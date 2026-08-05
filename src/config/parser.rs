@@ -78,6 +78,31 @@ fn parse_count(line: &[String], name: &str) -> Result<usize, String> {
         .map_err(|_| format!("invalid {name} value '{v}'"))
 }
 
+/// Parse a rate token like `50r/s`, `1200r/m`, `3r/h`, `1r/d` (spec §5.2) into
+/// a count and a time unit.
+fn parse_rate(token: &str) -> Result<(u64, RateUnit), String> {
+    let (count_str, unit) = if let Some(v) = token.strip_suffix("r/s") {
+        (v, RateUnit::Second)
+    } else if let Some(v) = token.strip_suffix("r/m") {
+        (v, RateUnit::Minute)
+    } else if let Some(v) = token.strip_suffix("r/h") {
+        (v, RateUnit::Hour)
+    } else if let Some(v) = token.strip_suffix("r/d") {
+        (v, RateUnit::Day)
+    } else {
+        return Err(format!(
+            "invalid rate '{token}' (expected <count>r/<s|m|h|d>)"
+        ));
+    };
+    let count: u64 = count_str
+        .parse()
+        .map_err(|_| format!("invalid rate '{token}'"))?;
+    if count < 1 {
+        return Err(format!("rate count must be >= 1: '{token}'"));
+    }
+    Ok((count, unit))
+}
+
 struct Parser<'a> {
     file: &'a str,
     tokens: Vec<Token>,
@@ -331,6 +356,8 @@ impl<'a> Parser<'a> {
             "root" => self.parse_root(words, block_open),
             "encode" => self.parse_encode(words, block_open),
             "redir" => self.parse_redir(words, block_open),
+            "rate_limit" => self.parse_rate_limit(words, block_open),
+            "trusted_proxies" => self.parse_trusted_proxies(words, block_open),
             other => Err(self.err(format!("unknown directive '{other}'"))),
         }
     }
@@ -658,6 +685,75 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse `trusted_proxies <cidr>...` (spec §4).
+    fn parse_trusted_proxies(
+        &self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after trusted_proxies"));
+        }
+        if words.len() < 2 {
+            return Err(self.err("trusted_proxies requires at least one CIDR"));
+        }
+        let networks = words[1..]
+            .iter()
+            .map(|w| Cidr::parse(w).map_err(|message| self.err(message)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Directive::TrustedProxies { networks })
+    }
+
+    /// Parse `rate_limit <key> <rate> [burst=<n>]` (spec §5.2).
+    fn parse_rate_limit(
+        &self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after rate_limit"));
+        }
+        if !(3..=4).contains(&words.len()) {
+            return Err(self.err("rate_limit expects: rate_limit <remote_ip> <rate> [burst=<n>]"));
+        }
+        // Only `remote_ip` is supported in v0.1.2 (spec §5.2).
+        let key = match words[1].as_str() {
+            "remote_ip" => RateLimitKey::RemoteIp,
+            other => {
+                return Err(self.err(format!(
+                    "unknown rate_limit key '{other}' (only 'remote_ip' is supported)"
+                )))
+            }
+        };
+        let (count, unit) = parse_rate(&words[2]).map_err(|message| self.err(message))?;
+        let mut burst = count;
+        if let Some(arg) = words.get(3) {
+            match arg.strip_prefix("burst=") {
+                Some(value) => {
+                    burst = value
+                        .parse::<u64>()
+                        .map_err(|_| self.err(format!("invalid burst '{value}'")))?;
+                    if burst < 1 {
+                        return Err(self.err("burst must be >= 1"));
+                    }
+                }
+                None => {
+                    return Err(self.err(format!(
+                        "unexpected argument '{arg}' (expected 'burst=<n>')"
+                    )))
+                }
+            }
+        }
+        Ok(Directive::RateLimit {
+            spec: RateSpec {
+                key,
+                count,
+                unit,
+                burst,
+            },
+        })
+    }
+
     fn apply_global(&self, global: &mut GlobalConfig, words: &[String]) -> Result<(), ConfigError> {
         let name = words.first().expect("non-empty");
         match name.as_str() {
@@ -684,6 +780,16 @@ impl<'a> Parser<'a> {
                     }
                 };
                 global.log_level = Some(level);
+            }
+            "trusted_proxies" => {
+                if words.len() < 2 {
+                    return Err(self.err("trusted_proxies requires at least one CIDR"));
+                }
+                let networks = words[1..]
+                    .iter()
+                    .map(|w| Cidr::parse(w).map_err(|message| self.err(message)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                global.trusted_proxies = networks;
             }
             other => return Err(self.err(format!("unknown global directive '{other}'"))),
         }
@@ -898,6 +1004,113 @@ mod tests {
         assert_eq!(strip_matcher_wildcard("/*"), "/");
     }
 
+    #[test]
+    fn parses_trusted_proxies_in_global_block() {
+        let input = "{ trusted_proxies 10.0.0.0/8 172.16.0.0/12 127.0.0.1 }\n:80 { redir https://{host}{uri} permanent }\n";
+        let rf = parse("test", input).unwrap();
+        assert_eq!(rf.global.trusted_proxies.len(), 3);
+        assert!(rf.global.trusted_proxies[0].contains("10.1.2.3".parse().unwrap()));
+        assert!(!rf.global.trusted_proxies[0].contains("11.0.0.1".parse().unwrap()));
+        // A bare address is a single host.
+        assert!(rf.global.trusted_proxies[2].contains("127.0.0.1".parse().unwrap()));
+        assert!(!rf.global.trusted_proxies[2].contains("127.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn parses_trusted_proxies_in_site_block() {
+        let input =
+            ":8080 {\n    trusted_proxies 10.0.0.0/8\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::TrustedProxies { networks } => {
+                assert_eq!(networks.len(), 1);
+                assert!(networks[0].contains("10.9.8.7".parse().unwrap()));
+            }
+            other => panic!("expected trusted_proxies, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rate_limit_with_burst() {
+        let input = ":8080 {\n    rate_limit remote_ip 1200r/m burst=2000\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::RateLimit { spec } => {
+                assert_eq!(spec.key, RateLimitKey::RemoteIp);
+                assert_eq!(spec.count, 1200);
+                assert_eq!(spec.unit, RateUnit::Minute);
+                assert_eq!(spec.burst, 2000);
+            }
+            other => panic!("expected rate_limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_burst_defaults_to_rate() {
+        let input = ":8080 {\n    rate_limit remote_ip 3r/s\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::RateLimit { spec } => assert_eq!(spec.burst, spec.count),
+            other => panic!("expected rate_limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_rate() {
+        let err = parse("test", ":8080 {\n    rate_limit remote_ip 50/s\n}\n").unwrap_err();
+        assert!(err.to_string().contains("invalid rate"));
+    }
+
+    #[test]
+    fn rejects_zero_burst() {
+        let err = parse(
+            "test",
+            ":8080 {\n    rate_limit remote_ip 50r/s burst=0\n}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("burst must be >= 1"));
+    }
+
+    #[test]
+    fn rejects_unknown_rate_limit_key() {
+        let err = parse("test", ":8080 {\n    rate_limit path /api 50r/s\n}\n").unwrap_err();
+        assert!(err.to_string().contains("unknown rate_limit key"));
+    }
+
+    #[test]
+    fn rejects_rate_limit_in_global_block() {
+        let err = parse(
+            "test",
+            "{ rate_limit remote_ip 1r/s }\n:80 { redir / permanent }\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown global directive"));
+    }
+
+    #[test]
+    fn rejects_bare_trusted_proxies() {
+        let err = parse("test", "{ trusted_proxies }\n:80 { redir / permanent }\n").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("trusted_proxies requires at least one CIDR"));
+    }
+
+    #[test]
+    fn rejects_invalid_cidr() {
+        let err = parse("test", ":8080 {\n    trusted_proxies 10.0.0.0/33\n}\n").unwrap_err();
+        assert!(err.to_string().contains("CIDR prefix"));
+    }
+
+    #[test]
+    fn rate_limit_errors_report_line_and_column() {
+        let err = parse("test", ":8080 {\n    rate_limit remote_ip bad\n}\n").unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("test:2:5"),
+            "expected file:line:col, got: {text}"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Fuzz-style robustness (M3): the parser must never panic, only return
     // `Ok` or `Err`. A deterministic PRNG keeps failures reproducible; the
@@ -951,6 +1164,8 @@ mod tests {
             "{ acme_email ops@example.com\nlog_level info }\n:80 {\n    redir https://{host}{uri} permanent\n}\napi.example.com:8080 {\n    handle /static/* {\n        root /var/www\n        file_server\n        encode zstd gzip\n    }\n    reverse_proxy 127.0.0.1:9000\n    header_up X-Real-IP {remote_host}\n}\n",
             ":8080 {\n    reverse_proxy {\n        to 127.0.0.1:9001 127.0.0.1:9002\n    }\n}\n",
             "# only a comment\n:8080 {\n    header_up X-Test {uri}\n    redir /old permanent\n}\n",
+            // v0.1.2: trusted_proxies + rate_limit grammar.
+            "{ trusted_proxies 10.0.0.0/8 172.16.0.0/12 127.0.0.1 }\n:8080 {\n    rate_limit remote_ip 50r/s burst=100\n    reverse_proxy 127.0.0.1:9000\n}\napi.test:8081 {\n    trusted_proxies 192.168.0.0/16\n    rate_limit remote_ip 3r/d\n    redir /old permanent\n}\n",
         ];
         let mut rng = XorShift(0x0123_4567_89ab_cdef);
         for seed in seeds {

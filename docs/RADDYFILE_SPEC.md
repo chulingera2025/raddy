@@ -27,10 +27,11 @@ interpret it line by line:
   and execution continues with the next directive; one without a matcher always
   matches. The first matching terminal ends site execution.
 - **Modifier directives** (`header_up`, `header_down`, `encode`) are
-  **declarative transforms**; they do not take part in the "who serves"
-  decision. Wherever they appear in a block (before or after a terminal), they
-  apply to whichever terminal serves that block; modifiers inside a `handle`
-  block apply only to that block's terminal.
+  **declarative transforms**; `rate_limit` is a **declarative guard** (see
+  §5.2). None of them takes part in the "who serves" decision. Wherever they
+  appear in a block (before or after a terminal), they apply to whichever
+  terminal serves that block; modifiers inside a `handle` block apply only to
+  that block's terminal.
 - **`handle /path { ... }`**: a mutually-exclusive matching block. If the path
   matches, the block's directives run and **matching stops**; if not, execution
   continues. `handle` is for path grouping and "match one and stop" scenarios.
@@ -85,6 +86,24 @@ trusted, so the default must be pinned down:
   `X-Forwarded-For` chain from the rightmost untrusted address.
 - Both the global block and site blocks may set it; the site block wins.
 
+**Syntax** (global or site block):
+
+```caddyfile
+{
+    trusted_proxies 10.0.0.0/8 172.16.0.0/12 127.0.0.1
+}
+```
+
+- `trusted_proxies <cidr>...`; each `<cidr>` is `<address>/<prefix>` or a bare
+  address (a single host). IPv4 and IPv6 are both accepted. A later occurrence
+  overrides an earlier one in the same scope.
+- A site-block `trusted_proxies` overrides the global list **for that site
+  only**; other sites keep the global list.
+- **Semantics**: the real client IP is the TCP peer unless the peer is a
+  trusted proxy; then it is the rightmost entry of the `X-Forwarded-For` chain
+  that is **not** a trusted proxy (malformed entries are skipped). When the
+  whole chain is trusted or absent, the trusted peer itself is used.
+
 ## 5. Directives and parameter semantics
 
 | Directive | Syntax | Status |
@@ -98,9 +117,9 @@ trusted, so the default must be pinned down:
 | `redir` | `redir <target> [code]`, default `308`; `code` is a 3xx number or the keywords `permanent`(=308) / `temporary`(=302); placeholders `{host}`, `{uri}` | Available |
 | `log_level` | global log level (`info` / `debug` / `warn` / `error`) | Available |
 | `acme_email` | ACME registration email (required by Let's Encrypt) | Available |
-| `rate_limit` | `rate_limit remote_ip 50r/s burst=100` (**single-instance** rate limit; `remote_ip` matcher in §8) | Planned |
+| `rate_limit` | `rate_limit remote_ip <rate> [burst=<n>]` (**single-instance** rate limit; see §5.2) | Available |
 | `jwt` | `jwt { issuer <url> audience <name> }` | Planned |
-| `trusted_proxies` | trusted network list (see §4) | Planned |
+| `trusted_proxies` | trusted network list (see §4) | Available |
 | `snippet` / `import` | reusable snippets `(name) { ... }` / multi-file includes | Future |
 
 **Single-instance vs cluster rate limiting**: rate limiting is per-instance
@@ -151,6 +170,32 @@ reverse_proxy {
 }
 ```
 
+### 5.2 `rate_limit` (declarative guard)
+
+- Syntax: `rate_limit <key> <rate> [burst=<n>]`.
+- `<key>`: `remote_ip` — the real client IP per the §4 trust model. This is the
+  only key in v0.1.2.
+- `<rate>`: `<count>r/<unit>`, where the unit is `s` (second), `m` (minute),
+  `h` (hour), or `d` (day) — e.g. `50r/s`, `1200r/m`. The count must be ≥ 1.
+- `burst=<n>`: the token-bucket capacity, `n ≥ 1`; **default = the rate
+  count**. Omitted or explicit.
+- Semantics: a **single-node, in-memory token bucket** per (site, terminal,
+  client IP). The bucket refills continuously at `<rate>` and holds at most
+  `burst` tokens; a request that finds no token is rejected with
+  **429 Too Many Requests**. State is process-lifetime and survives SIGHUP
+  reloads (ADR-011).
+- It is a **modifier** (guard): a site-level `rate_limit` guards whichever
+  terminal serves the block; inside a `handle` block it guards only that
+  block's terminal. Requests that match no terminal (404) are not rate limited.
+  When several `rate_limit` directives are in scope each keeps its own counter.
+
+```caddyfile
+api.example.com {
+    rate_limit remote_ip 100r/s burst=200
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
 ## 6. Site selection, ports, catch-all, and multiple sites
 
 - **Site selection is scoped per listener**: a request is matched only against
@@ -183,6 +228,7 @@ reverse_proxy {
 {
     acme_email ops@example.com
     log_level info
+    trusted_proxies 127.0.0.1
 }
 
 # HTTP → HTTPS redirect
@@ -191,6 +237,8 @@ reverse_proxy {
 }
 
 api.example.com {
+    rate_limit remote_ip 50r/s burst=100
+
     handle /static/* {
         root /var/www/html
         file_server
@@ -205,14 +253,16 @@ api.example.com {
 > Note: `header_up` written after `reverse_proxy` still affects the request
 > headers — it is a modifier directive applying to the terminal that serves this
 > block (here `reverse_proxy`). `encode zstd gzip` sits inside the `handle`
-> block, so it applies only to that block's `file_server`.
+> block, so it applies only to that block's `file_server`. `rate_limit` is a
+> declarative guard (modifier): it applies to whichever terminal serves the
+> site.
 
-> Other planned directives (`rate_limit`, `jwt`, `lb_policy`, `health_check`, …)
-> do not appear in the example, so readers never copy an unparseable config.
+> Other planned directives (`jwt`, …) do not appear in the example, so readers
+> never copy an unparseable config.
 
 ## 8. Todo
 
-- The `rate_limit` `remote_ip` matcher and the `jwt` sub-directive grammar must
-  be finalized here before implementation (`lb_policy` / `health_check` were
-  finalized in v0.1.1, see §5.1).
+- The `jwt` sub-directive grammar must be finalized here before implementation
+  (`lb_policy` / `health_check` were finalized in v0.1.1, see §5.1;
+  `rate_limit` / `trusted_proxies` were finalized in v0.1.2, see §4 / §5.2).
 - Any syntax detail not covered here: **document it before implementing**.

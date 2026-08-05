@@ -79,6 +79,8 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
     let mut terminals = Vec::new();
     let mut modifiers: Vec<Modifier> = Vec::new();
     let mut roots: Vec<String> = Vec::new();
+    // Site-scoped `trusted_proxies` (None = inherit the global list, §4).
+    let mut site_trusted: Option<Vec<Cidr>> = None;
 
     for directive in &site.directives {
         match directive {
@@ -140,6 +142,11 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                     modifiers: Vec::new(),
                 });
             }
+            Directive::TrustedProxies { networks } => {
+                // Last occurrence wins (same as the global block).
+                site_trusted = Some(networks.clone());
+            }
+            Directive::RateLimit { spec } => modifiers.push(Modifier::RateLimit { spec: *spec }),
         }
     }
 
@@ -163,6 +170,7 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
         key: site.key.clone(),
         terminals,
         modifiers,
+        trusted_proxies: site_trusted,
     })
 }
 
@@ -243,6 +251,15 @@ fn compile_handle_block(
                 scoped_modifiers.push(Modifier::Encode {
                     algorithms: algorithms.clone(),
                 });
+            }
+            Directive::RateLimit { spec } => {
+                scoped_modifiers.push(Modifier::RateLimit { spec: *spec });
+            }
+            Directive::TrustedProxies { .. } => {
+                return Err(validate_error(
+                    file,
+                    "trusted_proxies is only allowed at the global or site-block level",
+                ));
             }
             Directive::Handle { .. } => {
                 return Err(validate_error(
@@ -422,5 +439,68 @@ mod tests {
             TerminalKind::ReverseProxy { upstreams, .. } => assert_eq!(upstreams.len(), 1),
             other => panic!("expected reverse proxy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compiles_rate_limit_as_modifier() {
+        let cfg = compile(
+            ":8080 {\n    rate_limit remote_ip 50r/s burst=100\n    reverse_proxy 127.0.0.1:9000\n}\n",
+        )
+        .unwrap();
+        let site = &cfg.sites[0];
+        match &site.modifiers[0] {
+            Modifier::RateLimit { spec } => {
+                assert_eq!(spec.count, 50);
+                assert_eq!(spec.burst, 100);
+            }
+            other => panic!("expected rate_limit modifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compiles_handle_scoped_rate_limit() {
+        let cfg = compile(
+            ":8080 {\n    handle /api/* {\n        rate_limit remote_ip 5r/s\n        reverse_proxy 127.0.0.1:9000\n    }\n    reverse_proxy 127.0.0.1:9001\n}\n",
+        )
+        .unwrap();
+        let site = &cfg.sites[0];
+        // The handle terminal carries the handle-scoped rate_limit; the
+        // block-level reverse_proxy terminal does not.
+        assert_eq!(site.terminals.len(), 2);
+        assert!(matches!(
+            site.terminals[0].modifiers.first(),
+            Some(Modifier::RateLimit { .. })
+        ));
+        assert!(site.terminals[1].modifiers.is_empty());
+    }
+
+    #[test]
+    fn site_trusted_proxies_override_global() {
+        let cfg = compile(
+            "{ trusted_proxies 10.0.0.0/8 }\n:8080 {\n    trusted_proxies 192.168.0.0/16\n    reverse_proxy 127.0.0.1:9000\n}\n",
+        )
+        .unwrap();
+        let site = &cfg.sites[0];
+        let networks = site.trusted_proxies.as_ref().expect("site override");
+        assert!(networks[0].contains("192.168.5.5".parse().unwrap()));
+        assert!(!networks[0].contains("10.1.1.1".parse().unwrap()));
+        // Without a site override the compiled site inherits the global list.
+        let cfg2 = compile(
+            "{ trusted_proxies 10.0.0.0/8 }\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n",
+        )
+        .unwrap();
+        assert!(cfg2.sites[0].trusted_proxies.is_none());
+        assert_eq!(cfg2.global.trusted_proxies.len(), 1);
+    }
+
+    #[test]
+    fn rejects_trusted_proxies_inside_handle() {
+        let err = compile(
+            ":8080 {\n    handle /x/* {\n        trusted_proxies 10.0.0.0/8\n        file_server\n    }\n}\n",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("trusted_proxies is only allowed at the global or site-block level"));
     }
 }

@@ -123,11 +123,15 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         )),
         None => None,
     };
+    // Single-node rate limiter (M10): process-lifetime, so bucket state
+    // survives reloads like the LB pool (ADR-011).
+    let rate_limiter = Arc::new(crate::proxy::ratelimit::RateLimiter::new());
     let handler = ProxyHandler::new(
         config_store.clone(),
         challenges.clone(),
         access_log,
         lb_pool.clone(),
+        rate_limiter,
     );
 
     // Proactive issuance for configured named-443 hosts that lack a cached cert.

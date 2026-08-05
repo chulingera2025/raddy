@@ -22,9 +22,126 @@
 //! the file line by line.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// CIDR networks and rate limiting (spec §4 / §5.2)
+// ---------------------------------------------------------------------------
+
+/// An IP network used by `trusted_proxies`: an address plus a prefix length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cidr {
+    /// The network base address (only the masked bits are meaningful).
+    network: IpAddr,
+    /// The prefix length: `0..=32` for IPv4, `0..=128` for IPv6.
+    prefix: u8,
+}
+
+impl Cidr {
+    /// Parse a CIDR: `<address>/<prefix>`, or a bare address (a single host).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let (addr_str, prefix) = match raw.split_once('/') {
+            Some((addr, p)) => (addr, Some(p)),
+            None => (raw, None),
+        };
+        let address: IpAddr = addr_str
+            .parse()
+            .map_err(|_| format!("invalid IP address '{addr_str}'"))?;
+        let max_prefix = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix = match prefix {
+            Some(p) => {
+                let n: u8 = p
+                    .parse()
+                    .map_err(|_| format!("invalid CIDR prefix '{p}'"))?;
+                if n > max_prefix {
+                    return Err(format!("CIDR prefix {n} is too large for this address"));
+                }
+                n
+            }
+            None => max_prefix,
+        };
+        Ok(Self {
+            network: address,
+            prefix,
+        })
+    }
+
+    /// Whether an IP address falls inside this network.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix as u32)
+                };
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = if self.prefix == 0 {
+                    0u128
+                } else {
+                    u128::MAX << (128 - self.prefix as u32)
+                };
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The key a `rate_limit` directive counts on. `remote_ip` is the only key in
+/// v0.1.2 (spec §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateLimitKey {
+    RemoteIp,
+}
+
+/// The time unit of a rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateUnit {
+    Second,
+    Minute,
+    Hour,
+    Day,
+}
+
+impl RateUnit {
+    /// The number of seconds in this unit.
+    fn secs(self) -> u64 {
+        match self {
+            RateUnit::Second => 1,
+            RateUnit::Minute => 60,
+            RateUnit::Hour => 3600,
+            RateUnit::Day => 86400,
+        }
+    }
+}
+
+/// A compiled `rate_limit` spec: what to count on, plus a token bucket with a
+/// refill rate and capacity (spec §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateSpec {
+    /// What the limit counts (`remote_ip` in v0.1.2).
+    pub key: RateLimitKey,
+    /// Tokens refilled per `unit`.
+    pub count: u64,
+    pub unit: RateUnit,
+    /// Token-bucket capacity (≥ 1); defaults to `count` in the parser.
+    pub burst: u64,
+}
+
+impl RateSpec {
+    /// The continuous refill rate in tokens per second.
+    pub fn tokens_per_second(&self) -> f64 {
+        self.count as f64 / self.unit.secs() as f64
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Value templates (`{host}`, `{uri}`, `{remote_host}`)
@@ -125,6 +242,9 @@ pub struct Raddyfile {
 pub struct GlobalConfig {
     pub acme_email: Option<String>,
     pub log_level: Option<LogLevel>,
+    /// Networks whose `X-Forwarded-For` is trusted for the real client IP
+    /// (spec §4); empty = trust nobody, use the TCP peer.
+    pub trusted_proxies: Vec<Cidr>,
 }
 
 /// Global log level.
@@ -208,6 +328,15 @@ pub enum Directive {
     Redir {
         to: String,
         code: u16,
+    },
+    /// Site-scoped `trusted_proxies`, overriding the global list for this site
+    /// (spec §4). Compiled into [`CompiledSite::trusted_proxies`].
+    TrustedProxies {
+        networks: Vec<Cidr>,
+    },
+    /// A `rate_limit` guard (spec §5.2). Compiled into [`Modifier::RateLimit`].
+    RateLimit {
+        spec: RateSpec,
     },
 }
 
@@ -298,6 +427,8 @@ pub struct CompiledSite {
     pub terminals: Vec<Terminal>,
     /// Block-level modifier directives, applied to whichever terminal serves.
     pub modifiers: Vec<Modifier>,
+    /// Site-scoped `trusted_proxies` (None = inherit the global list, §4).
+    pub trusted_proxies: Option<Vec<Cidr>>,
 }
 
 /// A compiled terminal directive.
@@ -327,7 +458,7 @@ pub enum TerminalKind {
     Redir { to: ValueTemplate, code: u16 },
 }
 
-/// A declarative transform, applied regardless of position (ADR-012).
+/// A declarative transform or guard, applied regardless of position (ADR-012).
 #[derive(Debug, Clone)]
 pub enum Modifier {
     HeaderUp {
@@ -341,6 +472,10 @@ pub enum Modifier {
     /// Response compression; runtime lands in M5.
     Encode {
         algorithms: Vec<Encoding>,
+    },
+    /// A rate-limit guard (spec §5.2).
+    RateLimit {
+        spec: RateSpec,
     },
 }
 

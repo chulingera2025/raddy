@@ -20,11 +20,13 @@
 //! so the upstream Connector's connection pools survive (ADR-011).
 
 use crate::config::ast::{
-    Encoding, LbPolicy, Modifier, SiteKey, TemplatePart, TerminalKind, ValueTemplate, Variable,
+    Cidr, Encoding, LbPolicy, Modifier, SiteKey, TemplatePart, TerminalKind, ValueTemplate,
+    Variable,
 };
 use crate::config::snapshot::ConfigStore;
 use crate::proxy::compress::{self, Algo};
 use crate::proxy::lb::{LbSpec, LoadBalancerPool};
+use crate::proxy::ratelimit::RateLimiter;
 use crate::proxy::site;
 use crate::server::acme::ChallengeStore;
 use async_trait::async_trait;
@@ -34,6 +36,7 @@ use pingora::proxy::Session;
 use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +48,8 @@ pub struct ProxyHandler {
     /// HTTP-01 challenge registry, consulted before site selection so the
     /// ACME challenge is served regardless of the site routing.
     challenges: Arc<ChallengeStore>,
+    /// Single-node rate limiter (M10, ADR-011: state survives reloads).
+    rate_limiter: Arc<RateLimiter>,
     /// Optional structured access-log destination (M5).
     access_log: Option<Mutex<File>>,
 }
@@ -56,12 +61,14 @@ impl ProxyHandler {
         challenges: Arc<ChallengeStore>,
         access_log: Option<Mutex<File>>,
         pool: Arc<LoadBalancerPool>,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Self {
         Self {
             store,
             pool,
             challenges,
             access_log,
+            rate_limiter,
         }
     }
 }
@@ -139,9 +146,38 @@ impl ProxyHttp for ProxyHandler {
             site::Selection::Site(site) => {
                 // Owned so a mutable session borrow can coexist while matching.
                 let path = request_path(session).to_string();
+                // Site-scoped `trusted_proxies` override the global list (§4).
+                let trusted: Vec<Cidr> = match &site.trusted_proxies {
+                    Some(networks) => networks.clone(),
+                    None => config.global.trusted_proxies.clone(),
+                };
                 for (index, terminal) in site.terminals.iter().enumerate() {
                     if !matchers_match(&terminal.matchers, &path) {
                         continue;
+                    }
+                    // Effective modifiers: block-level then terminal-scoped
+                    // (ADR-012), shared by the rate-limit guard and the dispatch.
+                    let mut modifiers = site.modifiers.clone();
+                    modifiers.extend(terminal.modifiers.iter().cloned());
+                    // Rate limiting (spec §5.2): each `rate_limit` directive has
+                    // its own per-(terminal, client IP) token bucket; an empty
+                    // bucket rejects the request with 429. The client IP is only
+                    // derived when a rate_limit is actually in scope.
+                    if modifiers
+                        .iter()
+                        .any(|m| matches!(m, Modifier::RateLimit { .. }))
+                    {
+                        if let Some(ip) = client_ip(session, &trusted) {
+                            for (offset, modifier) in modifiers.iter().enumerate() {
+                                if let Modifier::RateLimit { spec } = modifier {
+                                    if !self.rate_limiter.allow(&site.key, index, offset, ip, spec)
+                                    {
+                                        session.respond_error(429).await?;
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
                     }
                     match &terminal.kind {
                         TerminalKind::Redir { to, code } => {
@@ -164,15 +200,12 @@ impl ProxyHttp for ProxyHandler {
                                 policy: *lb_policy,
                                 health_check: *health_check,
                             });
-                            ctx.modifiers = site.modifiers.clone();
-                            ctx.modifiers.extend(terminal.modifiers.iter().cloned());
+                            ctx.modifiers = modifiers;
                             ctx.encode_algos = encode_algos(&ctx.modifiers);
                             // Continue to upstream_peer for forwarding.
                             return Ok(false);
                         }
                         TerminalKind::FileServer { root } => {
-                            let mut modifiers = site.modifiers.clone();
-                            modifiers.extend(terminal.modifiers.iter().cloned());
                             let encode = encode_algos(&modifiers);
                             crate::proxy::fs::serve(session, root, &path, &encode).await?;
                             return Ok(true);
@@ -383,6 +416,38 @@ fn challenge_token(path: &str) -> Option<&str> {
     path.strip_prefix(PREFIX).filter(|token| !token.is_empty())
 }
 
+/// The real client IP per the §4 trust model, or `None` when the peer address
+/// is unavailable (callers then skip rate limiting).
+fn client_ip(session: &Session, trusted: &[Cidr]) -> Option<IpAddr> {
+    let peer = session.client_addr()?.as_inet()?.ip();
+    let xff = session
+        .req_header()
+        .headers
+        .get("x-forwarded-for")
+        .map(|value| value.to_str().unwrap_or_default());
+    Some(resolve_client_ip(peer, xff, trusted))
+}
+
+/// Resolve the real client IP: the TCP peer, unless the peer is a trusted
+/// proxy — then the rightmost `X-Forwarded-For` entry that is not a trusted
+/// proxy (malformed entries are skipped). When the whole chain is trusted or
+/// absent, the trusted peer itself is the client (spec §4).
+fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[Cidr]) -> IpAddr {
+    if trusted.iter().all(|cidr| !cidr.contains(peer)) {
+        return peer;
+    }
+    let xff = xff.unwrap_or_default();
+    for entry in xff.split(',').rev() {
+        let Ok(addr) = entry.trim().parse::<IpAddr>() else {
+            continue;
+        };
+        if trusted.iter().all(|cidr| !cidr.contains(addr)) {
+            return addr;
+        }
+    }
+    peer
+}
+
 /// All matchers must match for a terminal to serve (ADR-012).
 fn matchers_match(matchers: &[crate::config::ast::PathMatcher], path: &str) -> bool {
     matchers
@@ -517,5 +582,83 @@ mod tests {
         assert_eq!(challenge_token("/.well-known/acme-challenge"), None);
         assert_eq!(challenge_token("/"), None);
         assert_eq!(challenge_token("/static/x"), None);
+    }
+
+    fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn trusted(nets: &[&str]) -> Vec<Cidr> {
+        nets.iter().map(|n| Cidr::parse(n).unwrap()).collect()
+    }
+
+    #[test]
+    fn client_ip_untrusted_peer_ignores_xff() {
+        // Peer not in trusted_proxies → the X-Forwarded-For header is ignored
+        // entirely (the v0.1 default).
+        let peer = ipv4(203, 0, 113, 9);
+        assert_eq!(
+            resolve_client_ip(peer, Some("1.2.3.4"), &trusted(&["10.0.0.0/8"])),
+            peer
+        );
+    }
+
+    #[test]
+    fn client_ip_trusted_peer_uses_rightmost_untrusted() {
+        let peer = ipv4(10, 0, 0, 1);
+        let t = trusted(&["10.0.0.0/8"]);
+        // Chain: client -> proxy1(trusted) -> raddy. The rightmost untrusted is
+        // the client; proxy1 is trusted and skipped.
+        assert_eq!(
+            resolve_client_ip(peer, Some("203.0.113.9, 10.0.0.2"), &t),
+            ipv4(203, 0, 113, 9)
+        );
+        // If the last proxy is NOT trusted, the chain cannot be believed.
+        assert_eq!(
+            resolve_client_ip(peer, Some("203.0.113.9, 198.51.100.7"), &t),
+            ipv4(198, 51, 100, 7)
+        );
+    }
+
+    #[test]
+    fn client_ip_all_trusted_or_malformed_chain_falls_back_to_peer() {
+        let peer = ipv4(10, 0, 0, 1);
+        let t = trusted(&["10.0.0.0/8"]);
+        // Every entry is a trusted proxy → the trusted peer is the client.
+        assert_eq!(
+            resolve_client_ip(peer, Some("10.0.0.2, 10.0.0.3"), &t),
+            peer
+        );
+        // Malformed entries are skipped.
+        assert_eq!(
+            resolve_client_ip(peer, Some("not-an-ip, 203.0.113.9"), &t),
+            ipv4(203, 0, 113, 9)
+        );
+        // No X-Forwarded-For at all.
+        assert_eq!(resolve_client_ip(peer, None, &t), peer);
+    }
+
+    #[test]
+    fn client_ip_empty_trusted_uses_peer() {
+        let peer = ipv4(203, 0, 113, 9);
+        assert_eq!(
+            resolve_client_ip(peer, Some("1.2.3.4"), &trusted(&[])),
+            peer
+        );
+    }
+
+    #[test]
+    fn client_ip_handles_ipv6() {
+        use std::net::Ipv6Addr;
+        let peer = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)); // 2001:db8::1
+        let t = trusted(&["2001:db8::/32"]);
+        // An untrusted IPv6 (outside the /32) is the real client.
+        assert_eq!(
+            resolve_client_ip(peer, Some("2001:db9::1"), &t),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db9, 0, 0, 0, 0, 0, 1))
+        );
+        // An all-trusted chain falls back to the trusted peer.
+        assert_eq!(resolve_client_ip(peer, Some("2001:db8::2"), &t), peer);
+        assert_eq!(resolve_client_ip(peer, None, &t), peer);
     }
 }

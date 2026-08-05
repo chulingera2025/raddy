@@ -3,6 +3,7 @@
 {
     acme_email ops@example.com
     log_level info
+    trusted_proxies 127.0.0.1
 }
 
 # HTTP → HTTPS redirect on :80.
@@ -12,6 +13,8 @@
 
 # Main site: static files under /static, everything else to the app.
 api.example.com {
+    rate_limit remote_ip 50r/s burst=100
+
     handle /static/* {
         root /var/www/html
         file_server

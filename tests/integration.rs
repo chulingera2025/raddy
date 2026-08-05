@@ -1244,3 +1244,84 @@ fn health_state_survives_reload() {
         "traffic to return to the recovered upstream after reload",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rate limiting (M10, spec §5.2) and trusted_proxies (spec §4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rate_limit_returns_429_after_burst() {
+    let (upstream_port, _upstream) = EchoUpstream::spawn("A");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    rate_limit remote_ip 1r/s burst=3\n    reverse_proxy 127.0.0.1:{upstream_port}\n}}\n"
+        )
+    });
+    // The first `burst` requests pass instantly.
+    for _ in 0..3 {
+        let resp = send_request(raddy.port(), Some("localhost"), "/");
+        assert_eq!(resp.status, 200, "burst request should pass: {resp:?}");
+    }
+    // The next request finds an empty bucket (the 1r/s refill is negligible
+    // within the test's milliseconds) and is rejected with 429.
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 429, "expected 429 after the burst: {resp:?}");
+}
+
+#[test]
+fn rate_limit_ignores_xff_without_trusted_proxies() {
+    let (upstream_port, _upstream) = EchoUpstream::spawn("A");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    rate_limit remote_ip 1r/s burst=1\n    reverse_proxy 127.0.0.1:{upstream_port}\n}}\n"
+        )
+    });
+    // Without `trusted_proxies` the X-Forwarded-For header is ignored: every
+    // request is keyed to the TCP peer (127.0.0.1), so a second request from a
+    // "different" client is still rate limited.
+    let first = send_request_hdr(
+        raddy.port(),
+        Some("localhost"),
+        "/",
+        &["X-Forwarded-For: 1.2.3.4"],
+    );
+    assert_eq!(first.status, 200, "first request should pass: {first:?}");
+    let second = send_request_hdr(
+        raddy.port(),
+        Some("localhost"),
+        "/",
+        &["X-Forwarded-For: 5.6.7.8"],
+    );
+    assert_eq!(
+        second.status, 429,
+        "X-Forwarded-For must be ignored without trusted_proxies: {second:?}"
+    );
+}
+
+#[test]
+fn trusted_proxies_enables_per_client_rate_limiting() {
+    let (upstream_port, _upstream) = EchoUpstream::spawn("A");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            "{{\n    trusted_proxies 127.0.0.1\n}}\n:{port} {{\n    rate_limit remote_ip 1r/s burst=1\n    reverse_proxy 127.0.0.1:{upstream_port}\n}}\n"
+        )
+    });
+    // With the peer trusted, X-Forwarded-For is honored: distinct client IPs
+    // each get their own bucket.
+    for client in ["1.2.3.4", "5.6.7.8", "9.9.9.9"] {
+        let header = format!("X-Forwarded-For: {client}");
+        let resp = send_request_hdr(raddy.port(), Some("localhost"), "/", &[&header]);
+        assert_eq!(
+            resp.status, 200,
+            "{client} should get its own bucket: {resp:?}"
+        );
+    }
+    // The same client again has spent its single token and is now limited.
+    let again = send_request_hdr(
+        raddy.port(),
+        Some("localhost"),
+        "/",
+        &["X-Forwarded-For: 1.2.3.4"],
+    );
+    assert_eq!(again.status, 429, "spent bucket should reject: {again:?}");
+}

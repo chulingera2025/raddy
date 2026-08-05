@@ -109,6 +109,7 @@ mod tests {
             key: SiteKey::CatchAll { port },
             terminals: Vec::<Terminal>::new(),
             modifiers: Vec::new(),
+            trusted_proxies: None,
         }
     }
 
@@ -120,6 +121,7 @@ mod tests {
             },
             terminals: Vec::new(),
             modifiers: Vec::new(),
+            trusted_proxies: None,
         }
     }
 
