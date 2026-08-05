@@ -181,6 +181,10 @@ pub enum Directive {
     ReverseProxy {
         matcher: Option<PathMatcher>,
         to: Vec<Upstream>,
+        /// `lb_policy` inside the block (defaults to round-robin).
+        lb_policy: LbPolicy,
+        /// `health_check` inside the block (none = no active health check).
+        health_check: Option<HealthCheckSpec>,
     },
     Handle {
         path: String,
@@ -228,6 +232,40 @@ pub struct PathMatcher {
 pub enum Encoding {
     Gzip,
     Zstd,
+}
+
+/// The load-balancing policy of a `reverse_proxy` block (M9, §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LbPolicy {
+    RoundRobin,
+    Random,
+    /// Consistent hash on the client IP (per-IP session stickiness).
+    IpHash,
+}
+
+/// The active health-check configuration of a `reverse_proxy` block (M9, §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthCheckSpec {
+    /// How often to probe each upstream.
+    pub interval: std::time::Duration,
+    /// Per-probe connection timeout.
+    pub timeout: std::time::Duration,
+    /// Consecutive failures before an upstream is removed.
+    pub consecutive_failures: usize,
+    /// Consecutive successes before an upstream is restored.
+    pub consecutive_successes: usize,
+}
+
+/// The spec §5.1 defaults.
+impl Default for HealthCheckSpec {
+    fn default() -> Self {
+        Self {
+            interval: std::time::Duration::from_secs(5),
+            timeout: std::time::Duration::from_secs(2),
+            consecutive_failures: 3,
+            consecutive_successes: 2,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,16 +316,15 @@ pub struct Terminal {
 pub enum TerminalKind {
     ReverseProxy {
         upstreams: Vec<SocketAddr>,
+        /// The selection policy (round-robin unless `lb_policy` is set).
+        lb_policy: LbPolicy,
+        /// The active health-check spec, if configured.
+        health_check: Option<HealthCheckSpec>,
     },
     /// Static file serving; runtime lands in M5.
-    FileServer {
-        root: String,
-    },
+    FileServer { root: String },
     /// A redirect; the target is a template expanded at request time.
-    Redir {
-        to: ValueTemplate,
-        code: u16,
-    },
+    Redir { to: ValueTemplate, code: u16 },
 }
 
 /// A declarative transform, applied regardless of position (ADR-012).

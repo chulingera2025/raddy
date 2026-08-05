@@ -19,6 +19,11 @@
 //! `/.well-known/acme-challenge/<token>` (wired into the proxy handler through
 //! the [`ChallengeStore`]). On-demand TLS (SNI miss) is authorized by an `ask`
 //! callback that only admits hostnames configured on this instance.
+//!
+//! M8 adds renewal: a background scheduler scans the store and queues a re-issue
+//! for any certificate inside [`RENEW_WINDOW`] of expiry. A failed renewal keeps
+//! the previous certificate in service and is retried on the next scan
+//! (ARCHITECTURE §5).
 
 use crate::tls::CertStore;
 use instant_acme::{
@@ -28,6 +33,19 @@ use instant_acme::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
+
+/// Re-issue a certificate once it is within this window of its expiry.
+const RENEW_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// An issuance request queued to the background worker.
+#[derive(Debug)]
+pub enum Issuance {
+    /// Issue only if the host has no certificate yet (startup + on-demand).
+    New(String),
+    /// Re-issue even though a (soon-to-expire) certificate exists (renewal).
+    Renew(String),
+}
 
 /// In-memory HTTP-01 challenge registry: token -> key authorization.
 ///
@@ -110,10 +128,11 @@ impl AcmeManager {
     }
 
     /// Spawn a background worker thread that processes issuance requests
-    /// serially, and return the queue sender. Both the startup batch and the
-    /// on-demand SNI-miss path push hostnames into this queue.
-    pub fn spawn_issuance_worker(self: &Arc<Self>) -> std::sync::mpsc::Sender<String> {
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// serially, and return the queue sender. The startup batch, the on-demand
+    /// SNI-miss path, and the renewal scheduler all push requests into this
+    /// queue (renewals with `Issuance::Renew` bypass the has-certificate check).
+    pub fn spawn_issuance_worker(self: &Arc<Self>) -> std::sync::mpsc::Sender<Issuance> {
+        let (tx, rx) = std::sync::mpsc::channel::<Issuance>();
         let manager = self.clone();
         std::thread::spawn(move || {
             // `instant-acme` is async; give this worker its own runtime so it
@@ -122,8 +141,12 @@ impl AcmeManager {
                 .enable_all()
                 .build()
                 .expect("failed to build ACME worker runtime");
-            while let Ok(host) = rx.recv() {
-                if let Err(e) = rt.block_on(manager.issue_for(&host)) {
+            while let Ok(request) = rx.recv() {
+                let (host, force) = match request {
+                    Issuance::New(host) => (host, false),
+                    Issuance::Renew(host) => (host, true),
+                };
+                if let Err(e) = rt.block_on(manager.issue_for(&host, force)) {
                     tracing::error!("ACME issuance failed for {host}: {e}");
                 }
             }
@@ -131,13 +154,35 @@ impl AcmeManager {
         tx
     }
 
+    /// Spawn a background thread that periodically scans the store and queues a
+    /// renewal for any certificate inside [`RENEW_WINDOW`] of expiry. Failures
+    /// are logged by the issuance worker and retried on the next scan; the old
+    /// certificate keeps serving until a renewal succeeds (ARCHITECTURE §5).
+    pub fn spawn_renewal_scheduler(
+        self: &Arc<Self>,
+        issuance_tx: std::sync::mpsc::Sender<Issuance>,
+        check_interval: Duration,
+    ) {
+        let manager = self.clone();
+        std::thread::spawn(move || loop {
+            let deadline = SystemTime::now() + RENEW_WINDOW;
+            for host in manager.store.hosts_due_renewal(deadline) {
+                tracing::info!("certificate for {host} is due for renewal; queuing reissue");
+                let _ = issuance_tx.send(Issuance::Renew(host));
+            }
+            std::thread::sleep(check_interval);
+        });
+    }
+
     /// Issue a certificate for a single hostname via HTTP-01 and publish it.
-    pub async fn issue_for(&self, host: &str) -> Result<(), String> {
-        if self.store.has(host) {
+    ///
+    /// With `force` (renewal) the existing certificate, if any, is replaced.
+    pub async fn issue_for(&self, host: &str, force: bool) -> Result<(), String> {
+        if !force && self.store.has(host) {
             return Ok(());
         }
         let _guard = self.issuance_lock.lock().await;
-        if self.store.has(host) {
+        if !force && self.store.has(host) {
             return Ok(());
         }
 

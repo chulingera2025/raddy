@@ -18,15 +18,24 @@
 //! without serving. The listener set is derived from the snapshot and fixed for
 //! the process lifetime (ADR-010). Port 443 is served over TLS with SNI
 //! dynamic certificates (M4); every other port is plain HTTP.
+//!
+//! Zero-downtime binary upgrade (M7, ADR-008) is expressed through the two
+//! pingora flags threaded in here: `-u/--upgrade` (this process is the *new*
+//! side: acquire the running instance's listening fds over the upgrade socket)
+//! and `-t/--test` (validate config + construction, then exit 0/1 without
+//! touching any listener). The upgrade socket path must agree between old and
+//! new process.
 
 use crate::config::ast::{CompiledConfig, SiteKey};
 use crate::config::snapshot::{self, ConfigStore};
 use crate::proxy::handler::ProxyHandler;
-use crate::server::acme::{AcmeManager, ChallengeStore};
+use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
+use crate::server::acme::{AcmeManager, ChallengeStore, Issuance};
 use crate::server::reload;
 use crate::tls::{CertStore, SniCallback};
 use pingora::listeners::{tls::TlsSettings, TlsAcceptCallbacks};
 use pingora::prelude::*;
+use pingora::server::configuration::{Opt, ServerConf};
 use pingora::services::listening::Service;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -45,6 +54,17 @@ pub struct RunOptions {
     pub access_log: Option<PathBuf>,
     /// Address for the Prometheus `/metrics` listener (none if unset).
     pub metrics_addr: Option<String>,
+    /// Start as the *new* side of a zero-downtime upgrade: acquire the running
+    /// instance's listening fds over the upgrade socket (ADR-008).
+    pub upgrade: bool,
+    /// Validate the config and construction, then exit 0/1 without binding any
+    /// listener (used as the `raddy upgrade` pre-flight).
+    pub test: bool,
+    /// Write this process's PID here so `raddy upgrade` can find it (none =
+    /// don't write; `raddy upgrade` then requires an explicit `--pidfile`).
+    pub pidfile: Option<PathBuf>,
+    /// Unix socket both sides use to hand over listening fds (must match).
+    pub upgrade_sock: String,
 }
 
 /// Boot the proxy server and run until a shutdown signal.
@@ -80,6 +100,17 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     ));
     acme.load_persisted_certs();
     let issuance_tx = acme.spawn_issuance_worker();
+    // Renewal: periodically re-issue certificates inside the renewal window.
+    // The interval is overridable via RADDY_RENEW_INTERVAL_SECS (a test hook so
+    // Pebble's short-lived certificates can be renewed quickly).
+    acme.spawn_renewal_scheduler(issuance_tx.clone(), renew_interval());
+
+    // Load-balancing pool (ADR-011: process-lifetime, health survives reloads)
+    // plus the health-check runner thread. Warm the pool from the snapshot so
+    // health checks begin immediately at startup.
+    let lb_pool = Arc::new(LoadBalancerPool::new());
+    lb_pool.warm(&snapshot);
+    spawn_health_check_runner(lb_pool.clone());
 
     let config_store = Arc::new(ConfigStore::new(snapshot));
     let access_log = match &opts.access_log {
@@ -92,11 +123,16 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         )),
         None => None,
     };
-    let handler = ProxyHandler::new(config_store.clone(), challenges.clone(), access_log);
+    let handler = ProxyHandler::new(
+        config_store.clone(),
+        challenges.clone(),
+        access_log,
+        lb_pool,
+    );
 
     // Proactive issuance for configured named-443 hosts that lack a cached cert.
     for host in startup_hosts {
-        let _ = issuance_tx.send(host);
+        let _ = issuance_tx.send(Issuance::New(host));
     }
 
     // SNI on-demand: only issue for hosts configured as named sites (ADR-003).
@@ -106,14 +142,41 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         let config = on_miss_store.load();
         if is_configured_host(&config, host) {
             tracing::info!("on-demand TLS requested for authorized host {host}; queuing issuance");
-            let _ = on_miss_tx.send(host.to_string());
+            let _ = on_miss_tx.send(Issuance::New(host.to_string()));
         } else {
             tracing::warn!("on-demand TLS refused for unauthorized host {host}");
         }
     });
 
-    let mut server = Server::new(None)?;
+    let mut server = Server::new_with_opt_and_conf(
+        Some(Opt {
+            upgrade: opts.upgrade,
+            test: opts.test,
+            daemon: false,
+            nocapture: false,
+            conf: None,
+        }),
+        ServerConf {
+            upgrade_sock: opts.upgrade_sock.clone(),
+            // After an upgrade the old process has already handed its listeners
+            // to the replacement; the grace period only drains already-in-flight
+            // requests. Pingora's default (300s) would make an upgraded process
+            // linger for minutes for nothing.
+            grace_period_seconds: Some(10),
+            ..ServerConf::default()
+        },
+    );
     server.bootstrap();
+
+    // Record our PID for `raddy upgrade` once the server is actually going to
+    // serve (bootstrap exits the process in test mode, so a throwaway check
+    // never clobbers the running instance's pidfile).
+    if !opts.test {
+        if let Some(pidfile) = &opts.pidfile {
+            std::fs::write(pidfile, std::process::id().to_string())
+                .map_err(|e| format!("failed to write pidfile {}: {e}", pidfile.display()))?;
+        }
+    }
 
     let mut proxy = http_proxy_service(&server.configuration, handler);
     for port in ports {
@@ -163,6 +226,16 @@ fn is_configured_host(config: &CompiledConfig, host: &str) -> bool {
         .sites
         .iter()
         .any(|site| matches!(&site.key, SiteKey::Named { host: named, .. } if named == host))
+}
+
+/// The renewal scan interval: hourly by default, overridable via
+/// `RADDY_RENEW_INTERVAL_SECS` (a test hook for Pebble's short-lived certs).
+fn renew_interval() -> std::time::Duration {
+    std::env::var("RADDY_RENEW_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(3600))
 }
 
 /// Install the global tracing subscriber (respecting `RUST_LOG`). Idempotent,

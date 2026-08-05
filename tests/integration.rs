@@ -755,3 +755,492 @@ fn access_log_writes_json_lines() {
     );
     let _ = std::fs::remove_file(&log_path);
 }
+
+// ---------------------------------------------------------------------------
+// Zero-downtime binary upgrade (M7)
+// ---------------------------------------------------------------------------
+
+/// Read the PID from a pidfile written by `raddy run`.
+fn read_pid_file(path: &std::path::Path) -> i32 {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read pidfile {}: {e}", path.display()))
+        .trim()
+        .parse()
+        .expect("pidfile has a non-numeric pid")
+}
+
+/// Whether a process exists and is not (yet) a zombie.
+///
+/// A zombie still answers `kill(pid, 0)` until its parent reaps it, so on Linux
+/// the state is read from `/proc/<pid>/stat` instead and `Z` counts as exited.
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // Format: "pid (comm) state ..."; `comm` may contain spaces or parens,
+        // so the state is the first field after the last `)`.
+        let Some(after_comm) = stat.rfind(')') else {
+            return false;
+        };
+        let state = stat[after_comm + 1..]
+            .split_whitespace()
+            .next()
+            .unwrap_or("?");
+        state != "Z"
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: signal 0 sends no signal; it only probes existence.
+        let ret = unsafe { libc::kill(pid, 0) };
+        ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+/// Unique pidfile/upgrade-socket/cert-dir paths so parallel tests never collide.
+///
+/// The counter is module-scoped (a `static` inside a test function would be
+/// function-scoped, so parallel tests would each start at 0 and collide).
+static UPGRADE_TAG: AtomicUsize = AtomicUsize::new(0);
+
+fn upgrade_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir();
+    (
+        dir.join(format!("raddy_upgrade_{tag}.pid")),
+        dir.join(format!("raddy_upgrade_{tag}.sock")),
+        dir.join(format!("raddy_upgrade_{tag}_certs")),
+    )
+}
+
+#[test]
+fn zero_downtime_upgrade_hands_off_listeners() {
+    let tag = format!(
+        "{}_{}",
+        std::process::id(),
+        UPGRADE_TAG.fetch_add(1, Ordering::Relaxed)
+    );
+    let (pidfile, upgrade_sock, cert_dir) = upgrade_paths(&tag);
+    let extra = vec![
+        format!("--pidfile={}", pidfile.display()),
+        format!("--upgrade-sock={}", upgrade_sock.display()),
+        format!("--cert-dir={}", cert_dir.display()),
+    ];
+
+    let (up_port, _up) = EchoUpstream::spawn("A");
+    let raddy = RadRaddy::spawn_with_args(
+        |port| format!(":{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"),
+        &extra,
+    );
+    let port = raddy.port();
+    let old_pid = read_pid_file(&pidfile);
+    assert!(process_alive(old_pid), "initial instance should be running");
+
+    let resp = send_request(port, Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=A");
+
+    // Fire requests continuously while the upgrade runs; every one must succeed
+    // (the handoff must not drop a single request — the acceptance criterion).
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<(usize, usize)>();
+    let load_thread = std::thread::spawn(move || {
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        while !stop_thread.load(Ordering::Relaxed) {
+            match try_request(port, Some("localhost"), "/") {
+                Some(r) if r.status == 200 && r.body == "label=A" => ok += 1,
+                _ => failed += 1,
+            }
+            // Pace to a realistic rate (~1k req/s): a handoff gap would still
+            // drop dozens here, but a max-DoS rate only stresses the test's
+            // thread-per-connection upstream, not raddy.
+            thread::sleep(Duration::from_micros(1000));
+        }
+        let _ = result_tx.send((ok, failed));
+    });
+
+    // Run `raddy upgrade` (the same binary) with the same flags the instance
+    // was started with; it must hand off the listeners and return 0.
+    let mut cmd = Command::new(BIN);
+    cmd.args(["upgrade", "-c"]).arg(&raddy.config_path);
+    cmd.args(&extra);
+    cmd.env("RUST_LOG", "error");
+    let status = cmd.status().expect("failed to spawn raddy upgrade");
+    assert!(status.success(), "raddy upgrade should succeed: {status:?}");
+
+    stop.store(true, Ordering::Relaxed);
+    let (ok, failed) = result_rx.recv().expect("load thread should report");
+    assert!(
+        ok > 0,
+        "requests should have been served during the upgrade"
+    );
+    assert_eq!(
+        failed, 0,
+        "zero requests may drop across the upgrade (ok={ok}, failed={failed})"
+    );
+    let _ = load_thread.join();
+
+    // The old process handed off and exited; the pidfile names the replacement.
+    assert!(!process_alive(old_pid), "old instance should have exited");
+    let new_pid = read_pid_file(&pidfile);
+    assert_ne!(new_pid, old_pid, "upgrade should replace the process");
+    assert!(process_alive(new_pid), "replacement should be running");
+
+    // The handed-off listeners still serve.
+    let resp = send_request(port, Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=A");
+
+    // The replacement is detached from `RadRaddy`'s Drop, so stop it directly.
+    // SAFETY: `new_pid` is the replacement process we verified is running.
+    unsafe {
+        libc::kill(new_pid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && process_alive(new_pid) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_alive(new_pid),
+        "replacement should have been stopped"
+    );
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = std::fs::remove_file(&upgrade_sock);
+    let _ = std::fs::remove_dir_all(&cert_dir);
+}
+
+#[test]
+fn upgrade_aborts_on_broken_config_without_disturbing_instance() {
+    let tag = format!(
+        "{}_{}",
+        std::process::id(),
+        UPGRADE_TAG.fetch_add(1, Ordering::Relaxed)
+    );
+    let (pidfile, upgrade_sock, cert_dir) = upgrade_paths(&tag);
+    let extra = vec![
+        format!("--pidfile={}", pidfile.display()),
+        format!("--upgrade-sock={}", upgrade_sock.display()),
+        format!("--cert-dir={}", cert_dir.display()),
+    ];
+
+    let (up_port, _up) = EchoUpstream::spawn("A");
+    let raddy = RadRaddy::spawn_with_args(
+        |port| format!(":{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"),
+        &extra,
+    );
+    let old_pid = read_pid_file(&pidfile);
+    let port = raddy.port();
+
+    // Corrupt the config (writing the file does not trigger a reload). The
+    // running instance keeps serving its in-memory snapshot.
+    std::fs::write(&raddy.config_path, "this is not a valid Raddyfile {\n").unwrap();
+
+    let mut cmd = Command::new(BIN);
+    cmd.args(["upgrade", "-c"]).arg(&raddy.config_path);
+    cmd.args(&extra);
+    cmd.env("RUST_LOG", "error");
+    let status = cmd.status().expect("failed to spawn raddy upgrade");
+    assert!(
+        !status.success(),
+        "upgrade should fail its pre-flight check"
+    );
+
+    // The running instance is untouched: same pid, still serving.
+    assert_eq!(
+        read_pid_file(&pidfile),
+        old_pid,
+        "pidfile should be unchanged"
+    );
+    assert!(process_alive(old_pid), "instance should still be running");
+    let resp = send_request(port, Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=A");
+
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = std::fs::remove_file(&upgrade_sock);
+    let _ = std::fs::remove_dir_all(&cert_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Load balancing + health checks (M9)
+// ---------------------------------------------------------------------------
+
+/// An upstream whose listener can be closed (new connections refused, as if the
+/// process died) and later rebound on the same port (recovery). Used to verify
+/// that the active health check routes around a dead upstream and flows back.
+struct ToggleUpstream {
+    port: u16,
+    label: String,
+    hits: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ToggleUpstream {
+    fn spawn(label: &str) -> (u16, ToggleUpstream) {
+        let (port, listener) = bind_listener();
+        let mut up = ToggleUpstream {
+            port,
+            label: label.to_string(),
+            hits: Arc::new(AtomicUsize::new(0)),
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        };
+        up.accept_loop(listener);
+        (port, up)
+    }
+
+    fn accept_loop(&mut self, listener: TcpListener) {
+        let hits = self.hits.clone();
+        let stop = self.stop.clone();
+        let label = self.label.clone();
+        self.handle = Some(thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                hits.fetch_add(1, Ordering::Relaxed);
+                let label = label.clone();
+                thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = format!("label={label}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        }));
+    }
+
+    /// Close the listener so new connections are refused (simulates a dead
+    /// upstream; in-flight accepted connections finish normally).
+    fn pause(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Unblock the accept loop so it drops the listener and exits.
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Re-bind the original port (SO_REUSEADDR, so TIME_WAIT from the old
+    /// listener's connections does not block it) and start accepting again.
+    fn resume(&mut self) {
+        self.stop.store(false, Ordering::Relaxed);
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        socket.set_reuse_address(true).unwrap();
+        socket
+            .bind(&SockAddr::from(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                self.port,
+            ))))
+            .expect("rebind upstream port");
+        socket.listen(16).unwrap();
+        self.accept_loop(socket.into());
+    }
+}
+
+impl Drop for ToggleUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The `reverse_proxy` block with a fast health check (short interval and low
+/// flapping thresholds so the test observes transitions within a few seconds).
+fn health_checked_proxy(upstreams: &[u16]) -> String {
+    let to = upstreams
+        .iter()
+        .map(|p| format!("127.0.0.1:{p}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "reverse_proxy {{\n    to {to}\n    health_check {{\n        interval 200ms\n        timeout 200ms\n        consecutive_failures 2\n        consecutive_successes 1\n    }}\n}}\n"
+    )
+}
+
+#[test]
+fn health_check_routes_around_dead_upstream() {
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    // A port with nothing listening — the health check must mark it unhealthy.
+    let dead_port = free_port();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    {}\n}}\n",
+            health_checked_proxy(&[a_port, dead_port])
+        )
+    });
+
+    // Give the health check time to remove the dead upstream.
+    thread::sleep(Duration::from_secs(2));
+    for _ in 0..10 {
+        let resp = send_request(raddy.port(), Some("localhost"), "/");
+        assert_eq!(resp.status, 200, "unexpected response: {resp:?}");
+        assert_eq!(
+            resp.body, "label=A",
+            "dead upstream must not receive traffic"
+        );
+    }
+}
+
+#[test]
+fn all_unhealthy_upstreams_return_502() {
+    let dead_port = free_port();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    {}\n}}\n",
+            health_checked_proxy(&[dead_port])
+        )
+    });
+
+    thread::sleep(Duration::from_secs(2));
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(
+        resp.status, 502,
+        "all-unhealthy should return 502: {resp:?}"
+    );
+}
+
+#[test]
+fn ip_hash_pins_client_to_one_upstream() {
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, _b) = EchoUpstream::spawn("B");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    reverse_proxy {{\n        to 127.0.0.1:{a_port} 127.0.0.1:{b_port}\n        lb_policy ip_hash\n    }}\n}}\n"
+        )
+    });
+
+    // Every request comes from the same loopback client IP, so `ip_hash` must
+    // pin them all to the same upstream.
+    let mut bodies = std::collections::BTreeSet::new();
+    for _ in 0..20 {
+        let resp = send_request(raddy.port(), Some("localhost"), "/");
+        assert_eq!(resp.status, 200);
+        bodies.insert(resp.body.clone());
+    }
+    assert_eq!(
+        bodies.len(),
+        1,
+        "same client IP must stay pinned to one upstream: {bodies:?}"
+    );
+}
+
+#[test]
+fn health_check_recovers_after_upstream_returns() {
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, mut b) = ToggleUpstream::spawn("B");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    {}\n}}\n",
+            health_checked_proxy(&[a_port, b_port])
+        )
+    });
+
+    // Both upstreams up: round-robin serves both labels.
+    wait_until(
+        || {
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..10 {
+                seen.insert(send_request(raddy.port(), Some("localhost"), "/").body);
+            }
+            seen.contains("label=A") && seen.contains("label=B")
+        },
+        "round-robin across both healthy upstreams",
+    );
+
+    // Kill B: once the health check catches it, only A is served.
+    b.pause();
+    wait_until(
+        || (0..10).all(|_| send_request(raddy.port(), Some("localhost"), "/").body == "label=A"),
+        "traffic to drain from the dead upstream",
+    );
+
+    // Bring B back: traffic flows to both again.
+    b.resume();
+    wait_until(
+        || {
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..20 {
+                seen.insert(send_request(raddy.port(), Some("localhost"), "/").body);
+            }
+            seen.contains("label=A") && seen.contains("label=B")
+        },
+        "traffic to return to the recovered upstream",
+    );
+}
+
+#[test]
+fn health_state_survives_reload() {
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, mut b) = ToggleUpstream::spawn("B");
+    let mut raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    {}\n}}\n",
+            health_checked_proxy(&[a_port, b_port])
+        )
+    });
+    let config = format!(
+        ":{} {{\n    {}\n}}\n",
+        raddy.port(),
+        health_checked_proxy(&[a_port, b_port])
+    );
+
+    // Both upstreams up.
+    wait_until(
+        || {
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..10 {
+                seen.insert(send_request(raddy.port(), Some("localhost"), "/").body);
+            }
+            seen.contains("label=A") && seen.contains("label=B")
+        },
+        "round-robin across both healthy upstreams",
+    );
+
+    // Kill B and let the health check drain it.
+    b.pause();
+    wait_until(
+        || (0..10).all(|_| send_request(raddy.port(), Some("localhost"), "/").body == "label=A"),
+        "traffic to drain from the dead upstream",
+    );
+
+    // Reload the identical config: the balancer (and B's unhealthy state) must
+    // survive the reload (ADR-011), so B still receives no traffic.
+    raddy.reload(&config);
+    for _ in 0..10 {
+        assert_eq!(
+            send_request(raddy.port(), Some("localhost"), "/").body,
+            "label=A",
+            "health state must survive a reload"
+        );
+    }
+
+    // Bring B back: the reloaded (reused) balancer re-probes and restores it.
+    b.resume();
+    wait_until(
+        || {
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..20 {
+                seen.insert(send_request(raddy.port(), Some("localhost"), "/").body);
+            }
+            seen.contains("label=A") && seen.contains("label=B")
+        },
+        "traffic to return to the recovered upstream after reload",
+    );
+}

@@ -82,12 +82,21 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
 
     for directive in &site.directives {
         match directive {
-            Directive::ReverseProxy { matcher, to } => {
+            Directive::ReverseProxy {
+                matcher,
+                to,
+                lb_policy,
+                health_check,
+            } => {
                 let upstreams = resolve_upstreams(file, to)?;
                 let matchers = matcher.iter().cloned().collect();
                 terminals.push(Terminal {
                     matchers,
-                    kind: TerminalKind::ReverseProxy { upstreams },
+                    kind: TerminalKind::ReverseProxy {
+                        upstreams,
+                        lb_policy: *lb_policy,
+                        health_check: *health_check,
+                    },
                     modifiers: Vec::new(),
                 });
             }
@@ -177,7 +186,12 @@ fn compile_handle_block(
 
     for directive in directives {
         match directive {
-            Directive::ReverseProxy { matcher, to } => {
+            Directive::ReverseProxy {
+                matcher,
+                to,
+                lb_policy,
+                health_check,
+            } => {
                 let upstreams = resolve_upstreams(file, to)?;
                 let mut matchers = vec![path_matcher.clone()];
                 if let Some(m) = matcher {
@@ -185,7 +199,11 @@ fn compile_handle_block(
                 }
                 block_terminals.push(Terminal {
                     matchers,
-                    kind: TerminalKind::ReverseProxy { upstreams },
+                    kind: TerminalKind::ReverseProxy {
+                        upstreams,
+                        lb_policy: *lb_policy,
+                        health_check: *health_check,
+                    },
                     modifiers: Vec::new(),
                 });
             }
@@ -361,7 +379,7 @@ mod tests {
         assert_eq!(site.terminals.len(), 1);
         assert_eq!(site.modifiers.len(), 1);
         match &site.terminals[0].kind {
-            TerminalKind::ReverseProxy { upstreams } => {
+            TerminalKind::ReverseProxy { upstreams, .. } => {
                 assert_eq!(upstreams.len(), 1);
                 assert_eq!(upstreams[0].port(), 8080);
             }
@@ -401,7 +419,7 @@ mod tests {
     fn resolves_upstream_hostname() {
         let cfg = compile(":8080 {\n    reverse_proxy localhost:8080\n}\n").unwrap();
         match &cfg.sites[0].terminals[0].kind {
-            TerminalKind::ReverseProxy { upstreams } => assert_eq!(upstreams.len(), 1),
+            TerminalKind::ReverseProxy { upstreams, .. } => assert_eq!(upstreams.len(), 1),
             other => panic!("expected reverse proxy, got {other:?}"),
         }
     }

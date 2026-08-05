@@ -39,7 +39,9 @@ openssl x509 -req -in /tmp/raddy_localhost.csr \
 rm -f /tmp/raddy_localhost.csr
 
 # Pebble config (absolute paths; httpPort is where Pebble validates HTTP-01,
-# unused with PEBBLE_VA_ALWAYS_VALID).
+# unused with PEBBLE_VA_ALWAYS_VALID). The "default" profile overrides Pebble's
+# built-in 90-day validity with 90s so the M8 renewal e2e can observe an
+# automatic re-issue within the test window.
 ABS="$(pwd)"
 cat > config/pebble-config.json <<EOF
 {
@@ -51,7 +53,14 @@ cat > config/pebble-config.json <<EOF
     "httpPort": 5002,
     "tlsPort": 5001,
     "ocspResponderURL": "",
-    "externalAccountBindingRequired": false
+    "externalAccountBindingRequired": false,
+    "profiles": {
+      "default": {
+        "description": "Short-lived certificates for the renewal e2e",
+        "validityPeriod": 90,
+        "maxValidityPeriod": 90
+      }
+    }
   }
 }
 EOF

@@ -62,7 +62,7 @@ api.example.com {
 
 | 指令 | 语法要点 | 状态 |
 |---|---|---|
-| `reverse_proxy` | `reverse_proxy <target>` 或块形式 `to <upstream>...`；`to` 支持**多目标轮询**；`lb_policy` / `health_check` 计划中 | 可用 |
+| `reverse_proxy` | `reverse_proxy <target>` 或块形式 `to <upstream>...`；`to` 支持**多目标轮询**；块内可选 `lb_policy` / `health_check`（见 §5.1） | 可用 |
 | `handle` | 互斥匹配块（见 §2） | 可用 |
 | `header_up` / `header_down` | 请求头 / 响应头改写 | 可用 |
 | `root` | 已限定路径的块内直接写路径，**不需要** Caddy 的 `root *` 冗余通配符 | 可用 |
@@ -79,6 +79,31 @@ api.example.com {
 **单机 vs 集群限流**：限流为**单机**（每实例独立计数）；集群级（跨实例共享计数）需外挂 Redis，属后续可选特性，不在本文档文法上预留参数。
 
 **`file_server` 运行时语义**：`file_server` 从 `root` 目录提供**完整请求路径**（含 `handle` 前缀）对应的文件——`handle /static/* { root /var/www; file_server }` 将 `/static/foo` 映射到 `/var/www/static/foo`。支持目录 `index.html`；拒绝 `..` 目录穿越（404）；仅允许 GET/HEAD。`encode` 对 `file_server` 响应同样生效。
+
+### 5.1 `lb_policy` / `health_check`（`reverse_proxy` 块内子指令）
+
+- 仅出现在 `reverse_proxy` 的**块形式**内；省略时保持默认轮询（`round_robin`），与 v0.1 行为一致。
+- `lb_policy round_robin | random | ip_hash`：选择算法。`round_robin`（默认）轮询；`random` 随机选择；`ip_hash` 按客户端 IP 一致哈希（同 IP 会话粘性）。
+- `health_check { ... }`：**主动健康检查**（TCP 连接探活）。全部子参数可选，省略用默认值：
+  - `interval <dur>`：探活周期，默认 `5s`。
+  - `timeout <dur>`：单次探活超时，默认 `2s`。
+  - `consecutive_failures <n>`：连续失败 N 次才把上游摘除（flapping 抑制），默认 `3`。
+  - `consecutive_successes <n>`：连续成功 M 次才恢复（flapping 抑制），默认 `2`。
+  - `<dur>` 形式：数字 + 单位（`ms` / `s` / `m` / `h`），或裸数字表示秒。
+- 运行时语义：被标记为不健康的上游不再被选择；恢复后自动回流。**所有上游均不健康时返回 502**。健康状态是进程级生命周期、跨 SIGHUP 重载存活（ADR-011）；仅当上游地址、策略或健康检查参数变更时重建。
+
+```caddyfile
+reverse_proxy {
+    to 10.0.0.1:8000 10.0.0.2:8000
+    lb_policy round_robin
+    health_check {
+        interval 5s
+        timeout 2s
+        consecutive_failures 3
+        consecutive_successes 2
+    }
+}
+```
 
 ## 6. 站点选择、端口、catch-all 与多站点
 
@@ -121,5 +146,5 @@ api.example.com {
 
 ## 8. 待办
 
-- `rate_limit` 的 `remote_ip` 匹配器与 `jwt` 子指令文法在实现前必须在本文档定稿。
+- `rate_limit` 的 `remote_ip` 匹配器与 `jwt` 子指令文法在实现前必须在本文档定稿（`lb_policy` / `health_check` 已于 v0.1.1 定稿，见 §5.1）。
 - 任何本规范未覆盖的语法细节，实现时**先补文档再动手**。

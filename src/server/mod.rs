@@ -11,12 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The service layer: CLI, startup sequence, and SIGHUP reload.
+//! The service layer: CLI, startup sequence, SIGHUP reload, and the
+//! zero-downtime binary upgrade.
 //!
 //! Reload never changes listener topology (ADR-010); topology changes go through
-//! the zero-downtime binary upgrade (`raddy upgrade`, not in M2).
+//! the zero-downtime binary upgrade (`raddy upgrade`, ADR-008).
 
 pub mod acme;
 pub mod cli;
 pub mod reload;
 pub mod startup;
+pub mod upgrade;

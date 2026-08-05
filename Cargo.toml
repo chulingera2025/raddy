@@ -17,7 +17,11 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 http = "1"
 instant-acme = { version = "0.8.5", features = ["rcgen"] }
+libc = "0.2"
 mime_guess = "2"
+# openssl is linked through pingora's `openssl` feature; declared directly to
+# read certificate expiry (`X509::not_after`) for the M8 renewal scheduler.
+openssl = "0.10"
 # Note: pingora has NO default features (`default = []`); `proxy`, `lb`, and a
 # TLS backend must be enabled explicitly. M4 adds the `openssl` backend for the
 # SNI dynamic-cert listeners and ACME.
@@ -33,5 +37,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"
 
 [dev-dependencies]
-libc = "0.2"
 rcgen = "0.14"
+socket2 = "0.6"

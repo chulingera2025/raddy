@@ -18,9 +18,13 @@
 //! swapped snapshot). [`SniCallback`] implements pingora's `TlsAccept` so the
 //! TLS handshake for a hostname is answered from the store; a miss triggers the
 //! on-demand issuance path (authorized by the `ask` callback per ADR-003).
+//!
+//! Each stored certificate also records its `notAfter` (M8) so the renewal
+//! scheduler can re-issue before expiry.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use pingora::listeners::TlsAccept;
@@ -28,10 +32,17 @@ use pingora::protocols::tls::TlsRef;
 use pingora::tls::{ext, pkey::PKey, ssl::NameType, x509::X509};
 use pingora::utils::tls::CertKey;
 
+/// A certificate plus the moment its leaf expires (parsed `notAfter`).
+#[derive(Debug)]
+pub struct CachedCert {
+    cert: Arc<CertKey>,
+    expires_at: SystemTime,
+}
+
 /// Process-lifetime store of certificates keyed by hostname.
 #[derive(Debug, Default)]
 pub struct CertStore {
-    certs: RwLock<HashMap<String, Arc<CertKey>>>,
+    certs: RwLock<HashMap<String, CachedCert>>,
 }
 
 impl CertStore {
@@ -46,7 +57,7 @@ impl CertStore {
             .read()
             .expect("cert store lock poisoned")
             .get(host)
-            .cloned()
+            .map(|entry| entry.cert.clone())
     }
 
     /// Whether a hostname has a certificate.
@@ -57,13 +68,60 @@ impl CertStore {
             .contains_key(host)
     }
 
-    /// Insert or replace the certificate for a hostname.
+    /// The expiry of a hostname's certificate (if any).
+    pub fn expiry(&self, host: &str) -> Option<SystemTime> {
+        self.certs
+            .read()
+            .expect("cert store lock poisoned")
+            .get(host)
+            .map(|entry| entry.expires_at)
+    }
+
+    /// Hostnames whose certificate expires on or before `before` — candidates
+    /// for renewal. Unknown expiry (unparsable `notAfter`) is treated as never
+    /// due rather than hammering ACME on every scan.
+    pub fn hosts_due_renewal(&self, before: SystemTime) -> Vec<String> {
+        self.certs
+            .read()
+            .expect("cert store lock poisoned")
+            .iter()
+            .filter(|(_, entry)| entry.expires_at <= before)
+            .map(|(host, _)| host.clone())
+            .collect()
+    }
+
+    /// Insert or replace the certificate for a hostname, recording its expiry.
     pub fn store(&self, host: &str, cert: CertKey) {
+        let expires_at = leaf_not_after(&cert).unwrap_or_else(|| {
+            // Unreachable for a cert that parsed as valid PEM; fall back to
+            // never-due so a parsing regression cannot cause a renewal storm.
+            tracing::warn!("failed to read notAfter for {host}; renewal disabled for it");
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100 * 365 * 24 * 3600)
+        });
         self.certs
             .write()
             .expect("cert store lock poisoned")
-            .insert(host.to_string(), Arc::new(cert));
+            .insert(
+                host.to_string(),
+                CachedCert {
+                    cert: Arc::new(cert),
+                    expires_at,
+                },
+            );
     }
+}
+
+/// The `notAfter` of the leaf certificate as a `SystemTime`.
+fn leaf_not_after(cert: &CertKey) -> Option<SystemTime> {
+    let not_after = cert.leaf().not_after();
+    let epoch = openssl::asn1::Asn1Time::from_unix(0).ok()?;
+    // `ASN1_TIME_diff(from, to)` yields `to - from`, so diffing the epoch
+    // against notAfter gives the (positive) seconds until expiry. The result
+    // is days + seconds; clamp defensively in case a cert predates the epoch.
+    let diff = epoch.diff(not_after).ok()?;
+    let total = diff.days as i64 * 86_400 + diff.secs as i64;
+    let secs = u64::try_from(total).unwrap_or(0);
+    Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
 }
 
 /// The SNI callback that answers a TLS handshake from the certificate store.
@@ -156,6 +214,54 @@ mod tests {
         assert!(cert.intermediates().is_empty());
         let leaf_pem = String::from_utf8(cert.leaf().to_pem().unwrap()).unwrap();
         assert!(leaf_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn store_records_expiry_and_filters_due_renewal() {
+        let store = CertStore::new();
+        // A certificate that expired long ago (fixed date), and one valid until
+        // 2035. The deadline below is derived from the stored expiries, so the
+        // test never depends on the current wall clock.
+        let (pem, key) = rcgen_test_cert_validity("due.test", (2025, 1, 1), (2026, 1, 1));
+        store.store("due.test", cert_key_from_pem(&pem, &key).unwrap());
+        let (pem, key) = rcgen_test_cert_validity("later.test", (2025, 1, 1), (2035, 1, 1));
+        store.store("later.test", cert_key_from_pem(&pem, &key).unwrap());
+
+        let due_expiry = store.expiry("due.test").expect("due.test expiry");
+        let later_expiry = store.expiry("later.test").expect("later.test expiry");
+        assert!(
+            due_expiry < later_expiry,
+            "due.test should expire before later.test"
+        );
+
+        // Due at its own expiry (and only it), not a day before.
+        assert_eq!(
+            store.hosts_due_renewal(due_expiry),
+            vec!["due.test".to_string()]
+        );
+        let one_day = std::time::Duration::from_secs(24 * 3600);
+        assert!(
+            store.hosts_due_renewal(due_expiry - one_day).is_empty(),
+            "not yet due a day before expiry"
+        );
+        // Far in the future both are due.
+        assert_eq!(store.hosts_due_renewal(later_expiry).len(), 2);
+    }
+
+    /// Generate a self-signed certificate valid between two fixed dates
+    /// (dev/test helper; production certificates come from ACME).
+    fn rcgen_test_cert_validity(
+        host: &str,
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
+    ) -> (String, String) {
+        let mut params = rcgen::CertificateParams::new(vec![host.to_string()])
+            .expect("failed to build certificate params");
+        params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+        let keypair = rcgen::KeyPair::generate().expect("failed to generate key");
+        let cert = params.self_signed(&keypair).expect("failed to sign cert");
+        (cert.pem(), keypair.serialize_pem())
     }
 
     /// Generate a self-signed certificate via `rcgen` (a dev/test-only helper;

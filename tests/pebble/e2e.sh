@@ -13,12 +13,13 @@ ROOT="$(pwd)"
 PEBBLE_DIR="tests/pebble"
 BIN="$ROOT/target/debug/raddy"
 
-# --- ensure the pebble binary is present ---
+# --- ensure the pebble binary is present and its config is fresh ---
+# setup.sh is idempotent: it downloads the binary only when missing, and always
+# regenerates the CA/certs/config (which now carries a short cert validity for
+# the M8 renewal phase).
+echo "ensuring pebble is set up..."
+bash "$ROOT/$PEBBLE_DIR/setup.sh"
 PEBBLE_BIN="$ROOT/$PEBBLE_DIR/pebble-linux-amd64/linux/amd64/pebble"
-if [ ! -x "$PEBBLE_BIN" ]; then
-  echo "setting up pebble (first run)..."
-  bash "$ROOT/$PEBBLE_DIR/setup.sh"
-fi
 
 UPSTREAM_PORT=19090
 CERT_DIR=$(mktemp -d)
@@ -61,7 +62,9 @@ raddy.test {
 EOF
 
 # --- run raddy under sudo so :443 can bind ---
-sudo "$BIN" run -c "$CONFIG" \
+# RADDY_RENEW_INTERVAL_SECS=5 makes the M8 renewal scheduler scan every 5s so
+# the (90s-valid) Pebble certificate is re-issued within the test window.
+sudo RADDY_RENEW_INTERVAL_SECS=5 "$BIN" run -c "$CONFIG" \
   --cert-dir "$CERT_DIR" \
   --acme-directory "https://localhost:14000/dir" \
   --acme-root-pem "$PEBBLE_CA" \
@@ -95,5 +98,36 @@ else
   echo "FAILED: unexpected HTTPS status: $STATUS" >&2
   exit 1
 fi
+
+# --- M8: automatic renewal before expiry ---
+# The Pebble cert is valid for 90s and the renewal scheduler runs every 5s, so
+# the on-disk certificate must be re-issued (different notAfter) within the wait.
+OLD_ENDDATE=$(openssl x509 -in "$CERT_DIR/raddy.test.pem" -noout -enddate 2>/dev/null)
+echo "renewal: initial notAfter: $OLD_ENDDATE"
+RENEWED=""
+for _ in $(seq 1 40); do
+  NEW_ENDDATE=$(openssl x509 -in "$CERT_DIR/raddy.test.pem" -noout -enddate 2>/dev/null)
+  if [ -n "$NEW_ENDDATE" ] && [ "$NEW_ENDDATE" != "$OLD_ENDDATE" ]; then
+    RENEWED="$NEW_ENDDATE"
+    break
+  fi
+  sleep 1
+done
+if [ -z "$RENEWED" ]; then
+  echo "FAILED: certificate was not renewed within 40s; raddy log:" >&2
+  tail -30 /tmp/raddy_e2e.log >&2 || true
+  exit 1
+fi
+echo "renewal: re-issued, new notAfter: $RENEWED"
+
+# The renewed certificate must still serve HTTPS (it replaced the old one).
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" --cacert "$CERT_DIR/raddy.test.pem" \
+  --resolve raddy.test:443:127.0.0.1 \
+  https://raddy.test/ 2>/dev/null)
+if [ "$STATUS" != "200" ]; then
+  echo "FAILED: HTTPS broken after renewal: $STATUS" >&2
+  exit 1
+fi
+echo "renewal: HTTPS still serves after re-issue (status $STATUS)"
 
 echo "e2e PASSED"

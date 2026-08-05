@@ -19,5 +19,5 @@
 pub mod compress;
 pub mod fs;
 pub mod handler;
+pub mod lb;
 pub mod site;
-pub mod upstream;

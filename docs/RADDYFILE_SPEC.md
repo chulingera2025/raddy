@@ -89,7 +89,7 @@ trusted, so the default must be pinned down:
 
 | Directive | Syntax | Status |
 |---|---|---|
-| `reverse_proxy` | `reverse_proxy <target>` or block form `to <upstream>...`; `to` supports **multi-target round-robin**; `lb_policy` / `health_check` are planned | Available |
+| `reverse_proxy` | `reverse_proxy <target>` or block form `to <upstream>...`; `to` supports **multi-target round-robin**; optional `lb_policy` / `health_check` inside the block (see §5.1) | Available |
 | `handle` | mutually-exclusive matching block (see §2) | Available |
 | `header_up` / `header_down` | request / response header rewrite | Available |
 | `root` | the path, written directly in a scoped block; **no** redundant Caddy `root *` wildcard | Available |
@@ -114,6 +114,42 @@ for it here.
 `/var/www/static/foo`. Directories serve their `index.html`; `..` traversal is
 rejected with 404; only GET/HEAD are allowed. `encode` applies to `file_server`
 responses too.
+
+### 5.1 `lb_policy` / `health_check` (sub-directives of the `reverse_proxy` block)
+
+- They only appear in the **block form** of `reverse_proxy`; omitted means the
+  default round-robin (the v0.1 behavior).
+- `lb_policy round_robin | random | ip_hash`: the selection algorithm.
+  `round_robin` (default) rotates; `random` picks at random; `ip_hash` is a
+  consistent hash on the client IP (per-IP session stickiness).
+- `health_check { ... }`: **active health check** (TCP connect probe). Every
+  sub-parameter is optional and falls back to its default:
+  - `interval <dur>`: probe period, default `5s`.
+  - `timeout <dur>`: per-probe timeout, default `2s`.
+  - `consecutive_failures <n>`: remove an upstream only after N consecutive
+    failures (flapping suppression), default `3`.
+  - `consecutive_successes <n>`: restore an upstream only after M consecutive
+    successes (flapping suppression), default `2`.
+  - `<dur>` is a number plus a unit (`ms` / `s` / `m` / `h`), or a bare number
+    meaning seconds.
+- Runtime semantics: an upstream marked unhealthy is never selected; it flows
+  back automatically once restored. **If every upstream is unhealthy, raddy
+  returns 502.** Health state is process-lifetime and survives SIGHUP reloads
+  (ADR-011); it is rebuilt only when the upstream list, policy, or health-check
+  parameters change.
+
+```caddyfile
+reverse_proxy {
+    to 10.0.0.1:8000 10.0.0.2:8000
+    lb_policy round_robin
+    health_check {
+        interval 5s
+        timeout 2s
+        consecutive_failures 3
+        consecutive_successes 2
+    }
+}
+```
 
 ## 6. Site selection, ports, catch-all, and multiple sites
 
@@ -177,5 +213,6 @@ api.example.com {
 ## 8. Todo
 
 - The `rate_limit` `remote_ip` matcher and the `jwt` sub-directive grammar must
-  be finalized here before implementation.
+  be finalized here before implementation (`lb_policy` / `health_check` were
+  finalized in v0.1.1, see §5.1).
 - Any syntax detail not covered here: **document it before implementing**.

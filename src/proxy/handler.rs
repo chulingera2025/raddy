@@ -20,12 +20,12 @@
 //! so the upstream Connector's connection pools survive (ADR-011).
 
 use crate::config::ast::{
-    Encoding, Modifier, SiteKey, TemplatePart, TerminalKind, ValueTemplate, Variable,
+    Encoding, LbPolicy, Modifier, SiteKey, TemplatePart, TerminalKind, ValueTemplate, Variable,
 };
 use crate::config::snapshot::ConfigStore;
 use crate::proxy::compress::{self, Algo};
+use crate::proxy::lb::{LbSpec, LoadBalancerPool};
 use crate::proxy::site;
-use crate::proxy::upstream::UpstreamSelector;
 use crate::server::acme::ChallengeStore;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -34,14 +34,14 @@ use pingora::proxy::Session;
 use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
-use std::net::SocketAddr as NetSocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The process-lifetime proxy handler.
 pub struct ProxyHandler {
     store: Arc<ConfigStore>,
-    selector: Arc<UpstreamSelector>,
+    /// Load-balancing pool (per-site/terminal balancers, ADR-011).
+    pool: Arc<LoadBalancerPool>,
     /// HTTP-01 challenge registry, consulted before site selection so the
     /// ACME challenge is served regardless of the site routing.
     challenges: Arc<ChallengeStore>,
@@ -55,10 +55,11 @@ impl ProxyHandler {
         store: Arc<ConfigStore>,
         challenges: Arc<ChallengeStore>,
         access_log: Option<Mutex<File>>,
+        pool: Arc<LoadBalancerPool>,
     ) -> Self {
         Self {
             store,
-            selector: Arc::new(UpstreamSelector::new()),
+            pool,
             challenges,
             access_log,
         }
@@ -80,12 +81,12 @@ struct AccessLogEntry {
 /// Per-request state carried across the `ProxyHttp` hook chain.
 #[derive(Default)]
 pub struct ProxyCtx {
-    /// The selected site key (for round-robin state).
+    /// The selected site key (for load-balancer state).
     site_key: Option<SiteKey>,
     /// The index of the selected terminal within its site.
     terminal_index: usize,
-    /// Upstreams of the selected terminal.
-    upstreams: Vec<NetSocketAddr>,
+    /// The load-balancing spec of the selected terminal.
+    lb_spec: Option<LbSpec>,
     /// The effective modifier directives (block-level + terminal-scoped).
     modifiers: Vec<Modifier>,
     /// The site's `encode` priorities (empty = no compression).
@@ -151,10 +152,18 @@ impl ProxyHttp for ProxyHandler {
                             session.write_response_header(Box::new(resp), true).await?;
                             return Ok(true);
                         }
-                        TerminalKind::ReverseProxy { upstreams } => {
+                        TerminalKind::ReverseProxy {
+                            upstreams,
+                            lb_policy,
+                            health_check,
+                        } => {
                             ctx.site_key = Some(site.key.clone());
                             ctx.terminal_index = index;
-                            ctx.upstreams = upstreams.clone();
+                            ctx.lb_spec = Some(LbSpec {
+                                upstreams: upstreams.clone(),
+                                policy: *lb_policy,
+                                health_check: *health_check,
+                            });
                             ctx.modifiers = site.modifiers.clone();
                             ctx.modifiers.extend(terminal.modifiers.iter().cloned());
                             ctx.encode_algos = encode_algos(&ctx.modifiers);
@@ -179,16 +188,33 @@ impl ProxyHttp for ProxyHandler {
 
     async fn upstream_peer(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let site_key = ctx
             .site_key
             .as_ref()
             .expect("upstream_peer requires a selected reverse-proxy terminal");
-        let addr = self
-            .selector
-            .pick(site_key, ctx.terminal_index, &ctx.upstreams);
+        let lb_spec = ctx
+            .lb_spec
+            .as_ref()
+            .expect("upstream_peer requires a selected reverse-proxy terminal");
+        let balancer = self
+            .pool
+            .balancer_for(site_key, ctx.terminal_index, lb_spec.clone());
+        // `ip_hash` keys on the client IP for per-IP session stickiness; the
+        // other policies ignore the key.
+        let key = match lb_spec.policy {
+            LbPolicy::IpHash => session
+                .client_addr()
+                .and_then(|addr| addr.as_inet())
+                .map(|addr| addr.ip().to_string().into_bytes())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let addr = balancer
+            .select(&key)
+            .ok_or_else(|| Error::explain(HTTPStatus(502), "no healthy upstreams available"))?;
         // v0.1: plain-HTTP upstreams only (Q8) — no TLS, empty SNI.
         Ok(Box::new(HttpPeer::new(addr, false, String::new())))
     }
