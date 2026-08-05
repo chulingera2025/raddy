@@ -118,7 +118,7 @@ enum Command {
     },
     /// Convert a Caddyfile or nginx.conf subset into a Raddyfile. An
     /// independent converter: it never changes the Raddyfile grammar, and it
-    /// validates its own output before printing (ARCHITECTURE §7).
+    /// validates its own output before printing.
     Import {
         /// The source format.
         #[arg(value_enum)]

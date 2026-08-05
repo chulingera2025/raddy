@@ -28,7 +28,7 @@ interpret it line by line:
   matches. The first matching terminal ends site execution.
 - **Modifier directives** (`header_up`, `header_down`, `encode`) are
   **declarative transforms**; `rate_limit` is a **declarative guard** (see
-  §5.2). None of them takes part in the "who serves" decision. Wherever they
+  Section 5.2). None of them takes part in the "who serves" decision. Wherever they
   appear in a block (before or after a terminal), they apply to whichever
   terminal serves that block; modifiers inside a `handle` block apply only to
   that block's terminal.
@@ -40,7 +40,7 @@ interpret it line by line:
   confusion.
 
 > Corollary: a modifier may appear after its terminal (e.g. `header_up` after
-> `reverse_proxy`) and still take effect on the request headers (see the §7
+> `reverse_proxy`) and still take effect on the request headers (see the Section 7
 > example). This is declarative semantics, not positional line-by-line
 > interpretation.
 
@@ -108,8 +108,8 @@ trusted, so the default must be pinned down:
 
 | Directive | Syntax | Status |
 |---|---|---|
-| `reverse_proxy` | `reverse_proxy <target>` or block form `to <upstream>...`; `to` supports **multi-target round-robin**; optional `lb_policy` / `health_check` inside the block (see §5.1) | Available |
-| `handle` | mutually-exclusive matching block (see §2) | Available |
+| `reverse_proxy` | `reverse_proxy <target>` or block form `to <upstream>...`; `to` supports **multi-target round-robin**; optional `lb_policy` / `health_check` inside the block (see Section 5.1) | Available |
+| `handle` | mutually-exclusive matching block (see Section 2) | Available |
 | `header_up` / `header_down` | request / response header rewrite | Available |
 | `root` | the path, written directly in a scoped block; **no** redundant Caddy `root *` wildcard | Available |
 | `file_server` | static file hosting | Available |
@@ -117,9 +117,9 @@ trusted, so the default must be pinned down:
 | `redir` | `redir <target> [code]`, default `308`; `code` is a 3xx number or the keywords `permanent`(=308) / `temporary`(=302); placeholders `{host}`, `{uri}` | Available |
 | `log_level` | global log level (`info` / `debug` / `warn` / `error`) | Available |
 | `acme_email` | ACME registration email (required by Let's Encrypt) | Available |
-| `rate_limit` | `rate_limit remote_ip <rate> [burst=<n>]` (**single-instance** rate limit; see §5.2) | Available |
+| `rate_limit` | `rate_limit remote_ip <rate> [burst=<n>]` (**single-instance** rate limit; see Section 5.2) | Available |
 | `jwt` | `jwt { issuer <url> audience <name> }` | Planned |
-| `trusted_proxies` | trusted network list (see §4) | Available |
+| `trusted_proxies` | trusted network list (see Section 4) | Available |
 | `snippet` / `import` | reusable snippets `(name) { ... }` / multi-file includes | Future |
 
 **Single-instance vs cluster rate limiting**: rate limiting is per-instance
@@ -154,7 +154,7 @@ responses too.
 - Runtime semantics: an upstream marked unhealthy is never selected; it flows
   back automatically once restored. **If every upstream is unhealthy, raddy
   returns 502.** Health state is process-lifetime and survives SIGHUP reloads
-  (ADR-011); it is rebuilt only when the upstream list, policy, or health-check
+; it is rebuilt only when the upstream list, policy, or health-check
   parameters change.
 
 ```caddyfile
@@ -173,7 +173,7 @@ reverse_proxy {
 ### 5.2 `rate_limit` (declarative guard)
 
 - Syntax: `rate_limit <key> <rate> [burst=<n>]`.
-- `<key>`: `remote_ip` — the real client IP per the §4 trust model. This is the
+- `<key>`: `remote_ip` — the real client IP per the Section 4 trust model. This is the
   only key in v0.1.2.
 - `<rate>`: `<count>r/<unit>`, where the unit is `s` (second), `m` (minute),
   `h` (hour), or `d` (day) — e.g. `50r/s`, `1200r/m`. The count must be ≥ 1.
@@ -183,7 +183,7 @@ reverse_proxy {
   client IP). The bucket refills continuously at `<rate>` and holds at most
   `burst` tokens; a request that finds no token is rejected with
   **429 Too Many Requests**. State is process-lifetime and survives SIGHUP
-  reloads (ADR-011).
+  reloads.
 - It is a **modifier** (guard): a site-level `rate_limit` guards whichever
   terminal serves the block; inside a `handle` block it guards only that
   block's terminal. Requests that match no terminal (404) are not rate limited.
@@ -263,6 +263,6 @@ api.example.com {
 ## 8. Todo
 
 - The `jwt` sub-directive grammar must be finalized here before implementation
-  (`lb_policy` / `health_check` were finalized in v0.1.1, see §5.1;
-  `rate_limit` / `trusted_proxies` were finalized in v0.1.2, see §4 / §5.2).
+  (`lb_policy` / `health_check` were finalized in v0.1.1, see Section 5.1;
+  `rate_limit` / `trusted_proxies` were finalized in v0.1.2, see Section 4 / Section 5.2).
 - Any syntax detail not covered here: **document it before implementing**.

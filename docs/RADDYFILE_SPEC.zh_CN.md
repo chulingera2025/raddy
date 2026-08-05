@@ -15,11 +15,11 @@
 站点块在解析期编译为两部分，运行时不是逐行解释：
 
 - **终端指令**（`reverse_proxy`、`file_server`、`redir`）：决定**哪个指令服务**请求。可带内联 matcher，如 `reverse_proxy /api/* { to ... }`；**不匹配时跳过该指令（no-op），继续执行下一条**；不带 matcher 则始终执行。命中即停——一旦命中，本站点执行结束。
-- **修饰指令**（`header_up`、`header_down`、`encode`）：**声明式变换**；`rate_limit` 为**声明式守卫**（见 §5.2）。均不参与「谁服务」的决策。无论写在块内哪个位置（终端之前或之后），作用于该块内服务的那个终端指令；`handle` 块内的修饰只作用于该块的终端。
+- **修饰指令**（`header_up`、`header_down`、`encode`）：**声明式变换**；`rate_limit` 为**声明式守卫**（见 第 5.2 节）。均不参与「谁服务」的决策。无论写在块内哪个位置（终端之前或之后），作用于该块内服务的那个终端指令；`handle` 块内的修饰只作用于该块的终端。
 - **`handle /path { ... }`**：互斥匹配块。匹配时执行块内指令并**停止后续匹配**（互斥、命中即停）；不匹配则继续执行后续指令。`handle` 用于路径分组与"命中一个即停止"的场景。
 - 不引入 Caddy 的 `route`（保序执行所有匹配块）——与默认顺序执行语义重叠，且是 Caddy 用户最大困惑源。
 
-> 推论：修饰指令可写在终端指令之后（如 `reverse_proxy` 之后的 `header_up`），请求头改写仍生效（见 §7 示例）。这是声明式语义，不是位置相关的逐行解释。
+> 推论：修饰指令可写在终端指令之后（如 `reverse_proxy` 之后的 `header_up`），请求头改写仍生效（见第 7 节的示例）。这是声明式语义，不是位置相关的逐行解释。
 
 ```caddyfile
 handle /admin/* {
@@ -74,8 +74,8 @@ api.example.com {
 
 | 指令 | 语法要点 | 状态 |
 |---|---|---|
-| `reverse_proxy` | `reverse_proxy <target>` 或块形式 `to <upstream>...`；`to` 支持**多目标轮询**；块内可选 `lb_policy` / `health_check`（见 §5.1） | 可用 |
-| `handle` | 互斥匹配块（见 §2） | 可用 |
+| `reverse_proxy` | `reverse_proxy <target>` 或块形式 `to <upstream>...`；`to` 支持**多目标轮询**；块内可选 `lb_policy` / `health_check`（见 第 5.1 节） | 可用 |
+| `handle` | 互斥匹配块（见 第 2 节） | 可用 |
 | `header_up` / `header_down` | 请求头 / 响应头改写 | 可用 |
 | `root` | 已限定路径的块内直接写路径，**不需要** Caddy 的 `root *` 冗余通配符 | 可用 |
 | `file_server` | 静态文件托管 | 可用 |
@@ -83,9 +83,9 @@ api.example.com {
 | `redir` | `redir <target> [code]`，默认 `308`；`code` 为 3xx 数字，或关键字 `permanent`(=308) / `temporary`(=302)；占位符 `{host}`、`{uri}` | 可用 |
 | `log_level` | 全局日志级别（`info` / `debug` / `warn` / `error`） | 可用 |
 | `acme_email` | ACME 注册邮箱（Let's Encrypt 要求） | 可用 |
-| `rate_limit` | `rate_limit remote_ip <rate> [burst=<n>]`（**单机**限流；见 §5.2） | 可用 |
+| `rate_limit` | `rate_limit remote_ip <rate> [burst=<n>]`（**单机**限流；见 第 5.2 节） | 可用 |
 | `jwt` | `jwt { issuer <url> audience <name> }` | 计划中 |
-| `trusted_proxies` | 受信网段列表（见 §4） | 可用 |
+| `trusted_proxies` | 受信网段列表（见 第 4 节） | 可用 |
 | `snippet` / `import` | 复用片段 `(name) { ... }` / 多文件拆分 | 远期 |
 
 **单机 vs 集群限流**：限流为**单机**（每实例独立计数）；集群级（跨实例共享计数）需外挂 Redis，属后续可选特性，不在本文档文法上预留参数。
@@ -102,7 +102,7 @@ api.example.com {
   - `consecutive_failures <n>`：连续失败 N 次才把上游摘除（flapping 抑制），默认 `3`。
   - `consecutive_successes <n>`：连续成功 M 次才恢复（flapping 抑制），默认 `2`。
   - `<dur>` 形式：数字 + 单位（`ms` / `s` / `m` / `h`），或裸数字表示秒。
-- 运行时语义：被标记为不健康的上游不再被选择；恢复后自动回流。**所有上游均不健康时返回 502**。健康状态是进程级生命周期、跨 SIGHUP 重载存活（ADR-011）；仅当上游地址、策略或健康检查参数变更时重建。
+- 运行时语义：被标记为不健康的上游不再被选择；恢复后自动回流。**所有上游均不健康时返回 502**。健康状态是进程级生命周期、跨 SIGHUP 重载存活；仅当上游地址、策略或健康检查参数变更时重建。
 
 ```caddyfile
 reverse_proxy {
@@ -120,10 +120,10 @@ reverse_proxy {
 ### 5.2 `rate_limit`（声明式守卫）
 
 - 语法：`rate_limit <key> <rate> [burst=<n>]`。
-- `<key>`：`remote_ip`——按 §4 信任模型解析的真实客户端 IP。v0.1.2 仅支持这一种 key。
+- `<key>`：`remote_ip`——按 第 4 节 信任模型解析的真实客户端 IP。v0.1.2 仅支持这一种 key。
 - `<rate>`：`<count>r/<unit>`，单位为 `s`（秒）、`m`（分）、`h`（时）、`d`（天）——如 `50r/s`、`1200r/m`。count 必须 ≥ 1。
 - `burst=<n>`：令牌桶容量，`n ≥ 1`；**默认 = rate 的 count 值**。可省略或显式指定。
-- 语义：**单机、内存内令牌桶**，按 (站点, 终端, 客户端 IP) 分别计数。桶以 `<rate>` 持续补充令牌、容量上限为 `burst`；请求到达时若无令牌可用，返回 **429 Too Many Requests**。状态是进程级生命周期、跨 SIGHUP 重载存活（ADR-011）。
+- 语义：**单机、内存内令牌桶**，按 (站点, 终端, 客户端 IP) 分别计数。桶以 `<rate>` 持续补充令牌、容量上限为 `burst`；请求到达时若无令牌可用，返回 **429 Too Many Requests**。状态是进程级生命周期、跨 SIGHUP 重载存活。
 - 它是**修饰指令**（守卫）：站点级 `rate_limit` 守卫该块内服务的任意终端；位于 `handle` 块内时只守卫该块的终端。未匹配到任何终端的请求（404）不受限流。作用域内存在多条 `rate_limit` 时各自独立计数。
 
 ```caddyfile
@@ -177,5 +177,5 @@ api.example.com {
 
 ## 8. 待办
 
-- `jwt` 子指令文法在实现前必须在本文档定稿（`lb_policy` / `health_check` 已于 v0.1.1 定稿，见 §5.1；`rate_limit` / `trusted_proxies` 已于 v0.1.2 定稿，见 §4 / §5.2）。
+- `jwt` 子指令文法在实现前必须在本文档定稿（`lb_policy` / `health_check` 已于 v0.1.1 定稿，见 第 5.1 节；`rate_limit` / `trusted_proxies` 已于 v0.1.2 定稿，见 第 4 节 / 第 5.2 节）。
 - 任何本规范未覆盖的语法细节，实现时**先补文档再动手**。
