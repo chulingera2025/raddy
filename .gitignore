@@ -26,3 +26,7 @@ CLAUDE.md
 
 # Development docs stay local-only (not tracked)
 /devdoc/
+
+# mdBook build output (book/ holds the site source; /book/*/book/ is generated)
+/book/*/book/
+/out/

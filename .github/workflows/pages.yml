@@ -1,0 +1,52 @@
+name: Pages
+
+# Builds the mdBook documentation site (English at /, Chinese under /zh-CN/)
+# and deploys it to GitHub Pages on every `main` push.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook
+        uses: peaceiris/actions-mdbook@v2
+
+      - name: Build English book
+        run: mdbook build book/en
+
+      - name: Build Chinese book
+        run: mdbook build book/zh
+
+      - name: Assemble site (English at root, Chinese under /zh-CN/)
+        run: |
+          mkdir -p out/zh-CN
+          cp -r book/en/book/. out/
+          cp -r book/zh/book/. out/zh-CN/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
