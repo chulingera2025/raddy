@@ -24,6 +24,8 @@ Rust 网关生态的现状大致两类：直接手写 Pingora 代码，或者使
 - **静态托管 + 压缩**：`file_server` 带目录穿越防护；`encode` 支持 gzip/zstd 并按 `Accept-Encoding` 选择。
 - **可观测性**：结构化 JSON 访问日志 + Prometheus `/metrics` 端点（QPS + 延迟）。
 - **转发**：`reverse_proxy` 支持 `to` 多目标轮询、头改写、重定向、干净的 400/404 兜底。
+- **边缘防护**：`rate_limit remote_ip` 单机令牌桶限流，配合 `trusted_proxies` 解析真实客户端 IP。
+- **迁移**：`raddy import caddyfile|nginx <file>` 将常见 Caddyfile / nginx.conf 子集转换为 Raddyfile（独立转换器，永不改动 Raddyfile 文法）。
 
 ## 快速开始
 
