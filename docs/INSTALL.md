@@ -12,7 +12,7 @@ curl -fsSL -O https://github.com/chulingera2025/raddy/releases/latest/download/i
 # Optional: verify the script's own checksum against the release SHA256SUMS
 shasum -a 256 -c SHA256SUMS
 ./install.sh                  # installs to /usr/local/bin/raddy
-./install.sh v0.1.0 ~/.local  # specific version and prefix
+./install.sh v0.1.2 ~/.local  # specific version and prefix
 ```
 
 The script picks `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` from `uname -m`, downloads the matching tarball and `SHA256SUMS`, and only runs `install` after `shasum -a 256 -c` passes. A failed check aborts without installing.

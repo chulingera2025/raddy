@@ -12,7 +12,7 @@ curl -fsSL -O https://github.com/chulingera2025/raddy/releases/latest/download/i
 # 可选：核对脚本自身的 sha256（见发布页 SHA256SUMS）
 shasum -a 256 -c SHA256SUMS   # 需已下载 SHA256SUMS
 ./install.sh                  # 安装到 /usr/local/bin/raddy
-./install.sh v0.1.0 ~/.local  # 指定版本与前缀
+./install.sh v0.1.2 ~/.local  # 指定版本与前缀
 ```
 
 脚本行为：按 `uname -m` 选择 `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu`，下载对应 tarball 与 `SHA256SUMS`，用 `shasum -a 256 -c` 校验通过后才 `install` 到前缀。校验失败即退出、不安装。

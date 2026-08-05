@@ -4,7 +4,7 @@ name: Release
 # cross-compilation of OpenSSL is needed), packages them, computes checksums,
 # and attaches everything to a GitHub release.
 #
-# Trigger: push a tag matching `v*` (e.g. `git tag v0.1.0 && git push --tags`).
+# Trigger: push a tag matching `v*` (e.g. `git tag v0.1.2 && git push --tags`).
 
 on:
   push:
