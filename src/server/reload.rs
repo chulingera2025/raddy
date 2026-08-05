@@ -19,6 +19,7 @@
 //! on failure. Listeners are never touched (ADR-010).
 
 use crate::config::snapshot::{self, ConfigStore};
+use crate::proxy::lb::LoadBalancerPool;
 use signal_hook::consts::SIGHUP;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +29,9 @@ use std::sync::Arc;
 /// The thread owns a handle to the [`ConfigStore`]; on success it stores the
 /// new snapshot, on failure it logs the error and the previous snapshot stays
 /// in service (Q6). The `PathBuf` is owned so the thread outlives the caller.
-pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>) {
+/// The load-balancing pool is reconciled against the new snapshot so removed
+/// sites stop their health probes.
+pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>, lb_pool: Arc<LoadBalancerPool>) {
     std::thread::spawn(move || {
         let mut signals = match signal_hook::iterator::Signals::new([SIGHUP]) {
             Ok(signals) => signals,
@@ -40,6 +43,7 @@ pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>) {
         for _ in signals.forever() {
             match snapshot::build(&config_path) {
                 Ok(new_snapshot) => {
+                    lb_pool.reconcile(&new_snapshot);
                     store.store(new_snapshot);
                     tracing::info!("config reloaded from {}", config_path.display());
                 }

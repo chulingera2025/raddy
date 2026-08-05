@@ -498,12 +498,19 @@ impl<'a> Parser<'a> {
             }
         }
         let defaults = HealthCheckSpec::default();
-        Ok(HealthCheckSpec {
+        let spec = HealthCheckSpec {
             interval: interval.unwrap_or(defaults.interval),
             timeout: timeout.unwrap_or(defaults.timeout),
             consecutive_failures: failures.unwrap_or(defaults.consecutive_failures),
             consecutive_successes: successes.unwrap_or(defaults.consecutive_successes),
-        })
+        };
+        // A zero interval would make the health runner probe every tick, and a
+        // zero timeout is meaningless; reject both rather than silently hammer
+        // upstreams.
+        if spec.interval.is_zero() || spec.timeout.is_zero() {
+            return Err(self.err("health_check interval and timeout must be greater than zero"));
+        }
+        Ok(spec)
     }
 
     fn parse_upstream(&self, s: &str) -> Result<Upstream, ConfigError> {
@@ -844,6 +851,15 @@ mod tests {
         let input = ":8080 {\n    reverse_proxy {\n        to 127.0.0.1:8081\n        health_check {\n            bogus 1s\n        }\n    }\n}\n";
         let err = parse("test", input).unwrap_err();
         assert!(err.to_string().contains("unknown health_check option"));
+    }
+
+    #[test]
+    fn rejects_zero_health_check_interval() {
+        let input = ":8080 {\n    reverse_proxy {\n        to 127.0.0.1:8081\n        health_check {\n            interval 0s\n        }\n    }\n}\n";
+        let err = parse("test", input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("interval and timeout must be greater than zero"));
     }
 
     #[test]

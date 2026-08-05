@@ -127,7 +127,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         config_store.clone(),
         challenges.clone(),
         access_log,
-        lb_pool,
+        lb_pool.clone(),
     );
 
     // Proactive issuance for configured named-443 hosts that lack a cached cert.
@@ -203,7 +203,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     }
 
     // Config hot reload runs on its own thread; `run_forever` never returns.
-    reload::spawn(config_path.to_path_buf(), config_store);
+    reload::spawn(config_path.to_path_buf(), config_store, lb_pool);
 
     server.run_forever();
 }

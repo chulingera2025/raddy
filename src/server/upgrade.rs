@@ -54,9 +54,9 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
         .as_ref()
         .ok_or("--pidfile is required to locate the running raddy instance")?;
     let old_pid = read_pid(pidfile)?;
-    if !process_alive(old_pid) {
+    if !process_alive(old_pid) || !is_raddy_process(old_pid) {
         return Err(format!(
-            "no running raddy instance: pidfile {} refers to dead pid {old_pid}",
+            "no running raddy instance: pidfile {} refers to pid {old_pid}, which is not a running raddy process",
             pidfile.display()
         ));
     }
@@ -105,7 +105,19 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     signal_quit(old_pid)?;
 
     wait_for_exit(old_pid, OLD_PROCESS_EXIT_TIMEOUT)?;
-    eprintln!("raddy: upgrade complete");
+
+    // Confirm the replacement actually took over: the pidfile must now name a
+    // different, live process. Without this check a race where the old process
+    // died on its own at the signal moment could report a false success while
+    // the replacement never received the listeners.
+    let new_pid = read_pid(pidfile)?;
+    if new_pid == old_pid || !process_alive(new_pid) {
+        return Err(format!(
+            "replacement did not take over the listeners (pidfile still names pid {new_pid}); \
+             check the replacement's logs"
+        ));
+    }
+    eprintln!("raddy: upgrade complete (now pid {new_pid})");
     Ok(())
 }
 
@@ -198,6 +210,16 @@ fn process_alive(pid: i32) -> bool {
     }
 }
 
+/// Whether a process is a raddy instance, checked by its process name so an
+/// upgrade never SIGQUITs an unrelated process that a stale or reused PID may
+/// point at.
+fn is_raddy_process(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|comm| comm.trim() == "raddy")
+        .unwrap_or(false)
+}
+
 /// Send SIGQUIT — pingora's graceful-upgrade signal (ADR-008) — to `pid`.
 fn signal_quit(pid: i32) -> Result<(), String> {
     // SAFETY: `pid` is the running raddy instance we verified alive.
@@ -239,4 +261,17 @@ fn wait_for_socket(sock: &str, timeout: Duration) -> Result<(), String> {
     Err(format!(
         "replacement did not bind upgrade socket {sock} within {timeout:?}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_raddy_process_rejects_non_raddy() {
+        // The test binary is not named `raddy`, so the guard must refuse to
+        // signal it (this is the "don't SIGQUIT an unrelated process" check).
+        assert!(!is_raddy_process(std::process::id() as i32));
+        assert!(!is_raddy_process(-1));
+    }
 }

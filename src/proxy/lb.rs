@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use pingora::lb::health_check;
 use pingora::lb::selection::{BackendIter, BackendSelection, Consistent, Random, RoundRobin};
 use pingora::lb::LoadBalancer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -130,6 +130,31 @@ impl LoadBalancerPool {
                 );
             }
         }
+    }
+
+    /// Drop balancers for (site, terminal) pairs that no longer exist in the
+    /// snapshot. Called after every reload so removing a site stops its health
+    /// probes instead of probing a decommissioned upstream forever.
+    pub fn reconcile(&self, config: &crate::config::ast::CompiledConfig) {
+        let mut entries = self.entries.lock().expect("lb pool lock poisoned");
+        entries.retain(|key, _| Self::live_keys(config).contains(key));
+    }
+
+    /// The (site, terminal) keys that currently hold a reverse-proxy terminal.
+    fn live_keys(config: &crate::config::ast::CompiledConfig) -> HashSet<(SiteKey, usize)> {
+        config
+            .sites
+            .iter()
+            .flat_map(|site| {
+                site.terminals
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, terminal)| {
+                        matches!(&terminal.kind, TerminalKind::ReverseProxy { .. })
+                            .then_some((site.key.clone(), index))
+                    })
+            })
+            .collect()
     }
 
     /// The balancers due for a health-check probe at `now`, resetting their
@@ -294,6 +319,28 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&a, &b),
             "different terminals must not share a balancer"
+        );
+    }
+
+    #[test]
+    fn reconcile_prunes_removed_site() {
+        use crate::config::ast::{CompiledConfig, GlobalConfig};
+
+        let pool = LoadBalancerPool::new();
+        let key = SiteKey::CatchAll { port: 8080 };
+        let s = spec(LbPolicy::RoundRobin, &["127.0.0.1:1"]);
+        let first = pool.balancer_for(&key, 0, s.clone());
+
+        // Reconcile against a config with no sites: the entry must be pruned.
+        let empty = CompiledConfig {
+            global: GlobalConfig::default(),
+            sites: vec![],
+        };
+        pool.reconcile(&empty);
+        let rebuilt = pool.balancer_for(&key, 0, s);
+        assert!(
+            !Arc::ptr_eq(&first, &rebuilt),
+            "a pruned entry must not be reused"
         );
     }
 
