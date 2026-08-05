@@ -21,8 +21,10 @@
 //! * [`server`] — startup, SIGHUP reload, and the `run`/`check` CLI.
 //! * [`tls`] — certificate store and the SNI dynamic-certificate callback (M4).
 //! * [`observ`] — observability placeholders (access log and metrics land in M5).
+//! * [`migrate`] — Caddyfile/nginx.conf → Raddyfile converter (ARCHITECTURE §7).
 
 pub mod config;
+pub mod migrate;
 pub mod observ;
 pub mod proxy;
 pub mod server;

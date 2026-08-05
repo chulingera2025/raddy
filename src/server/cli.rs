@@ -22,7 +22,9 @@
 //! the config and construction, then exits — the `raddy upgrade` pre-flight.
 //! `raddy upgrade` orchestrates the whole upgrade using the *new* binary.
 
+use crate::config::ast::ConfigError;
 use crate::config::snapshot;
+use crate::migrate::ImportFormat;
 use crate::server::startup::{self, RunOptions};
 use crate::server::upgrade;
 use clap::{Args, Parser, Subcommand};
@@ -114,6 +116,19 @@ enum Command {
         #[arg(short, long, default_value = "Raddyfile")]
         config: PathBuf,
     },
+    /// Convert a Caddyfile or nginx.conf subset into a Raddyfile. An
+    /// independent converter: it never changes the Raddyfile grammar, and it
+    /// validates its own output before printing (ARCHITECTURE §7).
+    Import {
+        /// The source format.
+        #[arg(value_enum)]
+        format: ImportFormat,
+        /// Path to the source config file.
+        source: PathBuf,
+        /// Write the Raddyfile to this file instead of printing to stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Entry point for the `raddy` binary.
@@ -150,5 +165,47 @@ pub fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Import {
+            format,
+            source,
+            output,
+        } => match crate::migrate::import(format, &source) {
+            Ok(converted) => {
+                if converted.raddyfile.trim().is_empty() {
+                    eprintln!("nothing convertible from {}", source.display());
+                    std::process::exit(1);
+                }
+                // Validate with the same pipeline a reload uses (Q7), so the
+                // converter can never hand the operator an unparseable config.
+                if let Err(e) = validate_converted(&converted.raddyfile) {
+                    eprintln!("migration produced invalid Raddyfile: {e}");
+                    std::process::exit(1);
+                }
+                for warning in &converted.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                match &output {
+                    Some(path) => {
+                        if let Err(e) = std::fs::write(path, &converted.raddyfile) {
+                            eprintln!("failed to write {}: {e}", path.display());
+                            std::process::exit(1);
+                        }
+                        println!("wrote {}", path.display());
+                    }
+                    None => print!("{}", converted.raddyfile),
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
     }
+}
+
+/// Validate an emitted Raddyfile with the parse → validate pipeline (Q7).
+fn validate_converted(raddyfile: &str) -> Result<(), ConfigError> {
+    let parsed = crate::config::parser::parse("import", raddyfile)?;
+    crate::config::validate::validate_and_compile("import", &parsed)?;
+    Ok(())
 }

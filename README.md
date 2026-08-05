@@ -41,6 +41,11 @@ models, limited extensibility). Raddy takes a different answer on three things:
   endpoint (QPS + latency).
 - **Forwarding** — `reverse_proxy` with `to` multi-target round-robin, header
   rewrites, redirects, and clean 400/404 fallbacks.
+- **Edge protection** — `rate_limit remote_ip` single-node token-bucket rate
+  limiting, with `trusted_proxies` for the real client IP.
+- **Migration** — `raddy import caddyfile|nginx <file>` converts a common
+  Caddyfile / nginx.conf subset into a Raddyfile (independent converter, never
+  changes the Raddyfile grammar).
 
 ## Quick start
 

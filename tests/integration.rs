@@ -1325,3 +1325,102 @@ fn trusted_proxies_enables_per_client_rate_limiting() {
     );
     assert_eq!(again.status, 429, "spent bucket should reject: {again:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Migration (`raddy import`, ARCHITECTURE §7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn import_caddyfile_output_validates() {
+    let src = std::env::temp_dir().join(format!("raddy_import_{}.Caddyfile", std::process::id()));
+    let out = std::env::temp_dir().join(format!("raddy_import_{}.Raddyfile", std::process::id()));
+    std::fs::write(
+        &src,
+        "example.com {\n    handle /static/* {\n        root /var/www\n        file_server\n    }\n    reverse_proxy 127.0.0.1:8080\n}\n",
+    )
+    .unwrap();
+
+    let status = Command::new(BIN)
+        .args(["import", "caddyfile"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success(), "import should succeed");
+
+    // The converted Raddyfile must pass `raddy check` (the same validation a
+    // reload performs).
+    let check = Command::new(BIN)
+        .args(["check", "-c"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "converted output must validate: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn import_nginx_output_validates() {
+    let src = std::env::temp_dir().join(format!("raddy_import_nginx_{}.conf", std::process::id()));
+    let out = std::env::temp_dir().join(format!(
+        "raddy_import_nginx_{}.Raddyfile",
+        std::process::id()
+    ));
+    std::fs::write(
+        &src,
+        "server {\n    listen 80;\n    server_name example.com;\n    location / {\n        proxy_pass http://127.0.0.1:8080;\n    }\n}\n",
+    )
+    .unwrap();
+
+    let status = Command::new(BIN)
+        .args(["import", "nginx"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success(), "import should succeed");
+
+    let check = Command::new(BIN)
+        .args(["check", "-c"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "converted output must validate: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn import_prints_to_stdout_by_default() {
+    let src =
+        std::env::temp_dir().join(format!("raddy_import_out_{}.Caddyfile", std::process::id()));
+    std::fs::write(&src, "example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n").unwrap();
+    let out = Command::new(BIN)
+        .args(["import", "caddyfile"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("reverse_proxy 127.0.0.1:8080"));
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn import_rejects_unknown_format() {
+    let status = Command::new(BIN)
+        .args(["import", "bogus", "/nonexistent"])
+        .status()
+        .unwrap();
+    assert!(!status.success(), "an unknown format is a CLI error");
+}
