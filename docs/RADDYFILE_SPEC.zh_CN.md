@@ -84,7 +84,6 @@ api.example.com {
 | `log_level` | 全局日志级别（`info` / `debug` / `warn` / `error`） | 可用 |
 | `acme_email` | ACME 注册邮箱（Let's Encrypt 要求） | 可用 |
 | `rate_limit` | `rate_limit remote_ip <rate> [burst=<n>]`（**单机**限流；见 第 5.2 节） | 可用 |
-| `jwt` | `jwt { issuer <url> audience <name> }` | 计划中 |
 | `trusted_proxies` | 受信网段列表（见 第 4 节） | 可用 |
 | `snippet` / `import` | 复用片段 `(name) { ... }` / 多文件拆分 | 远期 |
 
@@ -173,9 +172,8 @@ api.example.com {
 
 > 注：`header_up` 写在 `reverse_proxy` 之后仍对请求头生效——它是修饰指令，作用于本块服务的终端（此处为 `reverse_proxy`）。`encode zstd gzip` 位于 `handle` 块内，只作用于该块的 `file_server`。`rate_limit` 是声明式守卫（修饰指令）：作用于本块服务的任意终端。
 
-> 其余规划能力（`jwt` 等）不在示例中出现，避免读者照抄无法解析的配置。
+> 其余规划与远期能力（`snippet` / `import` 等）不在示例中出现，避免读者照抄无法解析的配置。
 
 ## 8. 待办
 
-- `jwt` 子指令文法在实现前必须在本文档定稿（`lb_policy` / `health_check` 已于 v0.1.1 定稿，见 第 5.1 节；`rate_limit` / `trusted_proxies` 已于 v0.1.2 定稿，见 第 4 节 / 第 5.2 节）。
 - 任何本规范未覆盖的语法细节，实现时**先补文档再动手**。

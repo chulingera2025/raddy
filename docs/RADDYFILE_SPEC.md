@@ -118,7 +118,6 @@ trusted, so the default must be pinned down:
 | `log_level` | global log level (`info` / `debug` / `warn` / `error`) | Available |
 | `acme_email` | ACME registration email (required by Let's Encrypt) | Available |
 | `rate_limit` | `rate_limit remote_ip <rate> [burst=<n>]` (**single-instance** rate limit; see Section 5.2) | Available |
-| `jwt` | `jwt { issuer <url> audience <name> }` | Planned |
 | `trusted_proxies` | trusted network list (see Section 4) | Available |
 | `snippet` / `import` | reusable snippets `(name) { ... }` / multi-file includes | Future |
 
@@ -257,12 +256,9 @@ api.example.com {
 > declarative guard (modifier): it applies to whichever terminal serves the
 > site.
 
-> Other planned directives (`jwt`, …) do not appear in the example, so readers
-> never copy an unparseable config.
+> Planned and future directives (`snippet` / `import`, …) do not appear in the
+> example, so readers never copy an unparseable config.
 
 ## 8. Todo
 
-- The `jwt` sub-directive grammar must be finalized here before implementation
-  (`lb_policy` / `health_check` were finalized in v0.1.1, see Section 5.1;
-  `rate_limit` / `trusted_proxies` were finalized in v0.1.2, see Section 4 / Section 5.2).
 - Any syntax detail not covered here: **document it before implementing**.
