@@ -25,9 +25,10 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_raddy");
 
@@ -356,9 +357,42 @@ fn send_request_hdr(port: u16, host: Option<&str>, path: &str, headers: &[&str])
     try_request_hdr(port, host, path, headers).expect("request failed")
 }
 
-/// Read a single HTTP/1.1 response from a keep-alive connection: the head
-/// (through `\r\n\r\n`) plus the body per `Content-Length`.
-fn read_one_response(stream: &mut TcpStream) -> Response {
+/// Send a request with an explicit method (e.g. `HEAD`) and extra headers.
+fn send_request_method(
+    method: &str,
+    port: u16,
+    host: Option<&str>,
+    path: &str,
+    headers: &[&str],
+) -> Response {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let host_line = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+    let extra = headers
+        .iter()
+        .map(|h| format!("{h}\r\n"))
+        .collect::<String>();
+    let request =
+        format!("{method} {path} HTTP/1.1\r\n{host_line}{extra}Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let head_str = read_head(&mut stream);
+    let status = parse_status(&head_str);
+    if method == "HEAD" {
+        // A HEAD response carries the GET Content-Length but no body (RFC 9110
+        // §9.3.2), so only the head is read.
+        return Response {
+            status,
+            headers: head_str.to_lowercase(),
+            body: String::new(),
+        };
+    }
+    read_one_response_with_head(head_str, &mut stream)
+}
+
+/// Read the response head (through `\r\n\r\n`) as a string.
+fn read_head(stream: &mut TcpStream) -> String {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while stream.read(&mut byte).unwrap_or(0) != 0 {
@@ -367,7 +401,31 @@ fn read_one_response(stream: &mut TcpStream) -> Response {
             break;
         }
     }
-    let head_str = String::from_utf8_lossy(&head).to_string();
+    String::from_utf8_lossy(&head).to_string()
+}
+
+/// The numeric status code of a response head.
+fn parse_status(head_str: &str) -> u16 {
+    head_str
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Read a single HTTP/1.1 response from a keep-alive connection: the head
+/// (through `\r\n\r\n`) plus the body per `Content-Length`.
+fn read_one_response(stream: &mut TcpStream) -> Response {
+    let head_str = read_head(stream);
+    read_one_response_with_head(head_str, stream)
+}
+
+/// Build a [`Response`] from an already-read head, reading the body per
+/// `Content-Length`.
+fn read_one_response_with_head(head_str: String, stream: &mut TcpStream) -> Response {
     let content_length = head_str
         .lines()
         .find_map(|line| {
@@ -380,19 +438,95 @@ fn read_one_response(stream: &mut TcpStream) -> Response {
     if content_length > 0 {
         stream.read_exact(&mut body).unwrap();
     }
-    let status = head_str
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
     Response {
-        status,
+        status: parse_status(&head_str),
         headers: head_str.to_lowercase(),
         body: String::from_utf8_lossy(&body).into_owned(),
     }
+}
+
+/// Extract a header value from a lowercased response head string (with its
+/// leading spaces and trailing CR trimmed).
+fn head_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}:");
+    head.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::trim)
+}
+
+/// Send an arbitrary-method request and return the raw (binary) response: the
+/// status, the lowercased head, and the body bytes.
+///
+/// Bodies are read per `Content-Length` when the head carries one; otherwise
+/// they are read until the server closes the connection (close-delimited
+/// framing, e.g. compressed responses). `HEAD` returns only the head.
+fn send_raw(
+    port: u16,
+    host: Option<&str>,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let host_line = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+    let extra = headers
+        .iter()
+        .map(|h| format!("{h}\r\n"))
+        .collect::<String>();
+    let request =
+        format!("{method} {path} HTTP/1.1\r\n{host_line}{extra}Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let head_str = read_head(&mut stream);
+    let status = parse_status(&head_str);
+    let headers = head_str.to_lowercase();
+    if method == "HEAD" {
+        // A HEAD response carries the GET Content-Length but no body (RFC 9110
+        // §9.3.2), so only the head is read.
+        return (status, headers, Vec::new());
+    }
+    let body = match head_header(&headers, "content-length") {
+        Some(len) => {
+            let len = len.parse::<usize>().unwrap_or(0);
+            let mut body = vec![0u8; len];
+            if len > 0 {
+                stream.read_exact(&mut body).unwrap();
+            }
+            body
+        }
+        None => {
+            // Close-delimited body (no Content-Length): read until the server
+            // closes the connection.
+            let mut body = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => body.extend_from_slice(&buf[..n]),
+                }
+            }
+            body
+        }
+    };
+    (status, headers, body)
+}
+
+/// Decompress a complete gzip stream back to its payload.
+fn gzip_decode(compressed: &[u8]) -> Vec<u8> {
+    let mut decoder = flate2::read::GzDecoder::new(compressed);
+    let mut decoded = Vec::new();
+    Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+    decoded
+}
+
+/// Decompress a complete zstd frame back to its payload.
+fn zstd_decode(compressed: &[u8]) -> Vec<u8> {
+    let mut decoder = zstd::stream::read::Decoder::new(compressed).unwrap();
+    let mut decoded = Vec::new();
+    Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+    decoded
 }
 
 /// Send `n` requests over a single keep-alive downstream connection.
@@ -516,6 +650,46 @@ fn header_up_reaches_upstream() {
     let resp = send_request(raddy.port(), Some("localhost"), "/");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, "label=A");
+}
+
+#[test]
+fn reverse_proxy_applies_header_down() {
+    let (up_port, _up) = EchoUpstream::spawn("A");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n    header_down X-Proxy {{uri}}\n}}\n"
+        )
+    });
+
+    let resp = send_request(raddy.port(), Some("localhost"), "/x?y=1");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("x-proxy"),
+        Some("/x?y=1"),
+        "header_down must apply to the reverse-proxy response with {{uri}} expanded"
+    );
+}
+
+#[test]
+fn redir_applies_header_down() {
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    redir https://{{host}}{{uri}} permanent\n    header_down X-Redirected {{host}}\n    header_down Location /overridden\n}}\n"
+        )
+    });
+
+    let resp = send_request(raddy.port(), Some("example.com:8080"), "/a");
+    assert_eq!(resp.status, 308);
+    assert_eq!(
+        resp.header("x-redirected"),
+        Some("example.com"),
+        "header_down must apply to the redir response with {{host}} expanded"
+    );
+    assert_eq!(
+        resp.header("location"),
+        Some("/overridden"),
+        "header_down must overwrite the redir's own Location header"
+    );
 }
 
 #[test]
@@ -701,6 +875,548 @@ fn file_server_compresses_on_accept_encoding() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Reverse-proxy streaming compression acceptance test (B3b1).
+///
+/// The upstream sends a compressible first part of a body and then blocks on a
+/// barrier before sending the rest. A proxy that genuinely streams compression
+/// must forward compressed bytes to the downstream *while the upstream is still
+/// blocked*; the old full-buffer implementation emitted nothing until end of
+/// stream and therefore times out waiting for the first compressed bytes.
+fn streaming_compression_scenario(
+    encode_line: &str,
+    expected_ce: &str,
+    decode: impl Fn(&[u8]) -> Vec<u8>,
+) {
+    let first_part = "compressible-".repeat(4_000); // ~52 KB
+    let second_part = "second-half-".repeat(4_000); // ~52 KB
+    let expected: Vec<u8> = format!("{first_part}{second_part}").into_bytes();
+
+    let (first_sent_tx, first_sent_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+
+    let (up_port, listener) = bind_listener();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let first_part_c = first_part.clone();
+    let second_part_c = second_part.clone();
+    let up_handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stop_thread.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(mut stream) = stream else { continue };
+            let first_part = first_part_c.clone();
+            let second_part = second_part_c.clone();
+            let first_sent_tx = first_sent_tx.clone();
+            let release_rx = release_rx.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let total = first_part.len() + second_part.len();
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(first_part.as_bytes());
+                let _ = first_sent_tx.send(());
+                // Block until the test has observed compressed bytes downstream.
+                let _ = release_rx.lock().unwrap().recv();
+                let _ = stream.write_all(second_part.as_bytes());
+            });
+        }
+    });
+
+    let config = move |port: u16| {
+        format!(":{port} {{\n    encode {encode_line}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n")
+    };
+    let raddy = RadRaddy::spawn(config);
+    let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: {encode_line}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+
+    let head_str = read_head(&mut stream);
+    assert_eq!(parse_status(&head_str), 200, "unexpected head: {head_str}");
+    assert!(
+        head_str
+            .to_lowercase()
+            .contains(&format!("content-encoding: {expected_ce}")),
+        "expected Content-Encoding: {expected_ce} in head: {head_str}"
+    );
+
+    // Wait for the first compressed bytes. With a streaming implementation these
+    // arrive while the upstream is still blocked on the barrier; with the old
+    // full-buffer implementation nothing is emitted until end of stream and
+    // this read times out.
+    let mut body: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    let first_read = stream
+        .read(&mut buf)
+        .expect("timed out waiting for the first compressed bytes before EOS");
+    assert!(
+        first_read > 0,
+        "downstream must receive compressed bytes before the upstream sends EOS"
+    );
+    body.extend_from_slice(&buf[..first_read]);
+
+    // The upstream may only continue once the downstream has seen body bytes.
+    release_tx.send(()).unwrap();
+
+    // Read the rest until the connection closes.
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+        }
+    }
+
+    // One continuous gzip member / zstd frame whose payload is the whole body.
+    let decoded = decode(&body);
+    assert_eq!(
+        decoded, expected,
+        "the concatenated compressed stream must decompress to the original body"
+    );
+
+    // The upstream really did wait on the barrier.
+    assert!(
+        first_sent_rx.recv().is_ok(),
+        "the upstream should have sent its first part"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = TcpStream::connect(("127.0.0.1", up_port));
+    let _ = up_handle.join();
+}
+
+#[test]
+fn reverse_proxy_streams_gzip_before_eos() {
+    streaming_compression_scenario("gzip", "gzip", |body| {
+        let mut decoder = flate2::read::GzDecoder::new(body);
+        let mut decoded = Vec::new();
+        Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+        decoded
+    });
+}
+
+#[test]
+fn reverse_proxy_streams_zstd_before_eos() {
+    streaming_compression_scenario("zstd", "zstd", |body| {
+        let mut decoder = zstd::stream::read::Decoder::new(body).unwrap();
+        let mut decoded = Vec::new();
+        Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+        decoded
+    });
+}
+
+#[test]
+fn file_server_applies_header_down() {
+    let dir = std::env::temp_dir().join(format!("raddy_fs_hd_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hello.txt"), "hi").unwrap();
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    file_server\n    header_down X-Served {{uri}}\n    header_down X-Static yes\n    header_down Content-Type application/octet-stream\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+
+    let resp = send_request(port, Some("localhost"), "/hello.txt");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("x-served"),
+        Some("/hello.txt"),
+        "header_down must apply to the file_server response with {{uri}} expanded"
+    );
+    assert_eq!(resp.header("x-static"), Some("yes"));
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/octet-stream"),
+        "header_down must overwrite the file_server's own Content-Type"
+    );
+
+    // HEAD keeps its bodyless response while still carrying header_down.
+    let head = send_request_method("HEAD", port, Some("localhost"), "/hello.txt", &[]);
+    assert_eq!(head.status, 200);
+    assert_eq!(head.body, "");
+    assert_eq!(head.header("x-static"), Some("yes"));
+
+    // A missing file still 404s (header_down must not change error behavior).
+    let missing = send_request(port, Some("localhost"), "/missing.txt");
+    assert_eq!(missing.status, 404);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// file_server streaming, ranges, and compression (B3b2)
+// ---------------------------------------------------------------------------
+
+/// Create a temp dir containing a deterministic file larger than one 64 KiB
+/// streaming chunk, and return the dir plus the expected bytes.
+fn big_static_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
+    let dir = std::env::temp_dir().join(format!("raddy_fs_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let expected: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.join("big.bin"), &expected).unwrap();
+    (dir, expected)
+}
+
+#[test]
+fn file_server_streams_large_file_exactly() {
+    let (dir, expected) = big_static_file("stream");
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    file_server\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/big.bin").is_some_and(|r| r.status == 200),
+        "large file response",
+    );
+
+    let (status, headers, body) = send_raw(port, Some("localhost"), "GET", "/big.bin", &[]);
+    assert_eq!(status, 200);
+    assert_eq!(head_header(&headers, "content-length"), Some("200000"));
+    assert!(headers.contains("accept-ranges: bytes"));
+    assert_eq!(body.len(), 200_000);
+    assert_eq!(
+        body, expected,
+        "the streamed bytes must exactly match the file (multiple chunks)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_server_head_returns_headers_without_body() {
+    let (dir, _expected) = big_static_file("head");
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    file_server\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/big.bin").is_some_and(|r| r.status == 200),
+        "large file response",
+    );
+
+    let (status, headers, body) = send_raw(port, Some("localhost"), "HEAD", "/big.bin", &[]);
+    assert_eq!(status, 200);
+    assert_eq!(body.len(), 0, "HEAD must not return a body");
+    assert_eq!(
+        head_header(&headers, "content-length"),
+        Some("200000"),
+        "HEAD must report the size a GET would return"
+    );
+    assert!(headers.contains("accept-ranges: bytes"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_server_serves_single_byte_range() {
+    let (dir, expected) = big_static_file("range");
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    file_server\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/big.bin").is_some_and(|r| r.status == 200),
+        "large file response",
+    );
+
+    // Closed range: bytes=100-199.
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Range: bytes=100-199"],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(body, expected[100..200].to_vec());
+    assert_eq!(head_header(&headers, "content-length"), Some("100"));
+    assert_eq!(
+        head_header(&headers, "content-range"),
+        Some("bytes 100-199/200000")
+    );
+    assert!(headers.contains("accept-ranges: bytes"));
+
+    // Open-ended range: bytes=199900-.
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Range: bytes=199900-"],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(body, expected[199900..].to_vec());
+    assert_eq!(
+        head_header(&headers, "content-range"),
+        Some("bytes 199900-199999/200000")
+    );
+
+    // Suffix range: the last 100 bytes.
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Range: bytes=-100"],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(body, expected[199900..].to_vec());
+    assert_eq!(
+        head_header(&headers, "content-range"),
+        Some("bytes 199900-199999/200000")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_server_unsatisfiable_range_is_416() {
+    let (dir, _expected) = big_static_file("unsat");
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    file_server\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/big.bin").is_some_and(|r| r.status == 200),
+        "large file response",
+    );
+
+    // A start past EOF is unsatisfiable.
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Range: bytes=200000-"],
+    );
+    assert_eq!(status, 416);
+    assert_eq!(
+        head_header(&headers, "content-range"),
+        Some("bytes */200000")
+    );
+    assert_eq!(body.len(), 0, "416 must have no body");
+
+    // Multiple ranges are out of scope: rejected as unsatisfiable (416), never
+    // multipart.
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Range: bytes=0-9,20-29"],
+    );
+    assert_eq!(status, 416);
+    assert_eq!(
+        head_header(&headers, "content-range"),
+        Some("bytes */200000")
+    );
+    assert_eq!(body.len(), 0);
+
+    // Even with Accept-Encoding: gzip, a 416 has nothing to compress.
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Range: bytes=200000-", "Accept-Encoding: gzip"],
+    );
+    assert_eq!(status, 416);
+    assert_eq!(head_header(&headers, "content-encoding"), None);
+    assert_eq!(body.len(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_server_partial_ranges_are_not_compressed() {
+    let (dir, expected) = big_static_file("rangece");
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    encode gzip\n    file_server\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/big.bin").is_some_and(|r| r.status == 200),
+        "large file response",
+    );
+
+    // A partial (206) response must stay byte-exact even when the client would
+    // otherwise accept gzip.
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Range: bytes=0-99", "Accept-Encoding: gzip"],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(head_header(&headers, "content-encoding"), None);
+    assert_eq!(head_header(&headers, "content-length"), Some("100"));
+    assert_eq!(body, expected[0..100].to_vec());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_server_streams_gzip_full_response() {
+    let (dir, expected) = big_static_file("gzip");
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    encode gzip\n    file_server\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/big.bin").is_some_and(|r| r.status == 200),
+        "large file response",
+    );
+
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Accept-Encoding: gzip"],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(head_header(&headers, "content-encoding"), Some("gzip"));
+    assert_eq!(
+        head_header(&headers, "content-length"),
+        None,
+        "a compressed response must not carry the uncompressed Content-Length: {headers}"
+    );
+    assert!(
+        headers.contains("vary: accept-encoding"),
+        "compressed responses must vary on Accept-Encoding: {headers}"
+    );
+    let decoded = gzip_decode(&body);
+    assert_eq!(
+        decoded, expected,
+        "the single continuous gzip stream must decode to the whole file"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_server_streams_zstd_full_response() {
+    let (dir, expected) = big_static_file("zstd");
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    encode zstd\n    file_server\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/big.bin").is_some_and(|r| r.status == 200),
+        "large file response",
+    );
+
+    let (status, headers, body) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/big.bin",
+        &["Accept-Encoding: zstd"],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(head_header(&headers, "content-encoding"), Some("zstd"));
+    assert_eq!(
+        head_header(&headers, "content-length"),
+        None,
+        "a compressed response must not carry the uncompressed Content-Length: {headers}"
+    );
+    assert!(
+        headers.contains("vary: accept-encoding"),
+        "compressed responses must vary on Accept-Encoding: {headers}"
+    );
+    let decoded = zstd_decode(&body);
+    assert_eq!(
+        decoded, expected,
+        "the single continuous zstd frame must decode to the whole file"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_server_header_down_applies_to_range_responses() {
+    let dir = std::env::temp_dir().join(format!("raddy_fs_rangehd_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hello.txt"), "hello range world").unwrap();
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    file_server\n    header_down X-Static yes\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/hello.txt").is_some_and(|r| r.status == 200),
+        "file_server response",
+    );
+
+    // header_down applies to the full 200, the partial 206, and the 416.
+    let (status, headers, _) = send_raw(port, Some("localhost"), "GET", "/hello.txt", &[]);
+    assert_eq!(status, 200);
+    assert_eq!(head_header(&headers, "x-static"), Some("yes"));
+
+    let (status, headers, _) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/hello.txt",
+        &["Range: bytes=0-4"],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(head_header(&headers, "x-static"), Some("yes"));
+
+    let (status, headers, _) = send_raw(
+        port,
+        Some("localhost"),
+        "GET",
+        "/hello.txt",
+        &["Range: bytes=99-"],
+    );
+    assert_eq!(status, 416);
+    assert_eq!(head_header(&headers, "x-static"), Some("yes"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn metrics_endpoint_reports_requests() {
     let (up_port, _up) = EchoUpstream::spawn("A");
@@ -753,6 +1469,133 @@ fn access_log_writes_json_lines() {
         },
         "access log line for the request",
     );
+    let _ = std::fs::remove_file(&log_path);
+}
+
+/// Extract the `ts` field (epoch ms) from one JSON access-log line.
+fn parse_log_ts(line: &str) -> u64 {
+    let start = line
+        .find("\"ts\":")
+        .expect("access-log line has a ts field")
+        + "\"ts\":".len();
+    let end = line[start..]
+        .find(',')
+        .map(|i| start + i)
+        .unwrap_or(line.len());
+    line[start..end].parse().expect("ts is a number")
+}
+
+#[test]
+fn access_log_client_uses_effective_ip() {
+    let (up_port, _up) = EchoUpstream::spawn("A");
+    let log_path = std::env::temp_dir().join(format!("raddy_access_ip_{}.log", std::process::id()));
+    let log_str = log_path.to_string_lossy().into_owned();
+    let raddy = RadRaddy::spawn_with_args(
+        // The site-scoped `trusted_proxies` override (127.0.0.1), not the global
+        // list (10.0.0.0/8), decides that the loopback peer is trusted.
+        move |port| {
+            format!(
+                "{{ trusted_proxies 10.0.0.0/8 }}\n:{port} {{\n    trusted_proxies 127.0.0.1\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+            )
+        },
+        &[String::from("--access-log"), log_str],
+    );
+
+    let resp = send_request_hdr(
+        raddy.port(),
+        Some("localhost"),
+        "/x",
+        &["X-Forwarded-For: 198.51.100.7"],
+    );
+    assert_eq!(resp.status, 200);
+
+    // The trusted peer's X-Forwarded-For must be the logged client, not the TCP
+    // peer 127.0.0.1.
+    wait_until(
+        || {
+            std::fs::read_to_string(&log_path)
+                .map(|s| {
+                    s.lines().any(|l| {
+                        l.contains("\"path\":\"/x\"") && l.contains("\"client\":\"198.51.100.7\"")
+                    })
+                })
+                .unwrap_or(false)
+        },
+        "access log to use the effective client IP",
+    );
+    let _ = std::fs::remove_file(&log_path);
+}
+
+#[test]
+fn access_log_ts_is_request_start() {
+    // A deliberately slow upstream: it sleeps before responding, so the gap
+    // between the request start and the logging time is measurable (~2.5s). The
+    // log's `ts` must be the former, not the latter.
+    let (up_port, listener) = bind_listener();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stop_thread.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(mut stream) = stream else { continue };
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                thread::sleep(Duration::from_millis(3000));
+                let body = "slow";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            });
+        }
+    });
+
+    let log_path = std::env::temp_dir().join(format!("raddy_access_ts_{}.log", std::process::id()));
+    let log_str = log_path.to_string_lossy().into_owned();
+    let raddy = RadRaddy::spawn_with_args(
+        move |port| format!(":{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"),
+        &[String::from("--access-log"), log_str],
+    );
+
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let resp = send_request(raddy.port(), Some("localhost"), "/slow");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "slow");
+
+    let mut found = None;
+    wait_until(
+        || {
+            let Ok(content) = std::fs::read_to_string(&log_path) else {
+                return false;
+            };
+            found = content
+                .lines()
+                .find(|l| l.contains("\"path\":\"/slow\"") && l.contains("\"status\":200"))
+                .map(parse_log_ts);
+            found.is_some()
+        },
+        "access log line for the slow request",
+    );
+    let ts = found.expect("the slow request should be logged");
+    // The request starts within ~2s of `before`; the log is written ~3s later,
+    // so a logging-time ts would be at `before + 3000` or later.
+    assert!(
+        (before..=before + 2000).contains(&ts),
+        "ts {ts} must be the request start (~{before}), not the logging time (~{})",
+        before + 3000
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = TcpStream::connect(("127.0.0.1", up_port));
+    let _ = handle.join();
     let _ = std::fs::remove_file(&log_path);
 }
 
@@ -1138,6 +1981,79 @@ fn ip_hash_pins_client_to_one_upstream() {
         bodies.len(),
         1,
         "same client IP must stay pinned to one upstream: {bodies:?}"
+    );
+}
+
+#[test]
+fn trusted_proxies_ip_hash_keys_on_effective_client_ip() {
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, _b) = EchoUpstream::spawn("B");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            "{{ trusted_proxies 127.0.0.1 }}\n:{port} {{\n    reverse_proxy {{\n        to 127.0.0.1:{a_port} 127.0.0.1:{b_port}\n        lb_policy ip_hash\n    }}\n}}\n"
+        )
+    });
+    let port = raddy.port();
+
+    // With the loopback peer trusted, the ip_hash key is the X-Forwarded-For
+    // client. Each distinct client must pin to one upstream, and two distinct
+    // clients must pin to different upstreams — if the code still keyed on the
+    // TCP peer, every client would share a single upstream.
+    let pin = |xff: &str| -> String {
+        let header = format!("X-Forwarded-For: {xff}");
+        let mut bodies = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let resp = send_request_hdr(port, Some("localhost"), "/", &[&header]);
+            assert_eq!(resp.status, 200, "client {xff} request failed: {resp:?}");
+            bodies.insert(resp.body.clone());
+        }
+        assert_eq!(
+            bodies.len(),
+            1,
+            "client {xff} must stay pinned to one upstream: {bodies:?}"
+        );
+        bodies.into_iter().next().unwrap()
+    };
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut distinct = false;
+    for n in 1..64 {
+        seen.insert(pin(&format!("1.2.3.{n}")));
+        if seen.len() >= 2 {
+            distinct = true;
+            break;
+        }
+    }
+    assert!(
+        distinct,
+        "distinct X-Forwarded-For clients must reach distinct upstreams: {seen:?}"
+    );
+}
+
+#[test]
+fn untrusted_peer_ip_hash_ignores_xff() {
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, _b) = EchoUpstream::spawn("B");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    reverse_proxy {{\n        to 127.0.0.1:{a_port} 127.0.0.1:{b_port}\n        lb_policy ip_hash\n    }}\n}}\n"
+        )
+    });
+
+    // Without `trusted_proxies` the X-Forwarded-For header is ignored: requests
+    // carrying different XFF clients all key on the same loopback TCP peer and
+    // must stay pinned to a single upstream.
+    let mut bodies = std::collections::BTreeSet::new();
+    for n in 0..20 {
+        let header = format!("X-Forwarded-For: 1.2.3.{n}");
+        let resp = send_request_hdr(raddy.port(), Some("localhost"), "/", &[&header]);
+        assert_eq!(resp.status, 200);
+        bodies.insert(resp.body.clone());
+    }
+    assert_eq!(
+        bodies.len(),
+        1,
+        "untrusted X-Forwarded-For must not affect ip_hash: {bodies:?}"
     );
 }
 

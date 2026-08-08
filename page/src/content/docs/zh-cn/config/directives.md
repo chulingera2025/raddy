@@ -145,10 +145,11 @@ header_up <name> <value>
 header_down <name> <value>
 ```
 
-**参数。** `<name>` 是头名;`<value>` 是值或占位符:`{remote_host}`(客户端
-套接字地址)、`{host}`、`{uri}`。
+**参数。** `<name>` 是头名;`<value>` 是值或占位符:`{remote_host}`(TCP
+客户端套接字地址——直接对端 IP,而非可信代理推导的有效客户端 IP)、
+`{host}`、`{uri}`。
 
-**示例。** 把真实客户端地址透传给后端:
+**示例。** 把客户端套接字地址透传给后端:
 
 ```caddyfile
 api.example.com {
@@ -201,7 +202,7 @@ rate_limit <key> <rate> [burst=<n>]
 
 **参数。**
 
-- `<key>` —— `remote_ip`,真实客户端 IP(见[可信代理](trusted-proxies/))。
+- `<key>` —— `remote_ip`,真实客户端 IP(见[可信代理](../trusted-proxies/))。
 - `<rate>` —— `<count>r/<unit>`,单位是 `s` / `m` / `h` / `d`,例如 `50r/s`、
   `1200r/m`。count 至少为 1。
 - `burst=<n>` —— 令牌桶容量,默认等于 rate 的 count。
@@ -244,7 +245,7 @@ static.example.com {
 ## `trusted_proxies`
 
 **作用。** 声明哪些网络是可信代理,使 raddy 能从 `X-Forwarded-For` 推导真实
-客户端 IP。见[可信代理](trusted-proxies/)。
+客户端 IP。见[可信代理](../trusted-proxies/)。
 
 **语法。**
 
@@ -259,7 +260,7 @@ trusted_proxies <cidr>...
 
 **作用。** 用 **DNS-01** 代替 HTTP-01 签发证书,通过 DNS 服务商发布 TXT
 记录证明域名控制权。适合 80 端口不可达的场景。见[站点 · 端口 ·
-HTTPS](sites/)。
+HTTPS](../sites/)。
 
 **语法。**
 
@@ -268,7 +269,7 @@ dns_challenge cloudflare <api_token>
 ```
 
 **参数。** 服务商(`cloudflare`——目前唯一)与服务商的 API 令牌,令牌需要
-**Zone: DNS: Edit** 权限。位于[全局块](sites/#全局块)。
+**Zone: DNS: Edit** 权限。位于[全局块](../sites/#全局块)。
 
 **行为。** 配置后,本实例上所有证书走 DNS-01 签发:raddy 在校验订单期间发布
 `_acme-challenge.<host>` TXT 记录,完成后移除。未配置 `dns_challenge` 时
@@ -311,7 +312,7 @@ log_level <level>
 acme_email <address>
 ```
 
-**参数。** 一个邮箱地址。位于[全局块](sites/#全局块)。
+**参数。** 一个邮箱地址。位于[全局块](../sites/#全局块)。
 
 ## `snippet` / `import`
 

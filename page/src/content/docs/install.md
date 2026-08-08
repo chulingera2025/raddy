@@ -52,9 +52,25 @@ System dependencies: stable Rust, OpenSSL dev libraries (`libssl-dev` /
 
 ## Docker
 
+The image does **not** bake in a Raddyfile, so mount your own read-only. The
+image's `ENTRYPOINT` is `raddy`, so the container command is the `run`
+subcommand itself. Run these from the directory that contains your `Raddyfile`:
+
 ```bash
 docker build -t raddy .
-docker run --rm -p 8080:8080 raddy run -c /etc/raddy/Raddyfile
+docker run --rm -p 8080:8080 \
+  -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
+  raddy run -c /etc/raddy/Raddyfile
+```
+
+To keep ACME certificates across container restarts, mount a certificate
+directory and point `--cert-dir` at it:
+
+```bash
+docker run --rm -p 80:80 -p 443:443 \
+  -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
+  -v raddy_certs:/etc/raddy/certs \
+  raddy run -c /etc/raddy/Raddyfile --cert-dir /etc/raddy/certs
 ```
 
 ## Verify the install

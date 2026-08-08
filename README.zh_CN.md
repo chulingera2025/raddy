@@ -19,7 +19,7 @@ Rust 网关生态的现状大致两类：直接手写 Pingora 代码，或者使
 ## 功能特性
 
 - **显式书写顺序 DSL**（Raddyfile）：终端指令 vs 修饰指令、`handle` 互斥匹配块、无隐藏排序规则。见 [Raddyfile 规范](docs/RADDYFILE_SPEC.zh_CN.md)。
-- **自动 HTTPS**：具名站点通过 ACME（HTTP-01）自动签发，SNI 动态证书，含 On-Demand `ask` 授权回调。
+- **自动 HTTPS**：具名站点通过 ACME 自动签发（默认 HTTP-01，或经 `dns_challenge cloudflare <token>` 走 DNS-01），SNI 动态证书，含 On-Demand `ask` 授权回调。
 - **配置热重载**：SIGHUP 原子替换路由快照；上游连接池跨重载存活（零中断）。
 - **静态托管 + 压缩**：`file_server` 带目录穿越防护；`encode` 支持 gzip/zstd 并按 `Accept-Encoding` 选择。
 - **可观测性**：结构化 JSON 访问日志 + Prometheus `/metrics` 端点（QPS + 延迟）。
@@ -70,6 +70,9 @@ raddy.test {
 ```bash
 raddy run -c Raddyfile --acme-directory https://acme-v02.api.letsencrypt.org/directory
 ```
+
+80 端口不可达？在全局块加 `dns_challenge cloudflare <token>`，改用 DNS-01
+证明控制权（见 [Raddyfile 规范](docs/RADDYFILE_SPEC.zh_CN.md)）。
 
 ## 配置
 

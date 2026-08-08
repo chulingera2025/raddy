@@ -65,7 +65,7 @@ A named site on port 443 gets a certificate automatically:
    challenge on its plain-HTTP listener (`/.well-known/acme-challenge/…`), or
    with **DNS-01** via `dns_challenge` in the [global block](#the-global-block)
    when port 80 is unreachable (see the
-   [directive reference](directives/#dns_challenge)).
+   [directive reference](../directives/#dns_challenge)).
 2. **SNI** — each HTTPS request's certificate is selected by the requested
    hostname, so a multi-site server serves the right certificate per site.
 3. **Caching** — certificates and account credentials are stored under

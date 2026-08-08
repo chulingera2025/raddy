@@ -56,45 +56,56 @@ export default defineConfig({
 			editLink: {
 				baseUrl: 'https://github.com/chulingera2025/raddy/edit/main/page',
 			},
+			// The 404 fallback is a fully custom page (`src/pages/404.astro`) so the
+			// injected Starlight 404 route is disabled to avoid the `/404` route
+			// conflict that otherwise breaks builds of the `docs` content collection.
+			disable404Route: true,
+			// Explicit crawl directives for every page, alongside public/robots.txt.
+			// Starlight already emits canonical/OG/Twitter metadata for each page.
+			// The custom 404 page overrides this per page (`noindex, follow`) via its
+			// frontmatter `head`, which Starlight merges by replacing the site-wide tag.
+			head: [
+				{ tag: 'meta', attrs: { name: 'robots', content: 'index, follow' } },
+			],
 			expressiveCode: {
 				shiki: { langs: [caddyfileLang] },
 			},
 			sidebar: [
 				{
 					label: 'Getting Started',
-					translations: { 'zh-cn': '快速开始' },
+					translations: { 'zh-CN': '快速开始' },
 					items: [
-						{ label: 'Quick start', translations: { 'zh-cn': '快速上手' }, slug: 'quickstart' },
-						{ label: 'Installation', translations: { 'zh-cn': '安装' }, slug: 'install' },
+						{ label: 'Quick start', translations: { 'zh-CN': '快速上手' }, slug: 'quickstart' },
+						{ label: 'Installation', translations: { 'zh-CN': '安装' }, slug: 'install' },
 					],
 				},
 				{
 					label: 'Guides',
-					translations: { 'zh-cn': '指南' },
+					translations: { 'zh-CN': '指南' },
 					items: [
-						{ label: 'Serve static files', translations: { 'zh-cn': '静态托管' }, slug: 'guides/static-files' },
-						{ label: 'Redirect HTTP → HTTPS', translations: { 'zh-cn': 'HTTP → HTTPS 重定向' }, slug: 'guides/http-to-https' },
-						{ label: 'Proxy an API', translations: { 'zh-cn': '代理 API' }, slug: 'guides/api-proxy' },
+						{ label: 'Serve static files', translations: { 'zh-CN': '静态托管' }, slug: 'guides/static-files' },
+						{ label: 'Redirect HTTP → HTTPS', translations: { 'zh-CN': 'HTTP → HTTPS 重定向' }, slug: 'guides/http-to-https' },
+						{ label: 'Proxy an API', translations: { 'zh-CN': '代理 API' }, slug: 'guides/api-proxy' },
 					],
 				},
 				{
 					label: 'Raddyfile',
-					translations: { 'zh-cn': 'Raddyfile' },
+					translations: { 'zh-CN': 'Raddyfile' },
 					items: [
-						{ label: 'Concepts', translations: { 'zh-cn': '核心概念' }, slug: 'config' },
-						{ label: 'Directives', translations: { 'zh-cn': '指令参考' }, slug: 'config/directives' },
-						{ label: 'Sites, ports & HTTPS', translations: { 'zh-cn': '站点 · 端口 · HTTPS' }, slug: 'config/sites' },
-						{ label: 'Trusted proxies', translations: { 'zh-cn': '可信代理' }, slug: 'config/trusted-proxies' },
+						{ label: 'Concepts', translations: { 'zh-CN': '核心概念' }, slug: 'config' },
+						{ label: 'Directives', translations: { 'zh-CN': '指令参考' }, slug: 'config/directives' },
+						{ label: 'Sites, ports & HTTPS', translations: { 'zh-CN': '站点 · 端口 · HTTPS' }, slug: 'config/sites' },
+						{ label: 'Trusted proxies', translations: { 'zh-CN': '可信代理' }, slug: 'config/trusted-proxies' },
 					],
 				},
 				{
 					label: 'CLI & Operations',
-					translations: { 'zh-cn': 'CLI 与运维' },
+					translations: { 'zh-CN': 'CLI 与运维' },
 					items: [
-						{ label: 'CLI reference', translations: { 'zh-cn': 'CLI 参考' }, slug: 'cli' },
-						{ label: 'Metrics', translations: { 'zh-cn': '指标' }, slug: 'operations/metrics' },
-						{ label: 'Access log', translations: { 'zh-cn': '访问日志' }, slug: 'operations/access-log' },
-						{ label: 'Performance', translations: { 'zh-cn': '性能' }, slug: 'performance' },
+						{ label: 'CLI reference', translations: { 'zh-CN': 'CLI 参考' }, slug: 'cli' },
+						{ label: 'Metrics', translations: { 'zh-CN': '指标' }, slug: 'operations/metrics' },
+						{ label: 'Access log', translations: { 'zh-CN': '访问日志' }, slug: 'operations/access-log' },
+						{ label: 'Performance', translations: { 'zh-CN': '性能' }, slug: 'performance' },
 					],
 				},
 			],

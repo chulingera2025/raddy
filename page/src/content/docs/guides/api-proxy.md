@@ -6,7 +6,8 @@ description: Load balance an API across upstreams with health checks, rate limit
 ## Goal
 
 Expose an API over HTTPS with two backend instances, automatic failover when one
-drops, rate limiting per client, and the real client IP forwarded to the backend.
+drops, rate limiting per client, and the client socket address forwarded to the
+backend.
 
 ## Configuration
 
@@ -45,8 +46,9 @@ What each piece does:
   (timeout `2s`). An upstream is removed only after `3` consecutive failures and
   restored only after `2` consecutive successes — this flapping suppression
   avoids thrashing on a flaky network.
-- **`header_up X-Real-IP {remote_host}`** — passes the client address to the
-  backend so it can log and throttle accurately.
+- **`header_up X-Real-IP {remote_host}`** — forwards the client socket address
+  (the direct TCP peer) to the backend. Behind a trusted proxy that is the
+  proxy's address, not the effective client IP used by `rate_limit`.
 
 ## Run it
 

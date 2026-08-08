@@ -20,18 +20,32 @@
 //! hostname, creating a TXT record, and deleting it again after the order.
 //!
 //! The ACME issuance worker runs on its own single-threaded runtime and
-//! serializes orders, so blocking I/O here is acceptable.
+//! serializes orders, so blocking I/O here is acceptable — but every call is
+//! *bounded*: the shared ureq [`Agent`] has finite connect/read/write/overall
+//! timeouts and a resolver that delegates to the fixed resolver pool, so a
+//! hung Cloudflare API (DNS, connect, or an unresponsive server) can never
+//! block the single issuance worker (or its DNS-01 cleanup) forever.
 
 use serde::Deserialize;
+use std::time::Duration;
 
 /// Cloudflare API v4 base URL.
 const DEFAULT_API_BASE: &str = "https://api.cloudflare.com/client/v4";
+
+/// Connect timeout for Cloudflare API requests.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-read/write and overall timeout for Cloudflare API requests.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A Cloudflare DNS-01 client. The API token is a secret and must have
 /// `Zone: DNS: Edit` permission.
 pub struct Cloudflare {
     api_token: String,
     base_url: String,
+    /// Shared agent with finite timeouts and the bounded resolver, so a hung
+    /// API call cannot block the single ACME issuance worker (or its DNS-01
+    /// cleanup) indefinitely.
+    agent: ureq::Agent,
 }
 
 /// A TXT record created by [`Cloudflare::present`], kept so `cleanup` can
@@ -50,17 +64,39 @@ impl Cloudflare {
     pub fn new(api_token: &str) -> Self {
         let base_url = std::env::var("RADDY_CLOUDFLARE_API_BASE")
             .unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
-        Self {
-            api_token: api_token.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-        }
+        Self::with_agent(
+            api_token,
+            &base_url,
+            build_agent(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+        )
     }
 
     /// Create a client against an explicit API base URL (test hook).
     pub fn with_base(api_token: &str, base_url: &str) -> Self {
+        Self::with_agent(
+            api_token,
+            base_url,
+            build_agent(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+        )
+    }
+
+    /// Create a client with explicit API timeouts (test hook).
+    #[cfg(test)]
+    fn with_timeouts(
+        api_token: &str,
+        base_url: &str,
+        connect: Duration,
+        request: Duration,
+    ) -> Self {
+        Self::with_agent(api_token, base_url, build_agent(connect, request))
+    }
+
+    /// Assemble a client around a ready-made agent (shared constructor).
+    fn with_agent(api_token: &str, base_url: &str, agent: ureq::Agent) -> Self {
         Self {
             api_token: api_token.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            agent,
         }
     }
 
@@ -127,17 +163,17 @@ impl Cloudflare {
 
     /// Build a GET request carrying the bearer token.
     fn auth_get(&self, url: &str) -> ureq::Request {
-        ureq::get(url).set("Authorization", &self.bearer())
+        self.agent.get(url).set("Authorization", &self.bearer())
     }
 
     /// Build a POST request carrying the bearer token.
     fn auth_post(&self, url: &str) -> ureq::Request {
-        ureq::post(url).set("Authorization", &self.bearer())
+        self.agent.post(url).set("Authorization", &self.bearer())
     }
 
     /// Build a DELETE request carrying the bearer token.
     fn auth_delete(&self, url: &str) -> ureq::Request {
-        ureq::delete(url).set("Authorization", &self.bearer())
+        self.agent.delete(url).set("Authorization", &self.bearer())
     }
 
     fn bearer(&self) -> String {
@@ -173,6 +209,20 @@ impl Cloudflare {
         }
         Ok(envelope)
     }
+}
+
+/// Build a ureq [`Agent`] whose requests are fully bounded: finite connect,
+/// read, write, and overall timeouts, plus a resolver that delegates to the
+/// fixed resolver pool (ureq's own DNS cannot be interrupted by a request
+/// timeout). `request` bounds the overall request as well as each read/write.
+fn build_agent(connect_timeout: Duration, request_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(connect_timeout)
+        .timeout_read(request_timeout)
+        .timeout_write(request_timeout)
+        .timeout(request_timeout)
+        .resolver(crate::config::resolver::agent_resolver)
+        .build()
 }
 
 /// The Cloudflare API response envelope: `{ success, errors, result }`.
@@ -366,5 +416,47 @@ mod tests {
         let client = Cloudflare::with_base("test-token", &base);
         let err = client.present("other.org", "ka").unwrap_err();
         assert!(err.contains("no Cloudflare zone found"), "got: {err}");
+    }
+
+    #[test]
+    fn request_times_out_when_server_withholds_response() {
+        // A server that accepts the connection and reads the request but never
+        // sends a response. The client's finite request timeout must surface as
+        // a transport error promptly, never hanging the test (or, in
+        // production, the single ACME issuance worker and its DNS-01 cleanup).
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+        let addr = listener.local_addr().expect("mock address");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read the request so the client has fully sent it, then withhold
+            // the response until the test releases us.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = release_rx.recv();
+        });
+
+        let client = Cloudflare::with_timeouts(
+            "test-token",
+            &format!("http://{addr}"),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        let start = std::time::Instant::now();
+        let err = client.present("example.com", "ka").unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a withheld response must time out, not hang (took {elapsed:?})"
+        );
+        assert!(
+            err.contains("transport"),
+            "expected a transport error, got: {err}"
+        );
+
+        let _ = release_tx.send(());
+        server.join().expect("server thread joins");
     }
 }

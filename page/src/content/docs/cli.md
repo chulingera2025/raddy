@@ -41,7 +41,7 @@ raddy check -c Raddyfile   # prints "Raddyfile: ok", exits 0; or prints the erro
 
 Convert a Caddyfile or nginx.conf subset into a Raddyfile. An **independent
 converter**: it never changes the Raddyfile grammar, and it validates its own
-output (through the same pipagem a reload uses) before printing.
+output (through the same pipeline a reload uses) before printing.
 
 ```bash
 raddy import caddyfile <source> [-o <output>]

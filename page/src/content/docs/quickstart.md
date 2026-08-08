@@ -9,7 +9,7 @@ minutes and a terminal.
 
 ## Before you start
 
-[Install raddy](install/) if you haven't yet. You'll also want a local HTTP
+[Install raddy](../install/) if you haven't yet. You'll also want a local HTTP
 service to proxy to — start a trivial one if you don't have anything running on
 `127.0.0.1:8080`:
 
@@ -33,7 +33,7 @@ example.local:8090 {
 > **Why the explicit port?** A named site without a port binds **443 (TLS)** and
 > enables automatic HTTPS. Writing `:8090` keeps this first example plain HTTP so
 > you can run it on your laptop without a real domain. Ports and HTTPS are
-> covered in [Sites, ports & HTTPS](config/sites/).
+> covered in [Sites, ports & HTTPS](../config/sites/).
 
 ## 2. Validate the configuration
 
@@ -116,8 +116,8 @@ curl -H 'Host: static.local' http://127.0.0.1:8090/hello.txt
 
 ## Next steps
 
-- [Serve static files](guides/static-files/) — `file_server` in detail
-- [Redirect HTTP → HTTPS](guides/http-to-https/) — the `:80` catch-all pattern
-- [Proxy an API](guides/api-proxy/) — load balancing, health checks, rate limiting
-- [Sites, ports & HTTPS](config/sites/) — how matching and certificates work
-- [Directive reference](config/directives/) — every directive, with examples
+- [Serve static files](../guides/static-files/) — `file_server` in detail
+- [Redirect HTTP → HTTPS](../guides/http-to-https/) — the `:80` catch-all pattern
+- [Proxy an API](../guides/api-proxy/) — load balancing, health checks, rate limiting
+- [Sites, ports & HTTPS](../config/sites/) — how matching and certificates work
+- [Directive reference](../config/directives/) — every directive, with examples

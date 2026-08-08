@@ -1,0 +1,58 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+
+// Custom 404 fallback page, rendered for every unmatched URL (Astro serves it
+// from `/404.html` regardless of the path the visitor landed on). Starlight's
+// own 404 route is disabled via `disable404Route` in astro.config.mjs, so this
+// is the single source for the "page not found" experience and keeps the
+// bilingual content that `docs/404.md` used to provide.
+//
+// Links MUST be absolute site-root paths carrying the `base` prefix
+// (`/raddy/...`) — because the page is served at whatever URL was requested, a
+// relative link would resolve against that missing URL and break. `scripts/check-links.mjs`
+// enforces this.
+const frontmatter = {
+	title: 'Page not found',
+	description: 'The page you are looking for could not be found on the Raddy documentation site.',
+	template: 'splash',
+	editUrl: false,
+	pagefind: false,
+	// Replace the site-wide `index, follow` robots meta (config `head`) with a
+	// noindex directive for this page. Starlight merges page `head` entries over
+	// config entries by matching on `name`, so exactly one `robots` tag is emitted
+	// — never a conflicting pair.
+	head: [{ tag: 'meta', attrs: { name: 'robots', content: 'noindex, follow' } }],
+};
+---
+
+<StarlightPage frontmatter={frontmatter}>
+	<p>
+		The page you tried to open does not exist — it may have moved, been renamed, or
+		the link may be stale.
+	</p>
+	<p>You can try:</p>
+	<ul>
+		<li>
+			<a href="/raddy/quickstart/">Quick start</a> — write your first Raddyfile in five
+			minutes
+		</li>
+		<li>
+			<a href="/raddy/config/">Configuration guide</a> — the mental model behind the Raddyfile
+		</li>
+		<li>
+			<a href="/raddy/cli/">CLI reference</a> — every <code>raddy</code> subcommand and option
+		</li>
+	</ul>
+	<p><a href="/raddy/">Back to the homepage</a></p>
+	<hr />
+	<p>你尝试打开的页面不存在——它可能已被移动、重命名，或链接已失效。</p>
+	<p>你可以尝试：</p>
+	<ul>
+		<li>
+			<a href="/raddy/zh-cn/quickstart/">快速上手</a> —— 五分钟写出你的第一个 Raddyfile
+		</li>
+		<li><a href="/raddy/zh-cn/config/">核心概念</a> —— Raddyfile 背后的心智模型</li>
+		<li><a href="/raddy/zh-cn/cli/">CLI 参考</a> —— 所有 <code>raddy</code> 子命令与选项</li>
+	</ul>
+	<p><a href="/raddy/zh-cn/">返回首页</a></p>
+</StarlightPage>

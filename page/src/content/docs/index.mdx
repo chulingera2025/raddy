@@ -26,7 +26,9 @@ Pingora's performance and memory safety.
 		no hidden ordering table.
 	</Card>
 	<Card title="Automatic HTTPS" icon="lock">
-		Native ACME (HTTP-01) issuance with SNI certificates, out of the box.
+		Native ACME — HTTP-01 by default, or **DNS-01** via
+		[`dns_challenge cloudflare`](config/directives/#dns_challenge) — with SNI
+		certificates, out of the box.
 	</Card>
 	<Card title="Hot reload" icon="refresh">
 		SIGHUP swaps the routing snapshot atomically; connections stay up.
