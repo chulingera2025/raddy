@@ -3,8 +3,9 @@ title: 可信代理
 description: 告诉 raddy 哪些网络可信,使其能从 X-Forwarded-For 推导真实客户端 IP。
 ---
 
-依赖客户端身份的功能 —— [限流](directives/#rate_limit)、访问日志 —— 需要
-*真实*客户端 IP,而非中间代理的地址。本页说明 raddy 如何判断这一点。
+依赖客户端身份的功能 —— [限流](../directives/#rate_limit)、`ip_hash`
+负载均衡、访问日志 —— 需要*真实*客户端 IP,而非中间代理的地址。本页说明
+raddy 如何判断这一点。
 
 ## 默认行为
 

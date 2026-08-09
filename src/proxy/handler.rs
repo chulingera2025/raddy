@@ -24,7 +24,7 @@ use crate::config::ast::{
     Variable,
 };
 use crate::config::snapshot::ConfigStore;
-use crate::proxy::compress::{self, Algo};
+use crate::proxy::compress;
 use crate::proxy::lb::{LbSpec, LoadBalancerPool};
 use crate::proxy::ratelimit::RateLimiter;
 use crate::proxy::site;
@@ -35,7 +35,7 @@ use pingora::prelude::*;
 use pingora::proxy::Session;
 use serde::Serialize;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -76,7 +76,7 @@ impl ProxyHandler {
 /// One structured access-log line (M5).
 #[derive(Serialize)]
 struct AccessLogEntry {
-    /// Epoch milliseconds of the request.
+    /// Epoch milliseconds of the request start.
     ts: u64,
     client: String,
     method: String,
@@ -98,12 +98,22 @@ pub struct ProxyCtx {
     modifiers: Vec<Modifier>,
     /// The site's `encode` priorities (empty = no compression).
     encode_algos: Vec<Encoding>,
-    /// The encoding chosen for this response, if any.
-    response_encoding: Option<Algo>,
-    /// Accumulated response body for compression (buffered until end of stream).
-    body_buffer: Vec<u8>,
-    /// When the request started (for access-log duration).
+    /// Per-request streaming compression encoder, created in `response_filter`
+    /// when a response is compressed (B3b1). Bounded by the codec state plus the
+    /// current chunk; `None` when the response is not compressed.
+    encoder: Option<compress::Encoder>,
+    /// When the request started, as a monotonic clock (for access-log duration).
     start: Option<Instant>,
+    /// The wall-clock request start in epoch milliseconds (the access-log `ts`;
+    /// captured in `request_filter` so it is the request start, not the logging
+    /// time). `None` only if the clock read failed.
+    start_wall: Option<u64>,
+    /// The effective client IP per the §4 trust model. Resolved once per
+    /// selected site from its `trusted_proxies` (or the global list) and shared
+    /// by rate limiting, `ip_hash`, and the access log. `None` for requests that
+    /// fail before a site is selected (ACME/400/404) or when the peer address is
+    /// unavailable — callers then fall back to the TCP peer.
+    effective_client_ip: Option<IpAddr>,
 }
 
 #[async_trait]
@@ -116,6 +126,9 @@ impl ProxyHttp for ProxyHandler {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         ctx.start = Some(Instant::now());
+        // The access log's `ts` documents the request start, so capture the wall
+        // clock now rather than at logging time (latency still uses the Instant).
+        ctx.start_wall = Some(epoch_now_ms());
         // ACME HTTP-01 challenge: serve `/.well-known/acme-challenge/<token>`
         // from the challenge store before any site selection, so the response
         // is served regardless of the site routing.
@@ -151,6 +164,11 @@ impl ProxyHttp for ProxyHandler {
                     Some(networks) => networks.clone(),
                     None => config.global.trusted_proxies.clone(),
                 };
+                // Resolve the effective client IP once per site (§4). rate_limit,
+                // `ip_hash`, and the access log all consume this same value;
+                // requests that fail before a site is selected (ACME/400/404)
+                // fall back to the TCP peer.
+                ctx.effective_client_ip = client_ip(session, &trusted);
                 for (index, terminal) in site.terminals.iter().enumerate() {
                     if !matchers_match(&terminal.matchers, &path) {
                         continue;
@@ -161,20 +179,13 @@ impl ProxyHttp for ProxyHandler {
                     modifiers.extend(terminal.modifiers.iter().cloned());
                     // Rate limiting (spec §5.2): each `rate_limit` directive has
                     // its own per-(terminal, client IP) token bucket; an empty
-                    // bucket rejects the request with 429. The client IP is only
-                    // derived when a rate_limit is actually in scope.
-                    if modifiers
-                        .iter()
-                        .any(|m| matches!(m, Modifier::RateLimit { .. }))
-                    {
-                        if let Some(ip) = client_ip(session, &trusted) {
-                            for (offset, modifier) in modifiers.iter().enumerate() {
-                                if let Modifier::RateLimit { spec } = modifier {
-                                    if !self.rate_limiter.allow(&site.key, index, offset, ip, spec)
-                                    {
-                                        session.respond_error(429).await?;
-                                        return Ok(true);
-                                    }
+                    // bucket rejects the request with 429.
+                    if let Some(ip) = ctx.effective_client_ip {
+                        for (offset, modifier) in modifiers.iter().enumerate() {
+                            if let Modifier::RateLimit { spec } = modifier {
+                                if !self.rate_limiter.allow(&site.key, index, offset, ip, spec) {
+                                    session.respond_error(429).await?;
+                                    return Ok(true);
                                 }
                             }
                         }
@@ -185,6 +196,10 @@ impl ProxyHttp for ProxyHandler {
                             let mut resp = ResponseHeader::build(*code, None)?;
                             resp.insert_header(http::header::LOCATION, location)?;
                             resp.insert_header(http::header::CONTENT_LENGTH, "0")?;
+                            // `header_down` applies to the final response header,
+                            // overriding the redirect's own Location/Content-Length
+                            // exactly like the reverse-proxy path.
+                            apply_header_down(&modifiers, session, &mut resp);
                             session.write_response_header(Box::new(resp), true).await?;
                             return Ok(true);
                         }
@@ -207,7 +222,8 @@ impl ProxyHttp for ProxyHandler {
                         }
                         TerminalKind::FileServer { root } => {
                             let encode = encode_algos(&modifiers);
-                            crate::proxy::fs::serve(session, root, &path, &encode).await?;
+                            crate::proxy::fs::serve(session, root, &path, &encode, &modifiers)
+                                .await?;
                             return Ok(true);
                         }
                     }
@@ -235,13 +251,20 @@ impl ProxyHttp for ProxyHandler {
         let balancer = self
             .pool
             .balancer_for(site_key, ctx.terminal_index, lb_spec.clone());
-        // `ip_hash` keys on the client IP for per-IP session stickiness; the
-        // other policies ignore the key.
+        // `ip_hash` keys on the effective client IP for per-IP session
+        // stickiness; the other policies ignore the key. The effective IP is
+        // resolved once per site (spec §4) so a trusted `X-Forwarded-For` client
+        // is honored here exactly as in rate limiting and the access log.
         let key = match lb_spec.policy {
-            LbPolicy::IpHash => session
-                .client_addr()
-                .and_then(|addr| addr.as_inet())
-                .map(|addr| addr.ip().to_string().into_bytes())
+            LbPolicy::IpHash => ctx
+                .effective_client_ip
+                .or_else(|| {
+                    session
+                        .client_addr()
+                        .and_then(|addr| addr.as_inet())
+                        .map(|addr| addr.ip())
+                })
+                .map(|ip| ip.to_string().into_bytes())
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
@@ -258,16 +281,10 @@ impl ProxyHttp for ProxyHandler {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        for (name, value) in header_ops(&ctx.modifiers, true, session) {
-            match http::HeaderName::from_bytes(name.as_bytes()) {
-                Ok(header_name) => {
-                    if let Err(e) = upstream_request.insert_header(header_name, value) {
-                        tracing::warn!("failed to set request header '{name}': {e}");
-                    }
-                }
-                Err(_) => tracing::warn!("skipping invalid header name '{name}'"),
-            }
-        }
+        let ops = header_ops(&ctx.modifiers, true, session);
+        apply_header_ops(&ops, |name, value| {
+            let _ = upstream_request.insert_header(name, value);
+        });
         Ok(())
     }
 
@@ -277,34 +294,44 @@ impl ProxyHttp for ProxyHandler {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        for (name, value) in header_ops(&ctx.modifiers, false, session) {
-            match http::HeaderName::from_bytes(name.as_bytes()) {
-                Ok(header_name) => {
-                    if let Err(e) = upstream_response.insert_header(header_name, value) {
-                        tracing::warn!("failed to set response header '{name}': {e}");
-                    }
-                }
-                Err(_) => tracing::warn!("skipping invalid header name '{name}'"),
-            }
-        }
+        // `header_down` is a declarative transform on the final response header,
+        // shared with the `redir` and `file_server` terminals.
+        apply_header_down(&ctx.modifiers, session, upstream_response);
 
-        // Compression (M5): if the site enables `encode` and the client accepts
-        // an algorithm, mark the response and let response_body_filter buffer +
-        // compress it. Never double-compress an already-encoded response, and
-        // skip statuses that carry no body.
-        if !upstream_response
-            .headers
-            .contains_key(http::header::CONTENT_ENCODING)
-            && !matches!(upstream_response.status.as_u16(), 204 | 304 | 206 | 1..=199)
-        {
+        // Compression (M5, B3b1): if the site enables `encode` and the client
+        // accepts an algorithm, mark the response and stream it through a
+        // per-request encoder in `response_body_filter`. Never double-compress
+        // an already-encoded response, and skip requests/responses that carry no
+        // body (HEAD, 1xx, 204, 304, and partial 206 responses).
+        let compressible = session.req_header().method != http::Method::HEAD
+            && !upstream_response
+                .headers
+                .contains_key(http::header::CONTENT_ENCODING)
+            && !matches!(upstream_response.status.as_u16(), 204 | 304 | 206 | 1..=199);
+        if compressible && !ctx.encode_algos.is_empty() {
+            // The representation depends on the request's Accept-Encoding, so a
+            // shared cache must vary on it (RFC 9110 §12.5.3) — even when this
+            // particular client did not ask for compression.
+            merge_vary_accept_encoding(upstream_response);
             let accept = session
                 .req_header()
                 .headers
                 .get(http::header::ACCEPT_ENCODING);
             if let Some(algo) = compress::choose(&ctx.encode_algos, accept) {
-                ctx.response_encoding = Some(algo);
-                upstream_response.insert_header(http::header::CONTENT_ENCODING, algo.token())?;
-                upstream_response.remove_header(&http::header::CONTENT_LENGTH);
+                match compress::Encoder::new(algo) {
+                    Ok(encoder) => {
+                        ctx.encoder = Some(encoder);
+                        upstream_response
+                            .insert_header(http::header::CONTENT_ENCODING, algo.token())?;
+                        upstream_response.remove_header(&http::header::CONTENT_LENGTH);
+                    }
+                    Err(e) => {
+                        // The header is not yet committed, so skipping
+                        // compression is safe — an encoder init failure is
+                        // essentially only a zstd context allocation failure.
+                        tracing::warn!("failed to initialize {algo:?} encoder: {e}");
+                    }
+                }
             }
         }
         Ok(())
@@ -317,16 +344,25 @@ impl ProxyHttp for ProxyHandler {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
-        if let Some(algo) = ctx.response_encoding {
-            if let Some(chunk) = body.take() {
-                ctx.body_buffer.extend_from_slice(&chunk);
-            }
+        let Some(encoder) = ctx.encoder.as_mut() else {
+            return Ok(None);
+        };
+        let chunk = body.take().unwrap_or_default();
+        // Feed the chunk and flush so the compressed bytes reach the client
+        // before the response ends; at EOS, finalize the single member/frame.
+        // A codec error here must propagate — never fall back to raw bytes —
+        // because `Content-Encoding` was already committed to the client.
+        let out = if chunk.is_empty() && !end_of_stream {
+            Vec::new()
+        } else {
+            let mut out = encoder.write(&chunk).map_err(compression_error)?;
             if end_of_stream {
-                // Flush the fully-buffered compressed body now.
-                let compressed = compress::compress(algo, &ctx.body_buffer);
-                ctx.body_buffer.clear();
-                *body = Some(Bytes::from(compressed));
+                out.extend(encoder.finish().map_err(compression_error)?);
             }
+            out
+        };
+        if !out.is_empty() {
+            *body = Some(Bytes::from(out));
         }
         Ok(None)
     }
@@ -360,10 +396,17 @@ fn access_log_entry(session: &Session, ctx: &ProxyCtx) -> Option<AccessLogEntry>
         .start
         .map(|start| start.elapsed().as_millis())
         .unwrap_or(0);
-    let client = session
-        .client_addr()
-        .and_then(|addr| addr.as_inet())
-        .map(|addr| addr.ip().to_string())
+    // The effective client IP when a site resolved one (spec §4); requests that
+    // failed before site selection (ACME/400/404) fall back to the TCP peer.
+    let client = ctx
+        .effective_client_ip
+        .map(|ip| ip.to_string())
+        .or_else(|| {
+            session
+                .client_addr()
+                .and_then(|addr| addr.as_inet())
+                .map(|addr| addr.ip().to_string())
+        })
         .unwrap_or_default();
     let method = session.req_header().method.to_string();
     let uri = &session.req_header().uri;
@@ -371,10 +414,7 @@ fn access_log_entry(session: &Session, ctx: &ProxyCtx) -> Option<AccessLogEntry>
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| uri.path().to_string());
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let ts = ctx.start_wall.unwrap_or_else(epoch_now_ms);
     Some(AccessLogEntry {
         ts,
         client,
@@ -383,6 +423,14 @@ fn access_log_entry(session: &Session, ctx: &ProxyCtx) -> Option<AccessLogEntry>
         status,
         duration_ms,
     })
+}
+
+/// The current wall clock in epoch milliseconds (the access-log `ts`).
+fn epoch_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The port of the local listener a request arrived on (per-listener selection).
@@ -417,7 +465,7 @@ fn challenge_token(path: &str) -> Option<&str> {
 }
 
 /// The real client IP per the §4 trust model, or `None` when the peer address
-/// is unavailable (callers then skip rate limiting).
+/// is unavailable (callers then fall back to the TCP peer).
 fn client_ip(session: &Session, trusted: &[Cidr]) -> Option<IpAddr> {
     let peer = session.client_addr()?.as_inet()?.ip();
     let xff = session
@@ -528,6 +576,48 @@ fn header_ops(modifiers: &[Modifier], up: bool, session: &Session) -> Vec<(Strin
     ops
 }
 
+/// Apply a set of pre-expanded header rewrites via a caller-supplied inserter.
+///
+/// Each name is validated as an HTTP token and each value as an HTTP header
+/// value; invalid ones are skipped with a warning, never a panic. `insert`
+/// semantics replace any existing header of the same name, so a rewrite always
+/// wins over the value the terminal or upstream set — this is the single
+/// validation/expansion implementation shared by `header_up` (request) and
+/// `header_down` (reverse-proxy response, `redir`, and `file_server`). The
+/// inserter receives a pre-validated pair for pingora's own `insert_header`,
+/// which keeps its header-name case map in sync.
+fn apply_header_ops(
+    ops: &[(String, String)],
+    mut insert: impl FnMut(http::HeaderName, http::HeaderValue),
+) {
+    for (name, value) in ops {
+        let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) else {
+            tracing::warn!("skipping invalid header name '{name}'");
+            continue;
+        };
+        match http::HeaderValue::from_str(value) {
+            Ok(header_value) => insert(header_name, header_value),
+            Err(e) => tracing::warn!("failed to set header '{name}': {e}"),
+        }
+    }
+}
+
+/// Apply the `header_down` modifiers to a response header, with placeholders
+/// expanded against `session`. Shared by the reverse-proxy `response_filter`,
+/// the `redir` terminal, and the `file_server` terminal.
+pub(super) fn apply_header_down(
+    modifiers: &[Modifier],
+    session: &Session,
+    resp: &mut ResponseHeader,
+) {
+    let ops = header_ops(modifiers, false, session);
+    apply_header_ops(&ops, |name, value| {
+        // The name and value are pre-validated by apply_header_ops, so pingora's
+        // insert_header (which keeps its case map in sync) cannot fail here.
+        let _ = resp.insert_header(name, value);
+    });
+}
+
 /// Collect the `encode` priorities from the effective modifier directives.
 fn encode_algos(modifiers: &[Modifier]) -> Vec<Encoding> {
     modifiers
@@ -538,6 +628,50 @@ fn encode_algos(modifiers: &[Modifier]) -> Vec<Encoding> {
         })
         .flatten()
         .collect()
+}
+
+/// Convert a codec error into a pingora internal error. Only called after
+/// `Content-Encoding` was committed to the client, so the returned error aborts
+/// the response rather than emitting raw bytes under the encoding header.
+fn compression_error(e: io::Error) -> Box<Error> {
+    Error::because(InternalError, "response compression failed", e)
+}
+
+/// Add `Accept-Encoding` to the response's `Vary` header (RFC 9110 §12.5.3),
+/// merging case-insensitively with any existing tokens and avoiding duplicates.
+/// An existing `accept-encoding` token leaves the header untouched. Shared by
+/// the reverse-proxy `response_filter` and the `file_server` terminal, whose
+/// compressed responses also vary on `Accept-Encoding`.
+pub(super) fn merge_vary_accept_encoding(resp: &mut ResponseHeader) {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut has_accept_encoding = false;
+    for value in resp.headers.get_all(http::header::VARY) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if token.eq_ignore_ascii_case("accept-encoding") {
+                has_accept_encoding = true;
+                continue;
+            }
+            if !tokens.iter().any(|t| t.eq_ignore_ascii_case(token)) {
+                tokens.push(token.to_string());
+            }
+        }
+    }
+    if has_accept_encoding {
+        return;
+    }
+    tokens.push("Accept-Encoding".into());
+    let merged = tokens.join(", ");
+    resp.remove_header(&http::header::VARY);
+    if let Ok(value) = http::HeaderValue::from_str(&merged) {
+        let _ = resp.insert_header(http::header::VARY, value);
+    }
 }
 
 #[cfg(test)]
@@ -660,5 +794,105 @@ mod tests {
         // An all-trusted chain falls back to the trusted peer.
         assert_eq!(resolve_client_ip(peer, Some("2001:db8::2"), &t), peer);
         assert_eq!(resolve_client_ip(peer, None, &t), peer);
+    }
+
+    #[test]
+    fn apply_header_ops_skips_invalid_names_and_values() {
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        let ops = vec![
+            ("X-Good".to_string(), "ok".to_string()),
+            // A header name that is not an HTTP token is skipped.
+            ("Bad Header".to_string(), "x".to_string()),
+            // A header value with a control byte cannot be inserted.
+            ("X-Nul".to_string(), "bad\u{0}value".to_string()),
+        ];
+        apply_header_ops(&ops, |name, value| {
+            let _ = resp.insert_header(name, value);
+        });
+        assert_eq!(
+            resp.headers.get("x-good").and_then(|v| v.to_str().ok()),
+            Some("ok")
+        );
+        assert_eq!(resp.headers.get("bad header"), None);
+        assert_eq!(
+            resp.headers.get("x-nul"),
+            None,
+            "invalid value must not panic or insert"
+        );
+    }
+
+    #[test]
+    fn apply_header_ops_overwrites_existing_values() {
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header(http::header::LOCATION, "/old").unwrap();
+        let ops = vec![("Location".to_string(), "/new".to_string())];
+        apply_header_ops(&ops, |name, value| {
+            let _ = resp.insert_header(name, value);
+        });
+        assert_eq!(
+            resp.headers.get("location").and_then(|v| v.to_str().ok()),
+            Some("/new"),
+            "a header_down rewrite must overwrite the existing header"
+        );
+    }
+
+    #[test]
+    fn vary_merge_adds_accept_encoding() {
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        merge_vary_accept_encoding(&mut resp);
+        assert_eq!(
+            resp.headers
+                .get(http::header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Accept-Encoding")
+        );
+    }
+
+    #[test]
+    fn vary_merge_preserves_tokens_case_insensitively_and_dedups() {
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        // Two existing Vary lines with a duplicate token across them (one
+        // lowercased) — merging must deduplicate and append a canonical
+        // Accept-Encoding.
+        resp.insert_header(http::header::VARY, "Origin, Cookie")
+            .unwrap();
+        resp.append_header(http::header::VARY, "origin").unwrap();
+        merge_vary_accept_encoding(&mut resp);
+        let values: Vec<String> = resp
+            .headers
+            .get_all(http::header::VARY)
+            .into_iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["Origin, Cookie, Accept-Encoding".to_string()]);
+    }
+
+    #[test]
+    fn vary_merge_keeps_existing_accept_encoding_untouched() {
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header(http::header::VARY, "accept-encoding, Origin")
+            .unwrap();
+        merge_vary_accept_encoding(&mut resp);
+        let values: Vec<String> = resp
+            .headers
+            .get_all(http::header::VARY)
+            .into_iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["accept-encoding, Origin".to_string()]);
+    }
+
+    #[test]
+    fn vary_merge_avoids_duplicate_accept_encoding() {
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header(http::header::VARY, "origin").unwrap();
+        merge_vary_accept_encoding(&mut resp);
+        let values: Vec<String> = resp
+            .headers
+            .get_all(http::header::VARY)
+            .into_iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["origin, Accept-Encoding".to_string()]);
     }
 }

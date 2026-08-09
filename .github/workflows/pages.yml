@@ -1,12 +1,14 @@
 name: Pages
 
 # Builds the Astro (Starlight) documentation site in `page/` — English at the
-# site root, Chinese under /zh-CN/ — and deploys it to GitHub Pages on every
-# `main` push.
+# site root, Chinese under /zh-cn/ — and deploys it to GitHub Pages on every
+# `main` push. Pull requests run the same build plus the internal link check as
+# a validation gate; nothing is uploaded or deployed for PRs.
 
 on:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: read
@@ -14,7 +16,10 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  # Key on the ref so different PRs never cancel each other, while new runs for
+  # the same PR branch or a `main` push still cancel the old run. `main` deploys
+  # (`refs/heads/main`) and PR builds (`refs/pull/<n>/merge`) stay separate.
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -41,15 +46,21 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Check internal links
+        run: pnpm check:links
+
       - name: Build site
         run: pnpm build
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Upload pages artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
         with:
           path: page/dist
 
   deploy:
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

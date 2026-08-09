@@ -6,7 +6,7 @@ description: 用一个 catch-all 站点把每个纯 HTTP 访客强制转到 HTTP
 ## 目标
 
 输入 `http://example.com` 的访客应落到 `https://example.com` —— 同样的主机、
-同样的路径。你的安全站点在 443(见[站点 · 端口 · HTTPS](../config/sites/)),
+同样的路径。你的安全站点在 443(见[站点 · 端口 · HTTPS](../../config/sites/)),
 你希望纯 HTTP 监听器负责重定向。
 
 ## 配置

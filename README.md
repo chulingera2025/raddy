@@ -31,8 +31,9 @@ models, limited extensibility). Raddy takes a different answer on three things:
 - **Explicit write-order DSL** (`Raddyfile`) — terminal vs modifier directives,
   `handle` mutual-exclusion blocks, and no hidden ordering rules. See the
   [Raddyfile specification](docs/RADDYFILE_SPEC.md).
-- **Automatic HTTPS** — ACME (HTTP-01) issuance for named sites, SNI dynamic
-  certificates, and an on-demand `ask` authorization callback.
+- **Automatic HTTPS** — ACME issuance for named sites (HTTP-01 by default, or
+  **DNS-01** via `dns_challenge cloudflare <token>`), SNI dynamic certificates,
+  and an on-demand `ask` authorization callback.
 - **Config hot reload** — SIGHUP swaps the routing snapshot atomically; the
   upstream connection pools survive reloads (zero-interrupt).
 - **Static file serving + compression** — `file_server` with traversal
@@ -91,6 +92,10 @@ raddy.test {
 ```bash
 raddy run -c Raddyfile --acme-directory https://acme-v02.api.letsencrypt.org/directory
 ```
+
+Port 80 unreachable? Add `dns_challenge cloudflare <token>` to the global block
+to prove control via DNS-01 instead (see the
+[Raddyfile specification](docs/RADDYFILE_SPEC.md)).
 
 ## Configuration
 

@@ -24,7 +24,9 @@ Pingora 的性能与内存安全。
 		指令严格按书写顺序执行。所见即所执行——没有隐藏的排序表。
 	</Card>
 	<Card title="自动 HTTPS" icon="lock">
-		原生 ACME(HTTP-01)签发,SNI 动态证书,开箱即用。
+		原生 ACME —— 默认 HTTP-01,或经
+		[`dns_challenge cloudflare`](config/directives/#dns_challenge) 走 DNS-01 ——
+		SNI 动态证书,开箱即用。
 	</Card>
 	<Card title="热重载" icon="refresh">
 		SIGHUP 原子替换路由快照;连接保持不断。

@@ -68,14 +68,20 @@ fn parse_duration(line: &[String]) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_nanos(nanos))
 }
 
-/// Parse a positive integer health-check counter (the second token).
+/// Parse a positive integer health-check counter (the second token). A zero
+/// counter would disable the threshold it controls, so it is rejected.
 fn parse_count(line: &[String], name: &str) -> Result<usize, String> {
     if line.len() != 2 {
         return Err(format!("'{name}' requires exactly one integer value"));
     }
     let v = &line[1];
-    v.parse::<usize>()
-        .map_err(|_| format!("invalid {name} value '{v}'"))
+    let n: usize = v
+        .parse()
+        .map_err(|_| format!("invalid {name} value '{v}'"))?;
+    if n == 0 {
+        return Err(format!("{name} must be >= 1"));
+    }
+    Ok(n)
 }
 
 /// Parse a rate token like `50r/s`, `1200r/m`, `3r/h`, `1r/d` (spec §5.2) into
@@ -837,13 +843,45 @@ pub fn strip_matcher_wildcard(path: &str) -> &str {
     }
 }
 
-/// Normalize a site hostname for matching: strip a trailing dot and
-/// ASCII-lowercase, so it compares equal to the request-side normalization.
-/// Non-ASCII hostnames are rejected in v0.1 (they could never match).
+/// Normalize and validate a site hostname: an ASCII DNS hostname with non-empty
+/// labels of `[A-Za-z0-9-]`, no leading/trailing `-`, at most 253 chars total
+/// and 63 per label. One trailing dot (FQDN form) is stripped; single-label
+/// hosts such as `localhost` are allowed. Whitespace, slashes, backslashes,
+/// colons, empty labels, and non-ASCII characters are rejected — a host that
+/// cannot be a real DNS name could never match a request (and would make the
+/// config a footgun for SNI/ACME).
 fn normalize_host_name(host: &str) -> Result<String, String> {
-    let host = host.trim_end_matches('.');
+    if host.chars().any(char::is_whitespace) {
+        return Err("site hostname must not contain whitespace".to_string());
+    }
     if !host.is_ascii() {
         return Err("site hostname must be ASCII in v0.1".to_string());
+    }
+    // One trailing dot marks an FQDN; a second would leave an empty final
+    // label, rejected below.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return Err("site hostname must not be empty".to_string());
+    }
+    if host.len() > 253 {
+        return Err("site hostname is too long (max 253 chars)".to_string());
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("site hostname contains an empty label".to_string());
+        }
+        if label.len() > 63 {
+            return Err("site hostname label is too long (max 63 chars)".to_string());
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("site hostname contains an invalid character".to_string());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("site hostname label must not start or end with '-'".to_string());
+        }
     }
     Ok(host.to_ascii_lowercase())
 }
@@ -1010,6 +1048,140 @@ mod tests {
         assert!(err
             .to_string()
             .contains("interval and timeout must be greater than zero"));
+    }
+
+    #[test]
+    fn rejects_zero_consecutive_failures() {
+        let input = ":8080 {\n    reverse_proxy {\n        to 127.0.0.1:8081\n        health_check {\n            consecutive_failures 0\n        }\n    }\n}\n";
+        let err = parse("test", input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("consecutive_failures must be >= 1"));
+    }
+
+    #[test]
+    fn rejects_zero_consecutive_successes() {
+        let input = ":8080 {\n    reverse_proxy {\n        to 127.0.0.1:8081\n        health_check {\n            consecutive_successes 0\n        }\n    }\n}\n";
+        let err = parse("test", input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("consecutive_successes must be >= 1"));
+    }
+
+    #[test]
+    fn normalizes_valid_host_names() {
+        // (input, expected normalized output).
+        let cases: &[(&str, &str)] = &[
+            ("example.com", "example.com"),
+            ("EXAMPLE.COM", "example.com"),
+            ("example.com.", "example.com"),
+            ("localhost", "localhost"),
+            ("LocalHost", "localhost"),
+            ("sub-domain.example.com", "sub-domain.example.com"),
+            ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+            ("a", "a"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_host_name(input).as_deref(),
+                Ok(*expected),
+                "host '{input}'"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_host_names() {
+        let mut cases: Vec<String> = vec![
+            "".into(),                 // empty
+            ".".into(),                // only a trailing dot
+            "..".into(),               // double dot
+            "foo bar".into(),          // whitespace
+            "foo\tbar".into(),         // tab
+            "example.com:8080".into(), // colon (must be split as a port first)
+            "foo/bar.com".into(),      // slash
+            "foo\\bar.com".into(),     // backslash
+            "../../tmp/x".into(),      // path traversal
+            "foo..com".into(),         // empty label
+            ".com".into(),             // leading empty label
+            "example.com..".into(),    // trailing double dot
+            "-foo.com".into(),         // label leading hyphen
+            "foo-.com".into(),         // label trailing hyphen
+            "-foo-.com".into(),        // both
+            "例え.jp".into(),          // non-ASCII
+        ];
+        // A label longer than 63 chars and a host longer than 253 chars.
+        cases.push(format!("{}.com", "a".repeat(64)));
+        cases.push(format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        ));
+        for input in &cases {
+            assert!(
+                normalize_host_name(input).is_err(),
+                "host '{input}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_site_host_addresses() {
+        // (site address line, expected valid). The three audit cases — extra
+        // port, whitespace, path traversal — must be rejected.
+        let cases: &[(&str, bool)] = &[
+            // Valid: single-label, multi-label, explicit port, trailing dot,
+            // catch-all, uppercase (normalized by the parser).
+            ("localhost", true),
+            ("localhost:8080", true),
+            ("example.com", true),
+            ("example.com:443", true),
+            ("api.example.com.", true),
+            ("sub-domain.example.com", true),
+            ("EXAMPLE.COM", true),
+            ("a", true),
+            (":8080", true),
+            // Invalid.
+            ("foo bar:8080", false),        // whitespace
+            ("foo bar", false),             // whitespace
+            ("../../tmp/x:443", false),     // path traversal
+            ("foo/bar.com", false),         // slash
+            ("foo\\bar.com", false),        // backslash
+            ("example.com:8080:90", false), // extra port
+            ("example.com:", false),        // empty port
+            ("-foo.com", false),            // leading hyphen
+            ("foo-.com", false),            // trailing hyphen
+            ("foo..com", false),            // empty label
+            ("example.com..", false),       // trailing double dot
+            (".com", false),                // leading empty label
+            ("例え.jp", false),             // non-ASCII
+            (":0", false),                  // zero port
+            ("foo.com:0", false),           // zero port
+            ("foo:bar", false),             // non-numeric port
+        ];
+
+        for (addr, valid) in cases {
+            let input = format!("{addr} {{\n    reverse_proxy 127.0.0.1:9000\n}}\n");
+            assert_eq!(
+                parse("test", &input).is_ok(),
+                *valid,
+                "site address '{addr}' expected {}",
+                if *valid { "valid" } else { "invalid" }
+            );
+        }
+    }
+
+    #[test]
+    fn parser_normalizes_site_host_case_and_dot() {
+        // Uppercase + trailing dot collapse through the full parse path.
+        let input = "API.Example.COM. {\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert!(matches!(
+            &rf.sites[0].key,
+            SiteKey::Named { host, port: 443 } if host == "api.example.com"
+        ));
     }
 
     #[test]

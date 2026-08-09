@@ -8,7 +8,7 @@ description: 写出第一个 Raddyfile 并在约五分钟内跑通流量。
 
 ## 开始之前
 
-先[安装 raddy](install/)。你还需要一个本地 HTTP 服务作为代理目标 —— 如果
+先[安装 raddy](../install/)。你还需要一个本地 HTTP 服务作为代理目标 —— 如果
 `127.0.0.1:8080` 上没跑任何东西,启动一个简易的:
 
 ```bash
@@ -30,7 +30,7 @@ example.local:8090 {
 
 > **为什么要显式端口?** 不带端口的具名站点绑定 **443(TLS)** 并启用自动
 > HTTPS。写成 `:8090` 让这个第一个示例保持纯 HTTP,无需真实域名即可在笔记本
-> 上运行。端口与 HTTPS 见[站点 · 端口 · HTTPS](config/sites/)。
+> 上运行。端口与 HTTPS 见[站点 · 端口 · HTTPS](../config/sites/)。
 
 ## 2. 校验配置
 
@@ -110,8 +110,8 @@ curl -H 'Host: static.local' http://127.0.0.1:8090/hello.txt
 
 ## 下一步
 
-- [静态托管](guides/static-files/) —— `file_server` 详解
-- [HTTP → HTTPS 重定向](guides/http-to-https/) —— `:80` catch-all 模式
-- [代理 API](guides/api-proxy/) —— 负载均衡、健康检查、限流
-- [站点 · 端口 · HTTPS](config/sites/) —— 匹配与证书如何工作
-- [指令参考](config/directives/) —— 每条指令,含示例
+- [静态托管](../guides/static-files/) —— `file_server` 详解
+- [HTTP → HTTPS 重定向](../guides/http-to-https/) —— `:80` catch-all 模式
+- [代理 API](../guides/api-proxy/) —— 负载均衡、健康检查、限流
+- [站点 · 端口 · HTTPS](../config/sites/) —— 匹配与证书如何工作
+- [指令参考](../config/directives/) —— 每条指令,含示例

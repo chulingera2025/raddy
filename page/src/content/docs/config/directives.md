@@ -151,9 +151,10 @@ header_down <name> <value>
 ```
 
 **Arguments.** `<name>` is the header name; `<value>` is the value or a
-placeholder: `{remote_host}` (the client socket address), `{host}`, `{uri}`.
+placeholder: `{remote_host}` (the TCP client socket address — the direct peer IP,
+*not* the trusted-proxy effective client IP), `{host}`, `{uri}`.
 
-**Example.** Pass the real client address through to the backend:
+**Example.** Pass the client socket address through to the backend:
 
 ```caddyfile
 api.example.com {
@@ -206,7 +207,7 @@ rate_limit <key> <rate> [burst=<n>]
 
 **Arguments.**
 
-- `<key>` — `remote_ip`, the real client IP (see [Trusted proxies](trusted-proxies/)).
+- `<key>` — `remote_ip`, the real client IP (see [Trusted proxies](../trusted-proxies/)).
 - `<rate>` — `<count>r/<unit>` where the unit is `s` / `m` / `h` / `d`, e.g.
   `50r/s`, `1200r/m`. The count must be at least 1.
 - `burst=<n>` — the token bucket capacity; defaults to the rate count.
@@ -250,7 +251,7 @@ static.example.com {
 ## `trusted_proxies`
 
 **Purpose.** Declare which networks are trusted proxies, so raddy can derive the
-real client IP from `X-Forwarded-For`. See [Trusted proxies](trusted-proxies/).
+real client IP from `X-Forwarded-For`. See [Trusted proxies](../trusted-proxies/).
 
 **Syntax.**
 
@@ -266,7 +267,7 @@ site only.
 
 **Purpose.** Issue certificates via **DNS-01** instead of HTTP-01, proving
 domain control by publishing a TXT record through a DNS provider. Useful when
-port 80 is unreachable. See [Sites, ports & HTTPS](sites/).
+port 80 is unreachable. See [Sites, ports & HTTPS](../sites/).
 
 **Syntax.**
 
@@ -276,7 +277,7 @@ dns_challenge cloudflare <api_token>
 
 **Arguments.** The provider (`cloudflare` — the only one today) and the
 provider's API token, which must have **Zone: DNS: Edit** permission. Lives in
-the [global block](sites/#the-global-block).
+the [global block](../sites/#the-global-block).
 
 **Behavior.** When set, every certificate on the instance is issued via DNS-01:
 raddy publishes `_acme-challenge.<host>` TXT records while the order is being
@@ -321,7 +322,7 @@ log_level <level>
 acme_email <address>
 ```
 
-**Arguments.** An email address. Lives in the [global block](sites/#the-global-block).
+**Arguments.** An email address. Lives in the [global block](../sites/#the-global-block).
 
 ## `snippet` / `import`
 

@@ -16,9 +16,16 @@
 //! Implements gzip and zstd compression honoring the `encode` parameter order
 //! (priority) and the client's `Accept-Encoding` (RADDYFILE_SPEC §5): the first
 //! configured algorithm the client accepts is used.
+//!
+//! B3b1: the reverse-proxy path compresses incrementally through [`Encoder`] —
+//! one continuous gzip member / zstd frame per response — instead of buffering
+//! the whole body. B3b2: the `file_server` terminal streams through the same
+//! [`Encoder`] for full (200) responses; the whole-buffer [`compress`] helper
+//! is retained only as a one-shot convenience for tests.
 
 use crate::config::ast::Encoding;
 use http::HeaderValue;
+use std::io::{self, Write};
 
 /// A concrete compression algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,44 +47,155 @@ impl Algo {
 /// Choose the encoding for a request given the site's `encode` priorities and
 /// the client's `Accept-Encoding` header. `None` means no compression.
 ///
-/// Accept-Encoding parsing is deliberately simple: an entry matches if it names
-/// the token or is `*`, ignoring `q` weights except for an explicit `q=0`.
+/// Matching is case-insensitive (RFC 9110 §12.5.3). A `q` weight of `0` marks an
+/// algorithm as not acceptable; an explicit token match always overrides a `*`
+/// wildcard, so `gzip;q=0, *;q=1` excludes gzip but admits zstd. Among the
+/// configured algorithms the first one the client accepts wins, which makes the
+/// config order the preference on equal supported quality.
 pub fn choose(encode: &[Encoding], accept_encoding: Option<&HeaderValue>) -> Option<Algo> {
     if encode.is_empty() {
         return None;
     }
     let header = accept_encoding?.to_str().ok()?;
-    let accepts = |token: &str| {
-        header.split(',').any(|entry| {
-            let entry = entry.trim();
-            let (name, q) = match entry.split_once(';') {
-                Some((name, rest)) => (name.trim(), parse_q(rest)),
-                None => (entry, 1.0),
-            };
-            q > 0.0 && (name == token || name == "*")
-        })
-    };
+    let entries = parse_accept_encoding(header);
     for enc in encode {
         let algo = match enc {
             Encoding::Gzip => Algo::Gzip,
             Encoding::Zstd => Algo::Zstd,
         };
-        if accepts(algo.token()) {
+        if accepted(&entries, algo.token()) {
             return Some(algo);
         }
     }
     None
 }
 
-/// Parse a `;q=...` weight (defaults to 1.0).
-fn parse_q(rest: &str) -> f32 {
-    rest.trim()
-        .strip_prefix("q=")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0)
+/// A parsed `Accept-Encoding` entry: a lowercased token and its q weight.
+struct Entry {
+    token: String,
+    q: f32,
 }
 
-/// Compress `body` with `algo`.
+/// Parse an `Accept-Encoding` header into (token, q) entries, lowercasing the
+/// tokens so matching is case-insensitive. Entries without a `;q=` default to
+/// weight 1.0; an unparsable weight is also treated as 1.0 so that a malformed
+/// header does not silently disable compression.
+fn parse_accept_encoding(header: &str) -> Vec<Entry> {
+    header
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, rest) = match entry.split_once(';') {
+                Some((name, rest)) => (name, Some(rest)),
+                None => (entry, None),
+            };
+            let token = name.trim().to_ascii_lowercase();
+            if token.is_empty() {
+                return None;
+            }
+            let q = rest.map(parse_q).unwrap_or(1.0);
+            Some(Entry { token, q })
+        })
+        .collect()
+}
+
+/// Whether the client accepts `token` given the parsed entries.
+///
+/// The most specific reference wins: an explicit `token` entry (any q) beats a
+/// `*` wildcard, so `gzip;q=0, *;q=1` excludes gzip but admits other
+/// algorithms. For duplicated tokens the first occurrence wins.
+fn accepted(entries: &[Entry], token: &str) -> bool {
+    if let Some(entry) = entries.iter().find(|e| e.token == token) {
+        return entry.q > 0.0;
+    }
+    match entries.iter().find(|e| e.token == "*") {
+        Some(entry) => entry.q > 0.0,
+        None => false,
+    }
+}
+
+/// Parse a `;q=...` weight (defaults to 1.0). The parameter name is matched
+/// case-insensitively (`Q=` is accepted).
+fn parse_q(rest: &str) -> f32 {
+    let rest = rest.trim();
+    let value = rest
+        .strip_prefix("q=")
+        .or_else(|| rest.strip_prefix("Q="))
+        .and_then(|v| v.trim().parse().ok());
+    value.unwrap_or(1.0)
+}
+
+/// A per-request incremental compression encoder (B3b1).
+///
+/// Writes compressed bytes into an internal `Vec` that the caller drains after
+/// each [`write`](Self::write), so memory stays bounded by the codec state plus
+/// the current chunk — the whole response is never accumulated. One encoder is
+/// created per compressed response and emits exactly one gzip member or zstd
+/// frame.
+pub enum Encoder {
+    Gzip(flate2::write::GzEncoder<Vec<u8>>),
+    Zstd(zstd::stream::write::Encoder<'static, Vec<u8>>),
+}
+
+impl Encoder {
+    /// Create an encoder for `algo`. Fails only if the underlying codec cannot
+    /// be initialized (e.g. a zstd context allocation failure).
+    pub fn new(algo: Algo) -> io::Result<Self> {
+        match algo {
+            Algo::Gzip => Ok(Encoder::Gzip(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ))),
+            Algo::Zstd => Ok(Encoder::Zstd(zstd::stream::write::Encoder::new(
+                Vec::new(),
+                3,
+            )?)),
+        }
+    }
+
+    /// Compress `chunk`, flush the codec, and return the compressed bytes
+    /// produced so far. The flush makes the output decodable incrementally, so
+    /// the caller forwards it downstream before the response ends.
+    pub fn write(&mut self, chunk: &[u8]) -> io::Result<Vec<u8>> {
+        match self {
+            Encoder::Gzip(enc) => {
+                enc.write_all(chunk)?;
+                enc.flush()?;
+                Ok(std::mem::take(enc.get_mut()))
+            }
+            Encoder::Zstd(enc) => {
+                enc.write_all(chunk)?;
+                enc.flush()?;
+                Ok(std::mem::take(enc.get_mut()))
+            }
+        }
+    }
+
+    /// Finalize the stream, returning the remaining compressed bytes (the gzip
+    /// trailer / zstd frame epilogue). Call once after the last body chunk; the
+    /// encoder must not be written again afterwards.
+    pub fn finish(&mut self) -> io::Result<Vec<u8>> {
+        match self {
+            Encoder::Gzip(enc) => {
+                enc.try_finish()?;
+                Ok(std::mem::take(enc.get_mut()))
+            }
+            Encoder::Zstd(enc) => {
+                enc.do_finish()?;
+                Ok(std::mem::take(enc.get_mut()))
+            }
+        }
+    }
+}
+
+/// Compress `body` with `algo` in one shot.
+///
+/// The request-plane paths stream through [`Encoder`] instead (B3b1/B3b2); this
+/// whole-buffer helper remains for tests and callers that already own the full
+/// payload.
 pub fn compress(algo: Algo, body: &[u8]) -> Vec<u8> {
     match algo {
         Algo::Gzip => gzip(body),
@@ -132,6 +250,30 @@ mod tests {
     }
 
     #[test]
+    fn matching_is_case_insensitive() {
+        let encode = [Encoding::Zstd, Encoding::Gzip];
+        // Uppercase / mixed-case tokens still match the lowercased codec token.
+        assert_eq!(choose(&encode, Some(&hdr("GZIP"))), Some(Algo::Gzip));
+        assert_eq!(choose(&encode, Some(&hdr("gzip, ZSTD"))), Some(Algo::Zstd));
+        // q=0 spelled with an uppercase `Q` is honored.
+        assert_eq!(
+            choose(&encode, Some(&hdr("ZSTD;Q=0, GZIP"))),
+            Some(Algo::Gzip)
+        );
+    }
+
+    #[test]
+    fn explicit_token_q0_overrides_wildcard() {
+        let encode = [Encoding::Zstd, Encoding::Gzip];
+        // gzip is explicitly refused; the `*` must not resurrect it.
+        assert_eq!(choose(&encode, Some(&hdr("gzip;q=0, *"))), Some(Algo::Zstd));
+        // A `*;q=0` refuses everything not explicitly listed.
+        assert_eq!(choose(&encode, Some(&hdr("*;q=0"))), None);
+        // `*;q=0, gzip`: the wildcard refuses zstd, but gzip is explicit.
+        assert_eq!(choose(&encode, Some(&hdr("*;q=0, gzip"))), Some(Algo::Gzip));
+    }
+
+    #[test]
     fn no_encode_directive_means_no_compression() {
         assert_eq!(choose(&[], Some(&hdr("gzip"))), None);
     }
@@ -143,6 +285,71 @@ mod tests {
             let compressed = compress(algo, &body);
             assert!(!compressed.is_empty());
             assert_ne!(compressed, body, "{algo:?} output should differ");
+        }
+    }
+
+    /// Decode a complete compressed stream back to its payload.
+    fn decode(algo: Algo, compressed: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        match algo {
+            Algo::Gzip => {
+                let mut decoder = flate2::read::GzDecoder::new(compressed);
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded).unwrap();
+                decoded
+            }
+            Algo::Zstd => {
+                let mut decoder = zstd::stream::read::Decoder::new(compressed).unwrap();
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded).unwrap();
+                decoded
+            }
+        }
+    }
+
+    /// Feed `chunks` through one [`Encoder`], concatenating every flushed write
+    /// plus the final `finish()` trailer, then decode the single continuous
+    /// stream back to the original bytes.
+    fn stream_roundtrip(algo: Algo, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut encoder = Encoder::new(algo).unwrap();
+        let mut compressed = Vec::new();
+        let n = chunks.len();
+        for (i, chunk) in chunks.iter().enumerate() {
+            compressed.extend_from_slice(&encoder.write(chunk).unwrap());
+            if i == n - 1 {
+                compressed.extend_from_slice(&encoder.finish().unwrap());
+            }
+        }
+        decode(algo, &compressed)
+    }
+
+    #[test]
+    fn multi_chunk_gzip_is_one_continuous_member() {
+        let expected: Vec<u8> = (0..40_000u32).map(|i| (i % 253) as u8).collect();
+        // Odd-sized chunks force the encoder through many incremental flushes.
+        let chunks: Vec<&[u8]> = expected.chunks(8191).collect();
+        assert!(chunks.len() > 1, "test needs multiple chunks");
+        let decoded = stream_roundtrip(Algo::Gzip, &chunks);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn multi_chunk_zstd_is_one_continuous_frame() {
+        let expected: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        let chunks: Vec<&[u8]> = expected.chunks(4096).collect();
+        assert!(chunks.len() > 1, "test needs multiple chunks");
+        let decoded = stream_roundtrip(Algo::Zstd, &chunks);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn empty_body_is_a_valid_empty_member() {
+        for algo in [Algo::Gzip, Algo::Zstd] {
+            let mut encoder = Encoder::new(algo).unwrap();
+            let mut compressed = encoder.write(&[]).unwrap();
+            compressed.extend_from_slice(&encoder.finish().unwrap());
+            assert!(!compressed.is_empty(), "{algo:?} must still emit a frame");
+            assert!(decode(algo, &compressed).is_empty());
         }
     }
 }

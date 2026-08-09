@@ -20,8 +20,9 @@
 //! (Q7).
 
 use crate::config::ast::*;
+use crate::config::resolver::resolve_host;
 use std::collections::HashSet;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 
 /// Validate a parsed Raddyfile, resolve upstreams, and compile it.
 ///
@@ -90,7 +91,7 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                 lb_policy,
                 health_check,
             } => {
-                let upstreams = resolve_upstreams(file, to)?;
+                let upstreams = resolve_upstreams(file, to, resolve_host)?;
                 let matchers = matcher.iter().cloned().collect();
                 terminals.push(Terminal {
                     matchers,
@@ -200,7 +201,7 @@ fn compile_handle_block(
                 lb_policy,
                 health_check,
             } => {
-                let upstreams = resolve_upstreams(file, to)?;
+                let upstreams = resolve_upstreams(file, to, resolve_host)?;
                 let mut matchers = vec![path_matcher.clone()];
                 if let Some(m) = matcher {
                     matchers.push(m.clone());
@@ -284,33 +285,41 @@ fn compile_handle_block(
     Ok(())
 }
 
-/// Resolve every upstream's host to a concrete address at build time, so the
-/// snapshot stays pure data and the request plane performs no DNS (ADR-011).
-fn resolve_upstreams(file: &str, to: &[Upstream]) -> Result<Vec<SocketAddr>, ConfigError> {
-    let mut resolved = Vec::with_capacity(to.len());
+/// Resolve every upstream's host to all of its concrete addresses at build
+/// time, so the snapshot stays pure data and the request plane performs no DNS
+/// (ADR-011).
+///
+/// Each hostname contributes every unique `SocketAddr` it resolves to —
+/// flattened into the terminal's backend list with first-seen order preserved
+/// and duplicates dropped — so a hostname with several A/AAAA records becomes
+/// several backends instead of the v0.1 "first address only". An explicit IP
+/// literal contributes exactly itself (preserved unchanged). `resolver` is
+/// injectable so tests never touch the network; the production resolver
+/// (`crate::config::resolver::resolve_host`) applies a timeout and a bounded
+/// thread pool, so a hung DNS server yields a diagnosable error, never a hang.
+fn resolve_upstreams(
+    file: &str,
+    to: &[Upstream],
+    resolver: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, String>,
+) -> Result<Vec<SocketAddr>, ConfigError> {
+    let mut resolved: Vec<SocketAddr> = Vec::new();
     for upstream in to {
-        let addr = (upstream.host.as_str(), upstream.port)
-            .to_socket_addrs()
-            .map_err(|e| {
-                validate_error(
-                    file,
-                    format!(
-                        "failed to resolve upstream {}:{}: {e}",
-                        upstream.host, upstream.port
-                    ),
-                )
-            })?
-            .next()
-            .ok_or_else(|| {
-                validate_error(
-                    file,
-                    format!(
-                        "no address resolved for upstream {}:{}",
-                        upstream.host, upstream.port
-                    ),
-                )
-            })?;
-        resolved.push(addr);
+        let addrs = resolver(&upstream.host, upstream.port)
+            .map_err(|message| validate_error(file, message))?;
+        if addrs.is_empty() {
+            return Err(validate_error(
+                file,
+                format!(
+                    "no address resolved for upstream {}:{}",
+                    upstream.host, upstream.port
+                ),
+            ));
+        }
+        for addr in addrs {
+            if !resolved.contains(&addr) {
+                resolved.push(addr);
+            }
+        }
     }
     Ok(resolved)
 }
@@ -436,9 +445,91 @@ mod tests {
     fn resolves_upstream_hostname() {
         let cfg = compile(":8080 {\n    reverse_proxy localhost:8080\n}\n").unwrap();
         match &cfg.sites[0].terminals[0].kind {
-            TerminalKind::ReverseProxy { upstreams, .. } => assert_eq!(upstreams.len(), 1),
+            TerminalKind::ReverseProxy { upstreams, .. } => {
+                assert!(
+                    !upstreams.is_empty(),
+                    "localhost must resolve to at least one address"
+                );
+                assert!(
+                    upstreams.iter().all(|a| a.port() == 8080),
+                    "every resolved address must keep the configured port"
+                );
+            }
             other => panic!("expected reverse proxy, got {other:?}"),
         }
+    }
+
+    /// A test upstream entry for `resolve_upstreams`.
+    fn upstream(host: &str, port: u16) -> Upstream {
+        Upstream {
+            host: host.to_string(),
+            port,
+            resolved: None,
+        }
+    }
+
+    fn addr(n: u8) -> SocketAddr {
+        format!("10.0.0.{n}:80").parse().unwrap()
+    }
+
+    #[test]
+    fn flattens_all_unique_addresses_preserving_order() {
+        // One hostname resolves to several addresses; a shared address from a
+        // second hostname is deduplicated while first-seen order is kept.
+        let to = vec![upstream("a.test", 80), upstream("b.test", 80)];
+        let got = resolve_upstreams("test", &to, |host, _port| match host {
+            "a.test" => Ok(vec![addr(1), addr(2)]),
+            "b.test" => Ok(vec![addr(2), addr(3)]),
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(got, vec![addr(1), addr(2), addr(3)]);
+    }
+
+    #[test]
+    fn explicit_ip_upstreams_preserved_and_deduped() {
+        // The production resolver returns an explicit IP literal unchanged; the
+        // flatten step must keep it (and drop an exact duplicate upstream).
+        let to = vec![upstream("127.0.0.1", 9000), upstream("127.0.0.1", 9000)];
+        let got = resolve_upstreams("test", &to, |host, port| {
+            Ok(vec![SocketAddr::new(host.parse().unwrap(), port)])
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 9000)]
+        );
+    }
+
+    #[test]
+    fn empty_resolution_is_a_config_error() {
+        let to = vec![upstream("nope.test", 80)];
+        let err = resolve_upstreams("test", &to, |_, _| Ok(vec![])).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("no address resolved for upstream nope.test:80"));
+    }
+
+    #[test]
+    fn resolution_timeout_propagates_diagnostic() {
+        // The injectable resolver stands in for a timed-out lookup; the
+        // config error must carry the diagnostic for `raddy check`/reload.
+        let to = vec![upstream("slow.test", 80)];
+        let err = resolve_upstreams("test", &to, |_, _| {
+            Err("failed to resolve upstream slow.test:80: timed out after 5s".to_string())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out after 5s"));
+    }
+
+    #[test]
+    fn resolver_order_is_stable() {
+        // The order the resolver returns is preserved exactly: no re-sorting or
+        // reordering is performed by the flatten step.
+        let to = vec![upstream("x.test", 80)];
+        let got =
+            resolve_upstreams("test", &to, |_, _| Ok(vec![addr(3), addr(1), addr(2)])).unwrap();
+        assert_eq!(got, vec![addr(3), addr(1), addr(2)]);
     }
 
     #[test]

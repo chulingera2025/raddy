@@ -3,9 +3,9 @@ title: Trusted proxies
 description: Tell raddy which networks are trusted so it can derive the real client IP from X-Forwarded-For.
 ---
 
-Features that key on the client — [rate limiting](directives/#rate_limit), access
-logs — need the *real* client IP, not the address of an intermediate proxy. This
-page explains how raddy decides that.
+Features that key on the client — [rate limiting](../directives/#rate_limit),
+`ip_hash` load balancing, access logs — need the *real* client IP, not the
+address of an intermediate proxy. This page explains how raddy decides that.
 
 ## The default
 

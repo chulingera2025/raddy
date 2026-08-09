@@ -7,7 +7,7 @@ description: Force every plain-HTTP visitor onto HTTPS with a catch-all site.
 
 Visitors who type `http://example.com` should land on `https://example.com` —
 same host, same path. You have a secure site on 443 (see [Sites, ports &
-HTTPS](../config/sites/)) and want the plain-HTTP listener to redirect.
+HTTPS](../../config/sites/)) and want the plain-HTTP listener to redirect.
 
 ## Configuration
 

@@ -26,11 +26,12 @@
 //! touching any listener). The upgrade socket path must agree between old and
 //! new process.
 
-use crate::config::ast::{CompiledConfig, SiteKey};
+use crate::config::ast::{CompiledConfig, LogLevel, SiteKey};
 use crate::config::snapshot::{self, ConfigStore};
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
-use crate::server::acme::{AcmeManager, ChallengeStore, Issuance};
+use crate::server::acme::{AcmeManager, ChallengeStore, ISSUANCE_QUEUE_CAPACITY};
+use crate::server::issuance_queue::{EnqueueOutcome, RequestKind};
 use crate::server::reload;
 use crate::tls::{CertStore, SniCallback};
 use pingora::listeners::{tls::TlsSettings, TlsAcceptCallbacks};
@@ -77,7 +78,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     let email = snapshot.global.acme_email.clone();
     let startup_hosts = hosts_needing_certs(&snapshot);
 
-    init_tracing();
+    init_tracing(default_log_filter(snapshot.global.log_level));
 
     // Certificate store + ACME manager (certificates are process-lifetime and
     // survive config reloads; reload swaps only the routing snapshot).
@@ -100,11 +101,20 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         snapshot.global.dns_challenge.clone(),
     ));
     acme.load_persisted_certs();
-    let issuance_tx = acme.spawn_issuance_worker();
+    // The issuance state table (B3a) must be bounded by the authorized
+    // configured hosts plus the queue capacity: on-miss SNI and renewal can
+    // only ever name hosts configured as named sites, so a host-count-derived
+    // bound cannot grow with unconfigured traffic.
+    let configured_hosts = snapshot
+        .sites
+        .iter()
+        .filter(|site| matches!(&site.key, SiteKey::Named { .. }))
+        .count();
+    let issuance_queue = acme.spawn_issuance_worker(configured_hosts + ISSUANCE_QUEUE_CAPACITY + 1);
     // Renewal: periodically re-issue certificates inside the renewal window.
     // The interval is overridable via RADDY_RENEW_INTERVAL_SECS (a test hook so
     // Pebble's short-lived certificates can be renewed quickly).
-    acme.spawn_renewal_scheduler(issuance_tx.clone(), renew_interval());
+    acme.spawn_renewal_scheduler(issuance_queue.clone(), renew_interval());
 
     // Load-balancing pool (ADR-011: process-lifetime, health survives reloads)
     // plus the health-check runner thread. Warm the pool from the snapshot so
@@ -137,17 +147,35 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
 
     // Proactive issuance for configured named-443 hosts that lack a cached cert.
     for host in startup_hosts {
-        let _ = issuance_tx.send(Issuance::New(host));
+        match issuance_queue.enqueue(&host, RequestKind::New) {
+            EnqueueOutcome::Queued => tracing::info!("queued issuance for {host}"),
+            EnqueueOutcome::Duplicate | EnqueueOutcome::UpgradeForced => {}
+            EnqueueOutcome::InCooldown | EnqueueOutcome::QueueFull => {
+                tracing::warn!("ACME issuance for {host} deferred (queue busy or cooling down)")
+            }
+        }
     }
 
     // SNI on-demand: only issue for hosts configured as named sites (ADR-003).
     let on_miss_store = config_store.clone();
-    let on_miss_tx = issuance_tx.clone();
+    let on_miss_queue = issuance_queue.clone();
     let on_miss: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |host: &str| {
         let config = on_miss_store.load();
         if is_configured_host(&config, host) {
-            tracing::info!("on-demand TLS requested for authorized host {host}; queuing issuance");
-            let _ = on_miss_tx.send(Issuance::New(host.to_string()));
+            match on_miss_queue.enqueue(host, RequestKind::New) {
+                EnqueueOutcome::Queued => {
+                    tracing::info!(
+                        "on-demand TLS requested for authorized host {host}; queuing issuance"
+                    )
+                }
+                EnqueueOutcome::Duplicate | EnqueueOutcome::UpgradeForced => {}
+                EnqueueOutcome::InCooldown => tracing::warn!(
+                    "on-demand TLS for {host} deferred (host is in its failure cooldown)"
+                ),
+                EnqueueOutcome::QueueFull => {
+                    tracing::warn!("on-demand TLS for {host} deferred (ACME queue full)")
+                }
+            }
         } else {
             tracing::warn!("on-demand TLS refused for unauthorized host {host}");
         }
@@ -243,10 +271,43 @@ fn renew_interval() -> std::time::Duration {
         .unwrap_or(std::time::Duration::from_secs(3600))
 }
 
-/// Install the global tracing subscriber (respecting `RUST_LOG`). Idempotent,
-/// so `run` could be reused from a test harness.
-fn init_tracing() {
+/// The tracing filter level to use when `RUST_LOG` is unset: the configured
+/// global `log_level`, or `info` (the default) when the Raddyfile does not set
+/// one.
+fn default_log_filter(log_level: Option<LogLevel>) -> &'static str {
+    match log_level {
+        Some(LogLevel::Debug) => "debug",
+        Some(LogLevel::Info) => "info",
+        Some(LogLevel::Warn) => "warn",
+        Some(LogLevel::Error) => "error",
+        None => "info",
+    }
+}
+
+/// Install the global tracing subscriber. `RUST_LOG` takes precedence; when it
+/// is unset the given `default_level` is used. Idempotent (`try_init` returns
+/// without panicking if a subscriber is already installed), so `run` could be
+/// reused from a test harness without a double-initialize panic.
+fn init_tracing(default_level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_log_filter_uses_configured_level() {
+        assert_eq!(default_log_filter(Some(LogLevel::Debug)), "debug");
+        assert_eq!(default_log_filter(Some(LogLevel::Info)), "info");
+        assert_eq!(default_log_filter(Some(LogLevel::Warn)), "warn");
+        assert_eq!(default_log_filter(Some(LogLevel::Error)), "error");
+    }
+
+    #[test]
+    fn default_log_filter_falls_back_to_info() {
+        assert_eq!(default_log_filter(None), "info");
+    }
 }

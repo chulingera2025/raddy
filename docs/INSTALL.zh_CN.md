@@ -42,9 +42,24 @@ cargo build --release
 
 ## Docker
 
+镜像**不会**内置 Raddyfile，因此需要把宿主机上的 Raddyfile 以只读方式挂载
+进去。镜像的 `ENTRYPOINT` 是 `raddy`，所以容器命令直接写 `run` 子命令即可。
+请在包含你 `Raddyfile` 的目录下运行：
+
 ```bash
 docker build -t raddy .
-docker run --rm -p 8080:8080 raddy run -c /etc/raddy/Raddyfile
+docker run --rm -p 8080:8080 \
+  -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
+  raddy run -c /etc/raddy/Raddyfile
+```
+
+如需在容器重启后保留 ACME 证书，挂载一个证书目录并用 `--cert-dir` 指向它：
+
+```bash
+docker run --rm -p 80:80 -p 443:443 \
+  -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
+  -v raddy_certs:/etc/raddy/certs \
+  raddy run -c /etc/raddy/Raddyfile --cert-dir /etc/raddy/certs
 ```
 
 > 签名说明：用 **sha256 checksum** 保证完整性（安装脚本内置校验）。基于发布密钥的代码签名（如 minisign/cosign）作为后续增强，密钥与流程定稿后补充。
