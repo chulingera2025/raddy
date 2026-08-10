@@ -541,7 +541,12 @@ fn resolve_upstreams(
             ));
         }
         for addr in addrs {
-            if !resolved.iter().any(|peer| peer.addr == addr) {
+            // Dedup on the full peer identity (address + TLS scheme + host), so
+            // two hostnames resolving to the same IP:port each keep their scheme
+            // and SNI (P2) — a TLS virtual host is not collapsed into the other.
+            if !resolved.iter().any(|peer| {
+                peer.addr == addr && peer.tls == upstream.tls && peer.host == upstream.host
+            }) {
                 resolved.push(UpstreamPeer {
                     addr,
                     tls: upstream.tls,
@@ -785,8 +790,9 @@ mod tests {
 
     #[test]
     fn flattens_all_unique_addresses_preserving_order() {
-        // One hostname resolves to several addresses; a shared address from a
-        // second hostname is deduplicated while first-seen order is kept.
+        // One hostname resolves to several addresses. An address shared across
+        // two hostnames is kept once per distinct host (they may differ in TLS
+        // identity, P2), in first-seen order.
         let to = vec![upstream("a.test", 80), upstream("b.test", 80)];
         let got = resolve_upstreams("test", &to, |host, _port| match host {
             "a.test" => Ok(vec![addr(1), addr(2)]),
@@ -794,7 +800,21 @@ mod tests {
             _ => unreachable!(),
         })
         .unwrap();
-        assert_eq!(addrs_of(&got), vec![addr(1), addr(2), addr(3)]);
+        assert_eq!(addrs_of(&got), vec![addr(1), addr(2), addr(2), addr(3)]);
+        assert_eq!(got[1].host, "a.test");
+        assert_eq!(got[2].host, "b.test");
+    }
+
+    #[test]
+    fn same_addr_distinct_tls_hosts_are_both_kept() {
+        // Two `https://` hostnames resolving to the same IP:port must both
+        // survive with their scheme and SNI (P2) so the balancer can reach each
+        // TLS virtual host.
+        let to = vec![tls_upstream("a.test", 443), tls_upstream("b.test", 443)];
+        let got = resolve_upstreams("test", &to, |_, _| Ok(vec![addr(9)])).unwrap();
+        assert_eq!(got.len(), 2, "same-address TLS hosts must not be collapsed");
+        assert!(got.iter().all(|p| p.tls));
+        assert_ne!(got[0].host, got[1].host);
     }
 
     #[test]

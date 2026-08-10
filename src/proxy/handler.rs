@@ -472,14 +472,15 @@ impl ProxyHttp for ProxyHandler {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        let addr = balancer
+        let index = balancer
             .select(&key)
             .ok_or_else(|| Error::explain(HTTPStatus(502), "no healthy upstreams available"))?;
-        // Find the selected upstream to learn its scheme and original host (the
-        // default SNI); the balancer only ever selects configured upstreams.
-        let upstream = lb_spec.upstreams.iter().find(|p| p.addr == addr);
-        let is_tls = upstream.is_some_and(|p| p.tls);
-        let default_sni = upstream.map_or("", |p| p.host.as_str());
+        // Recover the selected peer by index so its TLS scheme and original host
+        // (the default SNI) are correct even when two peers share an address
+        // (P2). The balancer only ever returns configured indices.
+        let addr = lb_spec.upstreams[index].addr;
+        let is_tls = lb_spec.upstreams[index].tls;
+        let default_sni = lb_spec.upstreams[index].host.as_str();
         let peer = if is_tls {
             // A `https://` upstream (spec §5.4): TLS with the compiled options.
             // `UpstreamTls` is always present when any upstream is TLS (the

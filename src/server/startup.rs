@@ -233,10 +233,13 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     // directive opts it in (spec §5.7); every other port is plain HTTP.
     for port in ports {
         if tls_ports.contains(&port) {
-            // TLS listener with SNI dynamic certificates from the store.
+            // TLS listener with SNI dynamic certificates from the store. The
+            // callback is bound to this listener's port so per-(host, port)
+            // certs and `tls` options stay independent (P2).
             let callbacks: TlsAcceptCallbacks = Box::new(SniCallback::new(
                 cert_store.clone(),
                 config_store.clone(),
+                port,
                 on_miss.clone(),
             ));
             // Advertise HTTP/2 over ALPN (`h2` preferred, HTTP/1.1 fallback),
@@ -316,22 +319,28 @@ fn uses_acme(site: &crate::config::ast::CompiledSite) -> bool {
 }
 
 /// Load the static and internal certificates for sites that opted out of ACME
-/// into the certificate store, keyed by hostname (spec §5.7). Runs at startup
-/// (after persisted ACME certs, so it wins on a stale host).
+/// into the certificate store, keyed by `(host, port)` (spec §5.7, P2): the
+/// bare host on 443 (where ACME certs live), `host:port` elsewhere. Runs at
+/// startup (after persisted ACME certs, so it wins on a stale host).
 fn load_site_certificates(
     cert_store: &CertStore,
     config: &CompiledConfig,
 ) -> Result<(), Box<dyn Error>> {
     for site in &config.sites {
         let Some(tls) = &site.tls else { continue };
-        let SiteKey::Named { host, .. } = &site.key else {
+        let SiteKey::Named { host, port } = &site.key else {
             continue;
+        };
+        let key = if *port == 443 {
+            host.clone()
+        } else {
+            format!("{host}:{port}")
         };
         match &tls.source {
             TlsSource::Acme => {}
             TlsSource::Internal => {
                 let cert = generate_internal_cert(host)?;
-                cert_store.store(host, cert);
+                cert_store.store(&key, cert);
                 tracing::info!("serving a self-signed internal certificate for {host}");
             }
             TlsSource::Static {
@@ -343,7 +352,7 @@ fn load_site_certificates(
                 let key_pem = std::fs::read_to_string(key_file)
                     .map_err(|e| format!("failed to read key {key_file}: {e}"))?;
                 let cert = crate::tls::cert_key_from_pem(&cert_pem, &key_pem)?;
-                cert_store.store(host, cert);
+                cert_store.store(&key, cert);
                 tracing::info!("serving static certificate for {host}");
             }
         }
