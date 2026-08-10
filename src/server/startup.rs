@@ -217,7 +217,10 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
             // TLS listener with SNI dynamic certificates from the store.
             let callbacks: TlsAcceptCallbacks =
                 Box::new(SniCallback::new(cert_store.clone(), on_miss.clone()));
-            let settings = TlsSettings::with_callbacks(callbacks)?;
+            // Advertise HTTP/2 over ALPN (`h2` preferred, HTTP/1.1 fallback),
+            // spec §5.6.
+            let mut settings = TlsSettings::with_callbacks(callbacks)?;
+            settings.enable_h2();
             proxy.add_tls_with_settings(&format!("0.0.0.0:{port}"), None, settings);
             tracing::info!("listening (TLS) on 0.0.0.0:{port}");
         } else {

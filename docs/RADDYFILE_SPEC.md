@@ -286,6 +286,8 @@ tunnels the connection bidirectionally.
 
 ### 5.6 HTTP/2
 
+**Status: Available.**
+
 - **Downstream**: TLS listeners (port 443) advertise `h2` via ALPN and serve
   HTTP/2 to clients that support it, falling back to HTTP/1.1 otherwise. This is
   the default.
