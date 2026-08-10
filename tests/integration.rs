@@ -213,6 +213,88 @@ impl Drop for TlsEchoUpstream {
     }
 }
 
+/// A minimal protocol-upgrade upstream (spec §5.5): answers any request that
+/// asks for an upgrade with `101 Switching Protocols`, then echoes raw bytes
+/// back so the tunnel can be verified end to end.
+struct UpgradeEchoUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl UpgradeEchoUpstream {
+    fn spawn() -> (u16, UpgradeEchoUpstream) {
+        let (port, listener) = bind_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    // Read the request head (single read suffices for a GET).
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while head.len() < 8192 {
+                        match stream.read(&mut byte) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                head.push(byte[0]);
+                                if head.ends_with(b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !head
+                        .windows(b"Upgrade".len())
+                        .any(|w| w.eq_ignore_ascii_case(b"Upgrade"))
+                    {
+                        return;
+                    }
+                    let resp = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+                    if stream.write_all(resp.as_bytes()).is_err() {
+                        return;
+                    }
+                    // Echo raw bytes until either side closes the tunnel.
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (
+            port,
+            UpgradeEchoUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for UpgradeEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// An upstream that keeps connections alive (no `Connection: close`) and counts
 /// *distinct* connections, so a client can assert connection reuse across
 /// requests and reloads.
@@ -716,6 +798,48 @@ fn https_upstream_untrusted_cert_yields_502() {
     // The upstream is reached only to the TLS handshake, never to its HTTP
     // response — its body must not leak through a failed verification.
     assert_ne!(resp.body, "label=secure");
+}
+
+#[test]
+fn websocket_upgrade_is_proxied() {
+    // A WebSocket-style upgrade (spec §5.5): raddy forwards the `Connection:
+    // upgrade` request, the upstream answers 101, and raddy tunnels bytes
+    // bidirectionally.
+    let (up_port, _up) = UpgradeEchoUpstream::spawn();
+    let raddy =
+        RadRaddy::spawn(|port| format!(":{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"));
+    let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let req = "GET /chat HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    stream.write_all(req.as_bytes()).unwrap();
+    // Read the 101 response head.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match stream.read(&mut byte) {
+            Ok(0) => panic!("upstream closed before the 101 response"),
+            Ok(_) => {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => panic!("read error waiting for the 101 response"),
+        }
+    }
+    let head_str = String::from_utf8_lossy(&head).to_lowercase();
+    assert!(
+        head_str.starts_with("http/1.1 101"),
+        "expected 101 Switching Protocols, got: {head_str}"
+    );
+    // The tunnel is live: bytes written by the client are echoed by the upstream.
+    stream.write_all(b"ping").unwrap();
+    let mut echo = [0u8; 4];
+    stream.read_exact(&mut echo).unwrap();
+    assert_eq!(&echo, b"ping");
 }
 
 #[test]

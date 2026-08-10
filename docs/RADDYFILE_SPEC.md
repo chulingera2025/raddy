@@ -270,6 +270,8 @@ reverse_proxy {
 
 ### 5.5 WebSocket and protocol upgrades
 
+**Status: Available.**
+
 `reverse_proxy` forwards HTTP `Upgrade` requests (WebSocket and similar
 `Connection: upgrade` protocols) transparently: the client's upgrade request
 goes upstream, and once the upstream answers `101 Switching Protocols` raddy
