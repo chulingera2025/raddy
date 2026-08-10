@@ -26,7 +26,7 @@
 //! touching any listener). The upgrade socket path must agree between old and
 //! new process.
 
-use crate::config::ast::{CompiledConfig, LogLevel, SiteKey};
+use crate::config::ast::{CompiledConfig, LogLevel, SiteKey, TlsSource};
 use crate::config::snapshot::{self, ConfigStore};
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
@@ -38,6 +38,7 @@ use pingora::listeners::{tls::TlsSettings, TlsAcceptCallbacks};
 use pingora::prelude::*;
 use pingora::server::configuration::{Opt, ServerConf};
 use pingora::services::listening::Service;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -77,6 +78,9 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     let ports = snapshot.listeners();
     let email = snapshot.global.acme_email.clone();
     let startup_hosts = hosts_needing_certs(&snapshot);
+    // Computed before `snapshot` is moved into the store below (used later to
+    // decide which listeners are TLS).
+    let tls_ports = tls_listener_ports(&snapshot);
 
     init_tracing(default_log_filter(snapshot.global.log_level));
 
@@ -101,6 +105,10 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         snapshot.global.dns_challenge.clone(),
     ));
     acme.load_persisted_certs();
+    // Sites with a static or internal `tls` source (spec §5.7) serve their own
+    // certificate; load them into the store now, overriding any stale persisted
+    // ACME cert for the same host.
+    load_site_certificates(&cert_store, &snapshot)?;
     // The issuance state table (B3a) must be bounded by the authorized
     // configured hosts plus the queue capacity: on-miss SNI and renewal can
     // only ever name hosts configured as named sites, so a host-count-derived
@@ -212,11 +220,16 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     }
 
     let mut proxy = http_proxy_service(&server.configuration, handler);
+    // TLS is served on port 443 by default, and on any named site whose `tls`
+    // directive opts it in (spec §5.7); every other port is plain HTTP.
     for port in ports {
-        if port == 443 {
+        if tls_ports.contains(&port) {
             // TLS listener with SNI dynamic certificates from the store.
-            let callbacks: TlsAcceptCallbacks =
-                Box::new(SniCallback::new(cert_store.clone(), on_miss.clone()));
+            let callbacks: TlsAcceptCallbacks = Box::new(SniCallback::new(
+                cert_store.clone(),
+                config_store.clone(),
+                on_miss.clone(),
+            ));
             // Advertise HTTP/2 over ALPN (`h2` preferred, HTTP/1.1 fallback),
             // spec §5.6.
             let mut settings = TlsSettings::with_callbacks(callbacks)?;
@@ -244,24 +257,96 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     server.run_forever();
 }
 
-/// Hostnames that need a certificate up front: named sites bound to 443.
+/// Hostnames that need an ACME certificate up front: named sites served over
+/// TLS whose `tls` source is ACME (a static or internal source supplies its
+/// own cert — spec §5.7).
 fn hosts_needing_certs(config: &CompiledConfig) -> Vec<String> {
+    let tls_ports = tls_listener_ports(config);
     config
         .sites
         .iter()
         .filter_map(|site| match &site.key {
-            SiteKey::Named { host, port } if *port == 443 => Some(host.clone()),
+            SiteKey::Named { host, port } if tls_ports.contains(port) && uses_acme(site) => {
+                Some(host.clone())
+            }
             _ => None,
         })
         .collect()
 }
 
-/// Whether `host` is a named site configured on this instance.
+/// Whether `host` is a named site configured on this instance whose
+/// certificate comes from ACME (a static/internal site never triggers
+/// on-demand issuance — spec §5.7).
 fn is_configured_host(config: &CompiledConfig, host: &str) -> bool {
-    config
-        .sites
-        .iter()
-        .any(|site| matches!(&site.key, SiteKey::Named { host: named, .. } if named == host))
+    config.sites.iter().any(|site| {
+        matches!(&site.key, SiteKey::Named { host: named, .. } if named == host) && uses_acme(site)
+    })
+}
+
+/// The listener ports served over TLS: 443 plus any named-site port with a
+/// `tls` directive (spec §5.7).
+fn tls_listener_ports(config: &CompiledConfig) -> BTreeSet<u16> {
+    let mut ports = BTreeSet::new();
+    ports.insert(443);
+    for site in &config.sites {
+        if site.tls.is_some() {
+            if let SiteKey::Named { port, .. } = &site.key {
+                ports.insert(*port);
+            }
+        }
+    }
+    ports
+}
+
+/// Whether a site's certificate comes from ACME (no `tls` source, or an
+/// explicit ACME default).
+fn uses_acme(site: &crate::config::ast::CompiledSite) -> bool {
+    site.tls
+        .as_ref()
+        .is_none_or(|tls| tls.source == TlsSource::Acme)
+}
+
+/// Load the static and internal certificates for sites that opted out of ACME
+/// into the certificate store, keyed by hostname (spec §5.7). Runs at startup
+/// (after persisted ACME certs, so it wins on a stale host).
+fn load_site_certificates(
+    cert_store: &CertStore,
+    config: &CompiledConfig,
+) -> Result<(), Box<dyn Error>> {
+    for site in &config.sites {
+        let Some(tls) = &site.tls else { continue };
+        let SiteKey::Named { host, .. } = &site.key else {
+            continue;
+        };
+        match &tls.source {
+            TlsSource::Acme => {}
+            TlsSource::Internal => {
+                let cert = generate_internal_cert(host)?;
+                cert_store.store(host, cert);
+                tracing::info!("serving a self-signed internal certificate for {host}");
+            }
+            TlsSource::Static {
+                cert_file,
+                key_file,
+            } => {
+                let cert_pem = std::fs::read_to_string(cert_file)
+                    .map_err(|e| format!("failed to read certificate {cert_file}: {e}"))?;
+                let key_pem = std::fs::read_to_string(key_file)
+                    .map_err(|e| format!("failed to read key {key_file}: {e}"))?;
+                let cert = crate::tls::cert_key_from_pem(&cert_pem, &key_pem)?;
+                cert_store.store(host, cert);
+                tracing::info!("serving static certificate for {host}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Generate a self-signed certificate for `host` (the `tls internal` source).
+fn generate_internal_cert(host: &str) -> Result<pingora::utils::tls::CertKey, String> {
+    let cert = rcgen::generate_simple_self_signed(vec![host.to_string()])
+        .map_err(|e| format!("failed to generate internal certificate for {host}: {e}"))?;
+    crate::tls::cert_key_from_pem(&cert.cert.pem(), &cert.signing_key.serialize_pem())
 }
 
 /// The renewal scan interval: hourly by default, overridable via

@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
 const BIN: &str = env!("CARGO_BIN_EXE_raddy");
 
 // ---------------------------------------------------------------------------
@@ -376,6 +378,16 @@ impl Drop for KeepAliveUpstream {
     }
 }
 
+/// How a spawned server's readiness is probed. TLS sites (spec §5.7) cannot be
+/// reached with a plain-HTTP probe, and an mTLS `require` site rejects every
+/// handshake — those need a TLS or TCP-only probe respectively.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadyProbe {
+    Plain,
+    Tls,
+    Tcp,
+}
+
 /// A running `raddy run` subprocess plus the config file it reads.
 struct RadRaddy {
     child: Child,
@@ -392,6 +404,27 @@ impl RadRaddy {
 
     /// Spawn with extra CLI arguments (e.g. `--metrics-addr`, `--access-log`).
     fn spawn_with_args(config_for: impl Fn(u16) -> String, extra: &[String]) -> RadRaddy {
+        Self::spawn_with_probe(config_for, extra, ReadyProbe::Plain)
+    }
+
+    /// Spawn a server whose site's port is served over TLS (a named site with a
+    /// `tls` directive, spec §5.7); the readiness probe performs a TLS
+    /// handshake.
+    fn spawn_tls(config_for: impl Fn(u16) -> String) -> RadRaddy {
+        Self::spawn_with_probe(config_for, &[], ReadyProbe::Tls)
+    }
+
+    /// Spawn a server whose listener rejects normal probes (e.g. mTLS `require`);
+    /// readiness is a TCP accept only.
+    fn spawn_tcp(config_for: impl Fn(u16) -> String) -> RadRaddy {
+        Self::spawn_with_probe(config_for, &[], ReadyProbe::Tcp)
+    }
+
+    fn spawn_with_probe(
+        config_for: impl Fn(u16) -> String,
+        extra: &[String],
+        probe: ReadyProbe,
+    ) -> RadRaddy {
         loop {
             let port = free_port();
             let config = config_for(port);
@@ -411,7 +444,12 @@ impl RadRaddy {
                 port,
                 config_path,
             };
-            if raddy.wait_for_ready() {
+            let ready = match probe {
+                ReadyProbe::Plain => raddy.wait_for_ready(),
+                ReadyProbe::Tls => raddy.wait_for_ready_tls(),
+                ReadyProbe::Tcp => raddy.wait_for_ready_tcp(),
+            };
+            if ready {
                 return raddy;
             }
             // The child exited (bind failure) or never listened; retry.
@@ -440,6 +478,39 @@ impl RadRaddy {
             // flake a test. The probe omits Host so raddy answers 400 without
             // touching any upstream (which would pollute connection counts).
             if try_request(self.port, None, "/").is_some() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Poll until the TLS listener serves a handshake (spec §5.7); the plain
+    /// `wait_for_ready` probe cannot reach a TLS listener.
+    fn wait_for_ready_tls(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.child.try_wait().expect("try_wait failed").is_some() {
+                return false;
+            }
+            if tls_request(self.port, "localhost", "/", &[]).is_ok() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Poll until the child is alive and its listener accepts TCP. For sites
+    /// that reject every probe request (e.g. mTLS `require`, spec §5.7), a
+    /// successful TCP accept is the strongest readiness signal available.
+    fn wait_for_ready_tcp(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.child.try_wait().expect("try_wait failed").is_some() {
+                return false;
+            }
+            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
                 return true;
             }
             thread::sleep(Duration::from_millis(50));
@@ -512,6 +583,68 @@ fn try_request_hdr(
 
 fn send_request(port: u16, host: Option<&str>, path: &str) -> Response {
     try_request(port, host, path).expect("request failed")
+}
+
+/// Send a GET over TLS (spec §5.7) and return the parsed response. The server
+/// certificate is not verified (test sites use self-signed certs). `Err` on
+/// connect/handshake failure — callers use this to assert mTLS rejections.
+fn tls_request(port: u16, host: &str, path: &str, headers: &[&str]) -> Result<Response, String> {
+    let connector = tls_connector(None);
+    let stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let mut tls = connector
+        .connect(host, stream)
+        .map_err(|e| format!("TLS handshake failed: {e}"))?;
+    let extra = headers
+        .iter()
+        .map(|h| format!("{h}\r\n"))
+        .collect::<String>();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf);
+    let head_end = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+    let head = &text[..head_end];
+    Ok(Response {
+        status: parse_status(head),
+        headers: head.to_lowercase(),
+        body: text[head_end..].to_string(),
+    })
+}
+
+/// A TLS client connector with verification off and optional ALPN protocols
+/// (each `&[u8]` is the wire-format ALPN list, e.g. `b"\x02h2\x08http/1.1"`).
+fn tls_connector(alpn: Option<&[u8]>) -> SslConnector {
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    if let Some(alpn) = alpn {
+        builder.set_alpn_protos(alpn).unwrap();
+    }
+    builder.build()
+}
+
+/// The ALPN protocol a TLS client negotiates (spec §5.6), if any.
+fn tls_negotiated_alpn(port: u16, host: &str) -> Option<String> {
+    let connector = tls_connector(Some(b"\x02h2\x08http/1.1"));
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let tls = connector.connect(host, stream).unwrap();
+    tls.ssl()
+        .selected_alpn_protocol()
+        .map(|proto| String::from_utf8_lossy(proto).into_owned())
+}
+
+/// The PEM of the leaf certificate a TLS server presents (spec §5.7).
+fn tls_peer_cert_pem(port: u16, host: &str) -> Option<String> {
+    let connector = tls_connector(None);
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let tls = connector.connect(host, stream).ok()?;
+    let cert = tls.ssl().peer_certificate()?;
+    String::from_utf8(cert.to_pem().ok()?).ok()
 }
 
 /// Send a request with extra header lines (e.g. `Accept-Encoding`).
@@ -840,6 +973,113 @@ fn websocket_upgrade_is_proxied() {
     let mut echo = [0u8; 4];
     stream.read_exact(&mut echo).unwrap();
     assert_eq!(&echo, b"ping");
+}
+
+/// Write a cert + key PEM pair to temp files (spec §5.7 test helper).
+fn write_pem_pair(cert_pem: &str, key_pem: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir();
+    let stem = format!("raddy-site-cert-{}", std::process::id());
+    let cert_path = dir.join(format!("{stem}.pem"));
+    let key_path = dir.join(format!("{stem}.key"));
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+    (cert_path, key_path)
+}
+
+#[test]
+fn static_tls_site_serves_configured_certificate_and_proxies() {
+    // A named site with a `tls <cert> <key>` source (spec §5.7) is served over
+    // TLS with exactly that certificate, and requests proxy to the upstream.
+    let (up_port, _up) = EchoUpstream::spawn("secure");
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let (cert_path, key_path) = write_pem_pair(&cert_pem, &key_pem);
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "localhost:{port} {{\n    tls {} {}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            cert_path.display(),
+            key_path.display()
+        )
+    });
+    let resp = tls_request(raddy.port(), "localhost", "/", &[]).expect("tls request");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=secure");
+    // The served leaf is the certificate we configured.
+    let served = tls_peer_cert_pem(raddy.port(), "localhost").expect("peer cert");
+    assert_eq!(served.trim(), cert_pem.trim());
+}
+
+#[test]
+fn tls_internal_serves_a_self_signed_certificate() {
+    let (up_port, _up) = EchoUpstream::spawn("internal");
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+        )
+    });
+    let resp = tls_request(raddy.port(), "localhost", "/", &[]).expect("tls request");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=internal");
+    assert!(
+        tls_peer_cert_pem(raddy.port(), "localhost").is_some(),
+        "an internal site must serve a certificate"
+    );
+}
+
+#[test]
+fn mtls_require_rejects_clients_without_certificate() {
+    // `tls client_auth require` (spec §5.7): a client presenting no certificate
+    // cannot complete the handshake.
+    let (up_port, _up) = EchoUpstream::spawn("mtls");
+    let ca = rcgen::generate_simple_self_signed(vec!["Test CA".to_string()]).unwrap();
+    let ca_path = std::env::temp_dir().join(format!("raddy-ca-{}.pem", std::process::id()));
+    std::fs::write(&ca_path, ca.cert.pem()).unwrap();
+    // The listener rejects every TLS client without a certificate, so a TCP
+    // accept is the only usable readiness probe.
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    tls client_auth require {}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            ca_path.display()
+        )
+    });
+    assert!(
+        tls_request(raddy.port(), "localhost", "/", &[]).is_err(),
+        "a client without a certificate must be rejected"
+    );
+}
+
+#[test]
+fn mtls_optional_accepts_clients_without_certificate() {
+    // `tls client_auth optional` requests but does not require a certificate.
+    let (up_port, _up) = EchoUpstream::spawn("mtls-opt");
+    let ca = rcgen::generate_simple_self_signed(vec!["Test CA".to_string()]).unwrap();
+    let ca_path = std::env::temp_dir().join(format!("raddy-ca-opt-{}.pem", std::process::id()));
+    std::fs::write(&ca_path, ca.cert.pem()).unwrap();
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    tls client_auth optional {}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            ca_path.display()
+        )
+    });
+    let resp = tls_request(raddy.port(), "localhost", "/", &[]).expect("tls request");
+    assert_eq!(resp.status, 200);
+}
+
+#[test]
+fn h2_negotiated_on_tls_listener() {
+    // TLS listeners advertise h2 over ALPN (spec §5.6); a client offering h2
+    // and http/1.1 negotiates h2.
+    let (up_port, _up) = EchoUpstream::spawn("h2");
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+        )
+    });
+    assert_eq!(
+        tls_negotiated_alpn(raddy.port(), "localhost").as_deref(),
+        Some("h2")
+    );
 }
 
 #[test]

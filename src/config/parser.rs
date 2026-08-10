@@ -364,6 +364,7 @@ impl<'a> Parser<'a> {
             "redir" => self.parse_redir(words, block_open),
             "rate_limit" => self.parse_rate_limit(words, block_open),
             "trusted_proxies" => self.parse_trusted_proxies(words, block_open),
+            "tls" => self.parse_tls(words, block_open),
             other => Err(self.err(format!("unknown directive '{other}'"))),
         }
     }
@@ -760,6 +761,90 @@ impl<'a> Parser<'a> {
             .map(|w| Cidr::parse(w).map_err(|message| self.err(message)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Directive::TrustedProxies { networks })
+    }
+
+    /// Parse `tls` — the per-site TLS directive (spec §5.7). Forms:
+    /// `tls` (ACME default), `tls internal`, `tls <cert> <key>`,
+    /// `tls min_version|max_version <1.2|1.3>`, `tls ciphers <list>`,
+    /// `tls client_auth <optional|require> <ca-file>`. Options are merged
+    /// across separate `tls` lines by the compiler.
+    fn parse_tls(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after tls"));
+        }
+        let mut config = TlsConfig::default();
+        let args = &words[1..];
+        match args.first() {
+            None => {}
+            Some(first) => match first.as_str() {
+                "internal" => {
+                    if args.len() != 1 {
+                        return Err(self.err("tls internal takes no arguments"));
+                    }
+                    config.source = TlsSource::Internal;
+                }
+                "min_version" | "max_version" => {
+                    if args.len() != 2 {
+                        return Err(self.err(format!("tls {first} requires exactly one version")));
+                    }
+                    let version = match args[1].as_str() {
+                        "1.2" => TlsVersion::Tls12,
+                        "1.3" => TlsVersion::Tls13,
+                        other => {
+                            return Err(self.err(format!(
+                                "invalid TLS version '{other}' (expected 1.2 or 1.3)"
+                            )))
+                        }
+                    };
+                    if first == "min_version" {
+                        config.min_version = Some(version);
+                    } else {
+                        config.max_version = Some(version);
+                    }
+                }
+                "ciphers" => {
+                    if args.len() < 2 {
+                        return Err(self.err("tls ciphers requires a cipher list"));
+                    }
+                    // Space-separated cipher names are joined with `:` (OpenSSL's
+                    // cipher-list separator).
+                    config.ciphers = Some(args[1..].join(":"));
+                }
+                "client_auth" => {
+                    if args.len() != 3 {
+                        return Err(self.err(
+                            "tls client_auth expects: client_auth <optional|require> <ca-file>",
+                        ));
+                    }
+                    let mode = match args[1].as_str() {
+                        "optional" => ClientAuthMode::Optional,
+                        "require" => ClientAuthMode::Require,
+                        other => {
+                            return Err(self.err(format!(
+                                "invalid client_auth mode '{other}' (expected optional or require)"
+                            )))
+                        }
+                    };
+                    config.client_auth = Some(ClientAuth {
+                        mode,
+                        ca_file: args[2].clone(),
+                    });
+                }
+                _ => {
+                    // Static certificate pair: `tls <cert-file> <key-file>`.
+                    if args.len() != 2 {
+                        return Err(self.err(
+                            "tls expects: internal | <cert-file> <key-file> | min_version/max_version/ciphers/client_auth",
+                        ));
+                    }
+                    config.source = TlsSource::Static {
+                        cert_file: args[0].clone(),
+                        key_file: args[1].clone(),
+                    };
+                }
+            },
+        }
+        Ok(Directive::Tls { config })
     }
 
     /// Parse `rate_limit <key> <rate> [burst=<n>]` (spec §5.2).

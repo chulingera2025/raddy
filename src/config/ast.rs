@@ -367,6 +367,10 @@ pub enum Directive {
     RateLimit {
         spec: RateSpec,
     },
+    /// Per-site TLS configuration (spec §5.7): certificate source and options.
+    Tls {
+        config: TlsConfig,
+    },
 }
 
 /// An upstream target. The host is resolved to an address during validation;
@@ -395,6 +399,59 @@ pub struct ProxyTlsConfig {
     /// `tls_cert <cert-file> <key-file>`: a client certificate for upstream mTLS.
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
+}
+
+/// The certificate source of a site's `tls` directive (spec §5.7).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TlsSource {
+    /// Automatic ACME issuance (the default).
+    #[default]
+    Acme,
+    /// `tls internal` — a self-signed certificate generated at startup.
+    Internal,
+    /// `tls <cert-file> <key-file>` — a static PEM certificate chain + key.
+    Static { cert_file: String, key_file: String },
+}
+
+/// A TLS protocol version for `tls min_version` / `tls max_version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsVersion {
+    Tls12,
+    Tls13,
+}
+
+/// The mTLS client-certificate verification mode (`tls client_auth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAuthMode {
+    /// Ask for a client certificate but accept clients without one.
+    Optional,
+    /// Reject clients without a valid client certificate.
+    Require,
+}
+
+/// Client-certificate authentication (spec §5.7): verify against `ca_file`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuth {
+    pub mode: ClientAuthMode,
+    pub ca_file: String,
+}
+
+/// Per-site TLS configuration from the `tls` directive (spec §5.7).
+///
+/// Options are independent and each may appear on its own `tls` line; the
+/// compiler merges them. `source` defaults to ACME when no source is given.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Certificate source (ACME by default).
+    pub source: TlsSource,
+    /// `tls min_version` (None = no floor).
+    pub min_version: Option<TlsVersion>,
+    /// `tls max_version` (None = no ceiling).
+    pub max_version: Option<TlsVersion>,
+    /// `tls ciphers <list>` (OpenSSL cipher list).
+    pub ciphers: Option<String>,
+    /// `tls client_auth` — mutual TLS.
+    pub client_auth: Option<ClientAuth>,
 }
 
 /// A path matcher: a request path matches if it falls under the prefix.
@@ -477,6 +534,9 @@ pub struct CompiledSite {
     pub modifiers: Vec<Modifier>,
     /// Site-scoped `trusted_proxies` (None = inherit the global list, §4).
     pub trusted_proxies: Option<Vec<Cidr>>,
+    /// Per-site TLS configuration (spec §5.7): certificate source and the TLS
+    /// options applied per SNI. `None` = ACME default, no overrides.
+    pub tls: Option<TlsConfig>,
 }
 
 /// A compiled terminal directive.

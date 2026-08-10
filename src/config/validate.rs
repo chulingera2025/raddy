@@ -83,6 +83,8 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
     let mut roots: Vec<String> = Vec::new();
     // Site-scoped `trusted_proxies` (None = inherit the global list, §4).
     let mut site_trusted: Option<Vec<Cidr>> = None;
+    // Site-scoped `tls` configuration, merged across `tls` lines (spec §5.7).
+    let mut site_tls: Option<TlsConfig> = None;
 
     for directive in &site.directives {
         match directive {
@@ -146,7 +148,13 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                 site_trusted = Some(networks.clone());
             }
             Directive::RateLimit { spec } => modifiers.push(Modifier::RateLimit { spec: *spec }),
+            Directive::Tls { config } => merge_tls(&mut site_tls, config),
         }
+    }
+
+    // Validate the merged per-site TLS config (file existence, version range).
+    if let Some(tls) = &site_tls {
+        validate_tls_config(file, tls)?;
     }
 
     // Pass 2: block-level modifiers apply to every terminal (ADR-012); a
@@ -170,6 +178,7 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
         terminals,
         modifiers,
         trusted_proxies: site_trusted,
+        tls: site_tls,
     })
 }
 
@@ -252,6 +261,12 @@ fn compile_handle_block(
                 return Err(validate_error(
                     file,
                     "trusted_proxies is only allowed at the global or site-block level",
+                ));
+            }
+            Directive::Tls { .. } => {
+                return Err(validate_error(
+                    file,
+                    "tls is only allowed at the site-block level",
                 ));
             }
             Directive::Handle { .. } => {
@@ -456,6 +471,70 @@ fn validate_error(file: &str, message: impl Into<String>) -> ConfigError {
         file: file.to_string(),
         message: message.into(),
     }
+}
+
+/// Merge one `tls` directive into the site's accumulated config (spec §5.7).
+/// Each option is independent and the last occurrence wins; `source` is only
+/// overridden when the directive actually sets one (bare `tls` = ACME default).
+fn merge_tls(site_tls: &mut Option<TlsConfig>, config: &TlsConfig) {
+    let target = site_tls.get_or_insert_with(TlsConfig::default);
+    if config.source != TlsSource::Acme {
+        target.source = config.source.clone();
+    }
+    if config.min_version.is_some() {
+        target.min_version = config.min_version;
+    }
+    if config.max_version.is_some() {
+        target.max_version = config.max_version;
+    }
+    if config.ciphers.is_some() {
+        target.ciphers = config.ciphers.clone();
+    }
+    if config.client_auth.is_some() {
+        target.client_auth = config.client_auth.clone();
+    }
+}
+
+/// Validate a merged per-site `tls` config: static cert and mTLS CA files exist
+/// and parse, and the version range is consistent (spec §5.7). Runs at compile
+/// time so `raddy check` and reload catch it before the files are needed.
+fn validate_tls_config(file: &str, config: &TlsConfig) -> Result<(), ConfigError> {
+    if let TlsSource::Static {
+        cert_file,
+        key_file,
+    } = &config.source
+    {
+        let cert_pem = std::fs::read_to_string(cert_file).map_err(|e| {
+            validate_error(file, format!("failed to read certificate {cert_file}: {e}"))
+        })?;
+        let key_pem = std::fs::read_to_string(key_file)
+            .map_err(|e| validate_error(file, format!("failed to read key {key_file}: {e}")))?;
+        crate::tls::cert_key_from_pem(&cert_pem, &key_pem)
+            .map_err(|e| validate_error(file, format!("invalid tls certificate: {e}")))?;
+    }
+    if let Some(client_auth) = &config.client_auth {
+        let ca_pem = std::fs::read_to_string(&client_auth.ca_file).map_err(|e| {
+            validate_error(
+                file,
+                format!("failed to read CA file {}: {e}", client_auth.ca_file),
+            )
+        })?;
+        pingora::tls::x509::X509::stack_from_pem(ca_pem.as_bytes()).map_err(|e| {
+            validate_error(
+                file,
+                format!("invalid CA file {}: {e}", client_auth.ca_file),
+            )
+        })?;
+    }
+    if let (Some(min), Some(max)) = (config.min_version, config.max_version) {
+        if min > max {
+            return Err(validate_error(
+                file,
+                "tls min_version must not exceed max_version",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -804,5 +883,120 @@ mod tests {
         assert!(got[0].tls);
         assert_eq!(got[0].host, "secure.test");
         assert_eq!(got[0].addr.port(), 8443);
+    }
+
+    /// Write a self-signed cert + key for `host` to temp files, returning the
+    /// paths (spec §5.7 test helper). A per-test counter keeps filenames unique
+    /// so parallel tests never clobber each other's temp files.
+    fn write_test_cert(host: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir();
+        let stem = format!(
+            "raddy-tls-site-{}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+            host
+        );
+        let cert_path = dir.join(format!("{stem}.pem"));
+        let key_path = dir.join(format!("{stem}.key"));
+        let cert = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn compiles_static_tls_source() {
+        let (cert, key) = write_test_cert("example.com");
+        let cfg = compile(&format!(
+            "example.com:8443 {{\n    tls {} {}\n    reverse_proxy 127.0.0.1:9000\n}}\n",
+            cert.display(),
+            key.display()
+        ))
+        .unwrap();
+        assert!(matches!(
+            cfg.sites[0].tls.as_ref().expect("tls config").source,
+            TlsSource::Static { .. }
+        ));
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn compiles_internal_tls_without_files() {
+        let cfg =
+            compile("example.com:8443 {\n    tls internal\n    reverse_proxy 127.0.0.1:9000\n}\n")
+                .unwrap();
+        assert_eq!(
+            cfg.sites[0].tls.as_ref().expect("tls config").source,
+            TlsSource::Internal
+        );
+    }
+
+    #[test]
+    fn merges_tls_options_across_lines() {
+        let (cert, key) = write_test_cert("example.com");
+        let cfg = compile(&format!(
+            "example.com:8443 {{\n    tls {} {}\n    tls min_version 1.3\n    reverse_proxy 127.0.0.1:9000\n}}\n",
+            cert.display(),
+            key.display()
+        ))
+        .unwrap();
+        let tls = cfg.sites[0].tls.as_ref().expect("tls config");
+        assert!(matches!(tls.source, TlsSource::Static { .. }));
+        assert_eq!(tls.min_version, Some(TlsVersion::Tls13));
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn compiles_client_auth() {
+        let (ca, _) = write_test_cert("ca.example.com");
+        let cfg = compile(&format!(
+            "example.com:8443 {{\n    tls client_auth require {}\n    reverse_proxy 127.0.0.1:9000\n}}\n",
+            ca.display()
+        ))
+        .unwrap();
+        let auth = cfg.sites[0]
+            .tls
+            .as_ref()
+            .expect("tls config")
+            .client_auth
+            .as_ref()
+            .expect("client auth");
+        assert_eq!(auth.mode, ClientAuthMode::Require);
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn rejects_missing_static_cert() {
+        let err = compile(
+            "example.com:8443 {\n    tls /nonexistent/cert.pem /nonexistent/key.pem\n    reverse_proxy 127.0.0.1:9000\n}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to read certificate"));
+    }
+
+    #[test]
+    fn rejects_min_above_max_version() {
+        let cfg = compile(
+            "example.com:8443 {\n    tls min_version 1.3\n    tls max_version 1.2\n    reverse_proxy 127.0.0.1:9000\n}\n",
+        )
+        .unwrap_err();
+        assert!(cfg
+            .to_string()
+            .contains("min_version must not exceed max_version"));
+    }
+
+    #[test]
+    fn rejects_tls_inside_handle() {
+        let err = compile(
+            ":8080 {\n    handle /x/* {\n        tls internal\n        file_server\n    }\n}\n",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("tls is only allowed at the site-block level"));
     }
 }

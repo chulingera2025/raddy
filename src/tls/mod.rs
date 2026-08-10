@@ -22,11 +22,15 @@
 //! Each stored certificate also records its `notAfter` (M8) so the renewal
 //! scheduler can re-issue before expiry.
 
+use crate::config::ast::{ClientAuthMode, SiteKey, TlsConfig, TlsVersion};
+use crate::config::snapshot::ConfigStore;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use openssl::ssl::{SslVerifyMode, SslVersion};
+use openssl::x509::store::{X509Store, X509StoreBuilder};
 use pingora::listeners::TlsAccept;
 use pingora::protocols::tls::TlsRef;
 use pingora::tls::{ext, pkey::PKey, ssl::NameType, x509::X509};
@@ -129,15 +133,131 @@ fn leaf_not_after(cert: &CertKey) -> Option<SystemTime> {
 /// When the requested hostname has no certificate, `on_miss` is invoked (the
 /// ACME on-demand path) and the handshake proceeds without a certificate, so it
 /// fails; the client is expected to retry once issuance completes.
+///
+/// For a hostname that is a named site with a `tls` directive (spec §5.7), the
+/// callback also applies that site's per-SNI options on the handshake:
+/// `min_version` / `max_version`, `ciphers`, and `client_auth` (mTLS). The
+/// options are read from the current config snapshot, so a reload updates them
+/// without rebuilding the listener (ADR-010).
 pub struct SniCallback {
     store: Arc<CertStore>,
     on_miss: Arc<dyn Fn(&str) + Send + Sync>,
+    config: Arc<ConfigStore>,
+    /// Cache of parsed mTLS CA certificates, keyed by CA file path. mTLS sites
+    /// are few, so this is bounded by the number of distinct CA files; caching
+    /// the parsed certs avoids re-reading and re-parsing the CA PEM on every
+    /// handshake. (The `X509Store` itself is built per handshake — it is not
+    /// `Clone`.)
+    ca_cache: Mutex<HashMap<String, Arc<Vec<X509>>>>,
 }
 
 impl SniCallback {
     /// Create a callback backed by `store`; `on_miss` fires for unknown SNI.
-    pub fn new(store: Arc<CertStore>, on_miss: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
-        Self { store, on_miss }
+    /// `config` supplies the per-site `tls` options applied on the handshake.
+    pub fn new(
+        store: Arc<CertStore>,
+        config: Arc<ConfigStore>,
+        on_miss: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        Self {
+            store,
+            on_miss,
+            config,
+            ca_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Apply a site's per-SNI TLS options (spec §5.7) to an in-progress
+    /// handshake. Runs from within `certificate_callback`, before the version,
+    /// cipher, and client-certificate decisions are finalized. Best-effort:
+    /// an invalid cipher list or a missing CA file is logged, never fatal.
+    fn apply_site_tls_options(&self, ssl: &mut TlsRef, tls: &TlsConfig) {
+        if let Some(v) = tls.min_version {
+            if let Err(e) = ssl.set_min_proto_version(Some(tls_ssl_version(v))) {
+                tracing::warn!("failed to set min TLS version: {e}");
+            }
+        }
+        if let Some(v) = tls.max_version {
+            if let Err(e) = ssl.set_max_proto_version(Some(tls_ssl_version(v))) {
+                tracing::warn!("failed to set max TLS version: {e}");
+            }
+        }
+        if let Some(ciphers) = &tls.ciphers {
+            if let Err(e) = ssl.set_cipher_list(ciphers) {
+                tracing::warn!("invalid tls ciphers '{ciphers}': {e}");
+            }
+        }
+        if let Some(client_auth) = &tls.client_auth {
+            match self.ca_certs(&client_auth.ca_file) {
+                Some(certs) => {
+                    // `require` also rejects clients that present no certificate.
+                    let mode = match client_auth.mode {
+                        ClientAuthMode::Require => {
+                            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
+                        }
+                        ClientAuthMode::Optional => SslVerifyMode::PEER,
+                    };
+                    ssl.set_verify(mode);
+                    match self.build_ca_store(&certs) {
+                        Some(store) => {
+                            if let Err(e) = ssl.set_verify_cert_store(store) {
+                                tracing::warn!("failed to set mTLS CA store: {e}");
+                            }
+                        }
+                        None => tracing::warn!(
+                            "tls client_auth CA file {} could not be loaded; clients are not verified",
+                            client_auth.ca_file
+                        ),
+                    }
+                }
+                None => tracing::warn!(
+                    "tls client_auth CA file {} unreadable; clients are not verified",
+                    client_auth.ca_file
+                ),
+            }
+        }
+    }
+
+    /// The named site's `tls` config for `host`, if any (spec §5.7).
+    fn site_tls(&self, host: &str) -> Option<TlsConfig> {
+        let config = self.config.load();
+        config
+            .sites
+            .iter()
+            .find(|site| matches!(&site.key, SiteKey::Named { host: h, .. } if h == host))
+            .and_then(|site| site.tls.clone())
+    }
+
+    /// Parse (and cache) an mTLS CA PEM file into its certificates.
+    fn ca_certs(&self, path: &str) -> Option<Arc<Vec<X509>>> {
+        if let Ok(cache) = self.ca_cache.lock() {
+            if let Some(certs) = cache.get(path) {
+                return Some(certs.clone());
+            }
+        }
+        let pem = std::fs::read_to_string(path).ok()?;
+        let certs: Arc<Vec<X509>> = Arc::new(X509::stack_from_pem(pem.as_bytes()).ok()?);
+        if let Ok(mut cache) = self.ca_cache.lock() {
+            cache.insert(path.to_string(), certs.clone());
+        }
+        Some(certs)
+    }
+
+    /// Build a trust store from cached CA certificates.
+    fn build_ca_store(&self, certs: &[X509]) -> Option<X509Store> {
+        let mut builder = X509StoreBuilder::new().ok()?;
+        for cert in certs {
+            let _ = builder.add_cert(cert.clone());
+        }
+        Some(builder.build())
+    }
+}
+
+/// Map a config TLS version to the openssl `SslVersion`.
+fn tls_ssl_version(version: TlsVersion) -> SslVersion {
+    match version {
+        TlsVersion::Tls12 => SslVersion::TLS1_2,
+        TlsVersion::Tls13 => SslVersion::TLS1_3,
     }
 }
 
@@ -172,6 +292,10 @@ impl TlsAccept for SniCallback {
                 tracing::warn!("no certificate for SNI '{sni}'; triggering on-demand issuance");
                 (self.on_miss)(&sni);
             }
+        }
+        // Per-site TLS options (spec §5.7): min/max version, ciphers, mTLS.
+        if let Some(tls) = self.site_tls(&sni) {
+            self.apply_site_tls_options(ssl, &tls);
         }
     }
 }
@@ -288,8 +412,13 @@ mod tests {
             "example.test",
             cert_key_from_pem(&cert_pem, &key_pem).unwrap(),
         );
+        let config = Arc::new(ConfigStore::new(crate::config::ast::CompiledConfig {
+            global: crate::config::ast::GlobalConfig::default(),
+            sites: vec![],
+        }));
 
-        let callbacks: TlsAcceptCallbacks = Box::new(SniCallback::new(store, Arc::new(|_| {})));
+        let callbacks: TlsAcceptCallbacks =
+            Box::new(SniCallback::new(store, config, Arc::new(|_| {})));
         let acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
             .unwrap()
             .build();

@@ -120,7 +120,7 @@ trusted, so the default must be pinned down:
 | `trusted_proxies` | trusted network list (see Section 4) | Available |
 | `dns_challenge` | `dns_challenge cloudflare <api_token>` — DNS-01 issuance via a DNS provider (Cloudflare today; see Section 5.3) | Available |
 | `tls_alpn_challenge` | prove control via TLS-ALPN-01 on port 443 instead of HTTP-01 (see Section 5.8) | Planned |
-| `tls` | per-site TLS source and options: `tls [<cert> <key> | internal]`, `min_version`, `max_version`, `ciphers`, `alpn`, `client_auth` (see Section 5.7) | Planned |
+| `tls` | per-site TLS source and options: `tls [<cert> <key> | internal]`, `min_version`, `max_version`, `ciphers`, `client_auth` (see Section 5.7) | Available |
 | `rewrite` | `rewrite <matcher> <to>` — rewrite the request URI before forwarding (modifier; see Section 5.9) | Planned |
 | `handle_path` | like `handle`, but strips the matched path prefix from the URI (see Section 5.9) | Planned |
 | `respond` | `respond <status> [<body>]` — answer directly with a status/body (terminal; see Section 5.9) | Planned |
@@ -299,8 +299,12 @@ tunnels the connection bidirectionally.
 
 ### 5.7 `tls` directive (per-site TLS options, manual certificates, mTLS)
 
+**Status: Available.**
+
 Named sites normally get certificates automatically from ACME. The `tls`
-directive in a site block customizes TLS for that site:
+directive in a site block customizes TLS for that site; a named site that has a
+`tls` directive binds its port as a **TLS listener** (in addition to the default
+port 443):
 
 ```caddyfile
 api.example.com {
@@ -325,16 +329,17 @@ secure.example.com {
     development; clients must be configured to trust it. No ACME is attempted.
   - `tls <cert-file> <key-file>` — a static PEM certificate chain + private key
     served for this site instead of ACME. Renewal is the operator's job.
-- **Options** (all optional; combine freely):
+- **Options** (all optional; combine freely; each on its own `tls` line):
   - `tls min_version <1.2|1.3>` / `tls max_version <1.2|1.3>` — restrict the
-    negotiated TLS protocol version.
+    negotiated TLS protocol version for this site.
   - `tls ciphers <list>` — an OpenSSL cipher suite list (e.g.
-    `ECDHE-ECDSA-AES128-GCM-SHA256`).
-  - `tls alpn <protocols...>` — the advertised ALPN list (e.g. `h2 http/1.1`);
-    overrides the Section 5.6 default.
+    `ECDHE-ECDSA-AES128-GCM-SHA256`); space-separated names are joined with `:`.
   - `tls client_auth <optional|require> <ca-file>` — mutual TLS: verify the
     client certificate against `ca-file`. `require` rejects clients without a
     valid certificate; `optional` requests one but accepts clients without.
+- Options are applied **per SNI** during the handshake; a reload updates them
+  without rebuilding the listener. The advertised ALPN set is not per-site —
+  Section 5.6's `h2`/`http/1.1` default applies to every TLS listener.
 - A site whose `tls` source is static or internal is excluded from ACME
   issuance for that hostname (both startup and on-demand).
 
@@ -493,7 +498,8 @@ configure access logging more precisely:
 - **Explicit named-site ports**: `api.example.com:8081 { ... }` binds a named
   site to a non-standard port (for local multi-port deployment and testing);
   the default is 443 when the port is omitted. IPv6 literal addresses
-  (`[::1]:8080`) are not yet supported.
+  (`[::1]:8080`) are not yet supported. A named site with a `tls` directive
+  (Section 5.7) serves its port over TLS even when it is not 443.
 - **Fallbacks**: a missing or malformed Host → `400 Bad Request`; a valid but
   unmatched Host (with no catch-all) → `404 Not Found`. There are no
   configurable error pages.
