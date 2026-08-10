@@ -6,7 +6,8 @@
 > **Red line**: any syntax not specified here must be added here before it is
 > implemented — never decide syntax on the fly.
 
-Status legend: **Available** = implemented; **Planned** = scheduled; **Future** = not yet scheduled.
+Status legend: **Available** = implemented; **Deferred** = blocked or postponed;
+**Future** = not yet scheduled.
 
 ## 1. Design philosophy: explicit write-order execution
 
@@ -119,15 +120,15 @@ trusted, so the default must be pinned down:
 | `rate_limit` | `rate_limit <key> <rate> [burst=<n>]` (**single-instance** rate limit; see Section 5.2); key is `remote_ip` or `header <name>` | Available |
 | `trusted_proxies` | trusted network list (see Section 4) | Available |
 | `dns_challenge` | `dns_challenge cloudflare <api_token>` — DNS-01 issuance via a DNS provider (Cloudflare today; see Section 5.3) | Available |
-| `tls_alpn_challenge` | prove control via TLS-ALPN-01 on port 443 instead of HTTP-01 (see Section 5.8) | Planned |
-| `tls` | per-site TLS source and options: `tls [<cert> <key> | internal]`, `min_version`, `max_version`, `ciphers`, `client_auth` (see Section 5.7) | Available |
-| `rewrite` | `rewrite <to>` — rewrite the request URI before forwarding (modifier; see Section 5.9) | Available |
+| `tls_alpn_challenge` | prove control via TLS-ALPN-01 on port 443 instead of HTTP-01 (see Section 5.8) | Deferred |
+| `tls` | per-site TLS source and options: `tls [<cert> <key> \| internal]`, `min_version`, `max_version`, `ciphers`, `client_auth` (see Section 5.7) | Available |
+| `rewrite` | `rewrite <to>` — rewrite the request URI before forwarding; takes no matcher, always applied (modifier; see Section 5.9) | Available |
 | `handle_path` | like `handle`, but strips the matched path prefix from the URI (see Section 5.9) | Available |
-| `respond` | `respond <status> [<body>]` — answer directly with a status/body (terminal; see Section 5.9) | Available |
-| `error` | `error [<status>] [<message>]` — trigger the internal error response (terminal; see Section 5.9) | Available |
+| `respond` | `respond <matcher> <status> [<body>]` — answer directly with a status/body; accepts an inline matcher (terminal; see Section 5.9) | Available |
+| `error` | `error <matcher> [<status>] [<message>]` — trigger the internal error response; accepts an inline matcher (terminal; see Section 5.9) | Available |
 | `basic_auth` | `basic_auth <user> <bcrypt-hash>` — HTTP Basic auth guard (see Section 5.10) | Available |
 | `forward_auth` | `forward_auth <target>` — delegate auth to an upstream (see Section 5.10) | Available |
-| `import` / `(name)` | `import <file|name>` multi-file includes / snippets, `{$ENV}` expansion (see Section 5.12) | Available |
+| `import` / `(name)` | `import <file\|name>` multi-file includes / snippets, `{$ENV}` expansion (see Section 5.12) | Available |
 | `access_log` | `access_log <path> [format=<json|common>]` or `off` (see Section 5.13) | Available |
 
 **Single-instance vs cluster rate limiting**: rate limiting is per-instance
@@ -260,8 +261,10 @@ reverse_proxy {
     certificate is issued for a name.
   - `tls_skip_verify`: disable upstream certificate *and* hostname verification
     (never use in production).
-  - `tls_ca <pem-file>`: additional root CA(s) used to verify the upstream
-    certificate; repeatable. System roots are always trusted in addition.
+  - `tls_ca <pem-file>`: root CA(s) used to verify the upstream certificate;
+    repeatable. When set, verification trusts **only** the listed CAs — the
+    system trust roots are not consulted, so include any system roots you still
+    need in the file(s).
   - `tls_cert <cert-file> <key-file>`: a client certificate presented to the
     upstream (mutual TLS to the backend).
 - **Semantics**: by default the upstream certificate is verified against the
@@ -294,8 +297,8 @@ tunnels the connection bidirectionally.
 - **Cleartext (h2c)**: not supported — a plain-HTTP listener stays HTTP/1.1.
 - **Upstream**: raddy talks HTTP/1.1 to upstreams today; upstream HTTP/2 is
   future work.
-- `alpn <h2 http/1.1>` in the `tls` directive (Section 5.7) overrides the
-  advertised ALPN set for a site.
+- The advertised ALPN set is fixed (`h2` preferred, `http/1.1` fallback) on
+  every TLS listener; it is not configurable per site.
 
 ### 5.7 `tls` directive (per-site TLS options, manual certificates, mTLS)
 
@@ -303,8 +306,8 @@ tunnels the connection bidirectionally.
 
 Named sites normally get certificates automatically from ACME. The `tls`
 directive in a site block customizes TLS for that site; a named site that has a
-`tls` directive binds its port as a **TLS listener** (in addition to the default
-port 443):
+`tls` directive serves its port over **TLS** (port 443 by default, or the
+site's explicit port when one is given):
 
 ```caddyfile
 api.example.com {
@@ -337,15 +340,22 @@ secure.example.com {
   - `tls client_auth <optional|require> <ca-file>` — mutual TLS: verify the
     client certificate against `ca-file`. `require` rejects clients without a
     valid certificate; `optional` requests one but accepts clients without.
-- Options are applied **per SNI** during the handshake; a reload updates them
-  without rebuilding the listener. The advertised ALPN set is not per-site —
-  Section 5.6's `h2`/`http/1.1` default applies to every TLS listener.
+- Options are keyed **per (host, port)** and applied during the handshake when a
+  client connects to that site; a reload updates them without rebuilding the
+  listener. The advertised ALPN set is not per-site — Section 5.6's
+  `h2`/`http/1.1` default applies to every TLS listener.
 - A site whose `tls` source is static or internal is excluded from ACME
   issuance for that hostname (both startup and on-demand).
 
 ### 5.8 TLS-ALPN-01 challenge
 
-Domain control can also be proven by answering an ACME challenge over the
+**Status: Deferred.** `tls_alpn_challenge` cannot be implemented against the
+current dependencies: instant-acme 0.8.5 keeps the account key internal, and
+Pingora 0.8's `TlsSettings` has no dynamic ALPN callback that can swap in the
+`acme-tls/1` validation certificate — building it needs a dependency fork.
+HTTP-01 and DNS-01 cover the reachability cases otherwise.
+
+Domain control could otherwise be proven by answering an ACME challenge over the
 `acme-tls/1` ALPN protocol on port 443, when HTTP-01 (port 80) is blocked but
 port 443 is reachable:
 
@@ -386,17 +396,20 @@ directive directly: `handle path /a/* host example.com { ... }`.
 New directives introduced with matchers:
 
 - `rewrite <to>`: a **modifier** that rewrites the request URI before it is
-  forwarded. The terminal still serves the request, but the upstream sees the
-  rewritten path (placeholders `{host}`, `{uri}`, `{remote_host}` are
+  forwarded. It takes no matcher and **always applies** to whichever terminal
+  serves the block. The terminal still serves the request, but the upstream
+  sees the rewritten path (placeholders `{host}`, `{uri}`, `{remote_host}` are
   supported). Conditional rewrites belong inside a `handle` block.
 - `handle_path <matcher> { ... }`: like `handle`, but the matched path prefix is
   stripped from the URI before the block's terminal runs — so
   `handle_path /api/* { reverse_proxy }` forwards `/users/1`, not
   `/api/users/1`.
-- `respond <status> [<body>]`: a **terminal** that answers directly with the
-  given status and optional body.
-- `error [<status>] [<message>]`: a **terminal** that triggers raddy's internal
-  error response with the given status (default **500**) and optional message.
+- `respond <matcher> <status> [<body>]`: a **terminal** that answers directly
+  with the given status and optional body (the matcher is optional — omitted
+  means always match).
+- `error <matcher> [<status>] [<message>]`: a **terminal** that triggers raddy's
+  internal error response with the given status (default **500**) and optional
+  message.
 
 ```caddyfile
 api.example.com {
@@ -455,15 +468,19 @@ algorithm is used only when listed; it is negotiated against the client's
 **Status: Available.**
 
 - **`import <file>`**: splices the contents of another Raddyfile at that point.
-  Paths are relative to the importing file. Imports may nest (depth-limited). A
-  site block may import a file whose directives belong to that site.
+  Paths are relative to the importing file. Imports may nest only to a bounded
+  depth; an import cycle (tracked by canonical path) and an imported file over
+  the size limit are **errors** — never a silent truncation. A site block may
+  import a file whose directives belong to that site.
 - **Snippets**: a top-level block named `(name) { ... }` defines a reusable
   snippet; `import name` splices it at that point. Snippets are local to the
   file that defines them.
 - **Environment variables**: a directive argument `{$ENV_VAR}` is replaced by
   the value of `ENV_VAR` at parse time; a missing variable is a validation
   error. This works anywhere an argument appears (upstream targets, `root`,
-  `tls` paths, …).
+  `tls` paths, …). Expansion is **token-level**: the value becomes a single
+  argument, so a value containing spaces, `#`, braces, or newlines cannot
+  change the configuration's structure.
 
 ```caddyfile
 (base) {
@@ -491,7 +508,9 @@ configure access logging more precisely:
 - Global block: `access_log <path> [format=<json|common>]` sets the log file and
   format (default `json`); `access_log off` disables it for the whole instance.
   The `--access-log` flag still wins when both are set.
-- Site block: `access_log off` disables access logging for that site only.
+- Site block: `access_log off` disables access logging for that site only —
+  every terminal type (`reverse_proxy`, `file_server`, `redir`, `respond`,
+  `error`) is excluded.
 - The `common` format is the classic combined log line (`%h %l %u %t "%r" %>s
   %b "%{Referer}i" "%{User-Agent}i"`).
 
@@ -504,8 +523,8 @@ configure access logging more precisely:
   `:port` catch-all.
 - **Named sites default to port 443**: `api.example.com` (no port) binds 443
   (TLS). Automatic HTTPS is active: named sites obtain certificates via ACME —
-  HTTP-01 by default, DNS-01 when `dns_challenge` is configured (Section 5.3),
-  or TLS-ALPN-01 when `tls_alpn_challenge` is set (Section 5.8). A `tls` source
+  HTTP-01 by default, DNS-01 when `dns_challenge` is configured (Section 5.3).
+  TLS-ALPN-01 (`tls_alpn_challenge`) is deferred (Section 5.8). A `tls` source
   of static or internal certs (Section 5.7) opts a site out of ACME. SNI returns
   the matching certificate, and the 443 listener uses SNI dynamic certificates
   (cached in `raddy_certs/`, reused on restart). Certificates are renewed
@@ -560,7 +579,7 @@ api.example.com {
 > declarative guard (modifier): it applies to whichever terminal serves the
 > site.
 
-> Planned and future directives (`snippet` / `import`, …) do not appear in the
+> Deferred and future directives (`tls_alpn_challenge`, …) do not appear in the
 > example, so readers never copy an unparseable config.
 
 ## 8. Todo

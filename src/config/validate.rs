@@ -479,7 +479,9 @@ fn build_upstream_tls(
         }
         return Ok(None);
     }
-    // Extra root CAs (PEM), appended to the system roots.
+    // Root CAs from `tls_ca` (PEM). When set, the pingora openssl connector
+    // replaces the default trust store with these — system roots are not
+    // consulted (spec §5.4).
     let ca = if config.ca_files.is_empty() {
         None
     } else {

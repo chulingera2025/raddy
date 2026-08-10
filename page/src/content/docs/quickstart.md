@@ -3,9 +3,10 @@ title: Quick start
 description: Write your first Raddyfile and serve traffic in about five minutes.
 ---
 
-This guide takes you from a blank directory to a running reverse proxy: write a
-Raddyfile, validate it, run it, and watch traffic flow. You'll need about five
-minutes and a terminal.
+This guide takes you from a blank directory to a running reverse proxy: install
+raddy, write a Raddyfile, validate it, run it, and watch traffic flow. Then a few
+short follow-on snippets show rate limiting, basic auth, and HTTPS. You'll need
+about five minutes and a terminal.
 
 ## Before you start
 
@@ -114,10 +115,87 @@ curl -H 'Host: static.local' http://127.0.0.1:8090/hello.txt
 > process `SIGHUP` (`kill -HUP <raddy pid>`). Reloads swap the routing snapshot
 > atomically and keep existing connections alive.
 
+## Try more: rate limiting
+
+Add a rate limit to the proxy site. Stop raddy, add a `rate_limit` line, and
+start it again:
+
+```caddyfile
+example.local:8090 {
+    rate_limit remote_ip 10r/s
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Burst a few requests — the 11th request in a burst of 10 returns `429 Too Many
+Requests`:
+
+```bash
+for i in $(seq 1 12); do
+    curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: example.local' http://127.0.0.1:8090/
+done
+# → 200 ten times, then 429 429
+```
+
+## Try more: basic auth
+
+Protect a site with a username and a bcrypt password hash. Generate the hash
+with `htpasswd -B` (from the `apache2-utils` package):
+
+```bash
+htpasswd -Bbn admin 's3cret'   # → admin:$2b$12$...
+```
+
+Then paste the hash into a new site:
+
+```caddyfile
+admin.local:8090 {
+    basic_auth admin $2b$12$C6UzMDM.H6dfI/f/IKcEeO7Q7gW1wjQyG9Q8wK7BZ3v2pG5YzF5qO
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+```bash
+curl -H 'Host: admin.local' http://127.0.0.1:8090/            # → 401 Unauthorized
+curl -u admin:'s3cret' -H 'Host: admin.local' http://127.0.0.1:8090/   # → 200
+```
+
+## Try more: HTTPS
+
+On a machine with a real domain that resolves to it, drop the `:8090` port and
+let raddy issue a certificate automatically:
+
+```caddyfile
+example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+A named site without a port binds **443** and gets an ACME certificate
+automatically (HTTP-01 by default — make sure port 80 is reachable, or configure
+`dns_challenge`). For local development without a domain, use the `tls` directive
+with a self-signed certificate:
+
+```caddyfile
+dev.local:8443 {
+    tls internal
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+```bash
+curl -k -H 'Host: dev.local' https://127.0.0.1:8443/
+```
+
+The full story — the `tls` directive, upstream TLS, mTLS, and HTTP/2 — is in the
+[HTTPS & TLS](../guides/https-tls/) guide.
+
 ## Next steps
 
+- [HTTPS & TLS](../guides/https-tls/) — the `tls` directive, upstream TLS, mTLS, HTTP/2
+- [Routing & matchers](../guides/routing/) — route by path, host, method, header, query, IP
 - [Serve static files](../guides/static-files/) — `file_server` in detail
 - [Redirect HTTP → HTTPS](../guides/http-to-https/) — the `:80` catch-all pattern
-- [Proxy an API](../guides/api-proxy/) — load balancing, health checks, rate limiting
-- [Sites, ports & HTTPS](../config/sites/) — how matching and certificates work
+- [Proxy an API](../guides/api-proxy/) — load balancing, health checks, rate limiting, WebSockets
+- [Authentication](../guides/auth/) — `basic_auth` and `forward_auth`
 - [Directive reference](../config/directives/) — every directive, with examples

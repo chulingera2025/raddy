@@ -23,15 +23,18 @@ static.example.com {
 `./public` is resolved from raddy's working directory.
 
 To send compressed responses, add `encode` — the first algorithm the client also
-supports wins:
+supports wins. `gzip`, `zstd`, and Brotli (`br`) are available:
 
 ```caddyfile
 static.example.com {
     root /var/www/html
     file_server
-    encode zstd gzip
+    encode br zstd gzip
 }
 ```
+
+See the [Compression guide](../compression/) for how negotiation works
+and how to choose algorithms.
 
 ## Run it
 

@@ -677,8 +677,9 @@ pub struct UpstreamTls {
     pub verify_cert: bool,
     /// SNI/hostname override (`tls_servername`); empty = per-upstream host.
     pub servername: String,
-    /// Extra root CAs parsed from `tls_ca` PEM files. System roots are also
-    /// trusted.
+    /// Root CAs parsed from `tls_ca` PEM files. When set, the pingora openssl
+    /// connector REPLACES the default trust store with these CAs — the system
+    /// roots are not consulted.
     pub ca: Option<Arc<Box<[X509]>>>,
     /// Client certificate for upstream mTLS (`tls_cert`).
     pub client_cert: Option<Arc<CertKey>>,

@@ -74,6 +74,21 @@ raddy run -c Raddyfile
 **Per-IP stickiness** — swap `round_robin` for `ip_hash` so a client keeps
 hitting the same upstream (useful with stateful backends).
 
+**Proxy WebSockets** — no extra configuration. `reverse_proxy` forwards HTTP
+`Upgrade` requests transparently, so the same site serves both WebSocket and
+regular HTTP traffic:
+
+```caddyfile
+chat.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+raddy tunnels the connection once the upstream answers `101 Switching
+Protocols`; the backend must speak the upgraded protocol itself. `encode` never
+applies to an upgraded response. Protocol upgrades are covered in the
+[directive reference](../../config/directives/#websocket-and-protocol-upgrades).
+
 **Distinct paths** — combine with `handle` to rate-limit and balance an API
 while serving static assets from the same host:
 

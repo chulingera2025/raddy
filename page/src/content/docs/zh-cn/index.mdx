@@ -15,9 +15,59 @@ hero:
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 Raddy 是基于 [Cloudflare Pingora](https://github.com/cloudflare/pingora) 构建的
-反向代理网关(Rust)。你只需写一份 **Raddyfile** —— Caddyfile 风格的配置 ——
-raddy 便负责路由、自动 HTTPS、静态文件、压缩、限流与访问日志,并享有
-Pingora 的性能与内存安全。
+反向代理网关(Rust)——Pingora 正是为 Cloudflare 边缘网络提供动力的代理框架。
+你只需写一份 **Raddyfile**(Caddyfile 风格的配置),raddy 便负责路由、自动
+HTTPS、静态文件、压缩、限流与访问日志,并享有 Pingora 的性能与内存安全。
+
+结果是一个单一的小型二进制,做反向代理该做的事——配置可读、行为可预测。
+
+## 为什么选 Raddy
+
+- **天生高速。** raddy 构建于 Pingora:多线程事件循环、共享连接池、无垃圾
+  回收。相对裸 Pingora,代理热路径只增加极小开销。
+- **配置可以推理。** 指令**严格按书写顺序**执行。所见即所执行——没有隐藏的
+  指令排序表。每条指令要么是终端("谁服务这个请求"),要么是修饰符
+  ("如何服务"),要么是守卫("谁可以被服务")。
+- **开箱即用的生产级 TLS。** 基于 ACME 的自动 HTTPS(HTTP-01 或 DNS-01)、
+  SNI 证书选择、按站点的 TLS 选项、双向 TLS,以及下游 HTTP/2。
+- **零停机运维。** SIGHUP 重载原子替换路由快照;`raddy upgrade` 将监听套接字
+  移交给新二进制,连接零中断。
+- **默认安全。** 未经声明不信任任何东西:raddy 在配置 `trusted_proxies` 之前
+  忽略 `X-Forwarded-For`;无法读取的凭据会失败关闭(fail closed)。
+
+## 功能亮点
+
+- **路由与匹配** —— 按 `path`、`host`、`method`、`header`、`query`、
+  `remote_ip` 或 `protocol` 路由,支持 `!` 取反与空格分隔的 AND 条件;
+  `handle`、`handle_path`、`rewrite`、`respond`、`error` 让你精确控制每个请求
+  由谁服务。
+- **反向代理** —— 单个或多个上游,轮询 / 随机 / IP 哈希负载均衡,主动健康
+  检查,**到后端的 TLS**(`https://` 上游,含 SNI、自定义 CA 与客户端证书),
+  以及透明的 **WebSocket** 升级转发。
+- **自动 HTTPS** —— 经 HTTP-01 或 DNS-01 签发 ACME 证书并自动续期;另有
+  `tls` 指令支持自签(`internal`)、静态证书、协议版本与密码套件限制,以及
+  **mTLS** 客户端认证。
+- **认证守卫** —— `basic_auth`(bcrypt 哈希)与 `forward_auth`(交给专用认证
+  上游)。
+- **压缩** —— gzip、zstd 与 **Brotli**(`encode br`),按客户端的
+  `Accept-Encoding` 协商。
+- **限流** —— 基于真实客户端 IP 或任意请求头的令牌桶限制。
+- **静态文件** —— `file_server` 支持索引文件、路径穿越防护与压缩。
+- **配置 DX** —— 多文件 `import`、可复用的 `(name)` 片段,以及 `{$ENV}`
+  变量替换。
+- **可观测性** —— Prometheus 指标、JSON 或 Common Log Format 访问日志,可按
+  站点配置。
+
+## 何时使用 raddy
+
+当你想用一个又小又快的、可预测的反向代理时,raddy 很合适:
+
+- 把一个或多个 HTTP/HTTPS 服务放到公网并自动启用 TLS。
+- 在单个进程中同时托管静态内容与代理 API。
+- 用 `raddy check` 校验、用 SIGHUP 重载的配置文件,精确掌控路由、限流与认证。
+
+raddy 是**单实例**的:限流按进程计数,不跨集群共享。如果你需要跨集群协调、
+外部共享服务或插件系统,更大的代理更合适。
 
 <CardGrid>
 	<Card title="可预测的配置" icon="cursor-click">
@@ -26,16 +76,16 @@ Pingora 的性能与内存安全。
 	<Card title="自动 HTTPS" icon="lock">
 		原生 ACME —— 默认 HTTP-01,或经
 		[`dns_challenge cloudflare`](config/directives/#dns_challenge) 走 DNS-01 ——
-		SNI 动态证书,开箱即用。
+		SNI 动态证书与 HTTP/2,开箱即用。
 	</Card>
 	<Card title="热重载" icon="refresh">
 		SIGHUP 原子替换路由快照;连接保持不断。
 	</Card>
 	<Card title="边缘防护" icon="shield">
-		基于可信代理模型识别真实客户端 IP 的限流。
+		限流与认证守卫,基于可信代理模型识别真实客户端 IP。
 	</Card>
 	<Card title="可观测性" icon="chart">
-		Prometheus 指标与结构化 JSON 访问日志。
+		Prometheus 指标与结构化 JSON 或 Common Log Format 访问日志。
 	</Card>
 	<Card title="零停机升级" icon="rocket">
 		`raddy upgrade` 将监听套接字移交给新二进制,连接零中断。
@@ -47,7 +97,8 @@ Pingora 的性能与内存安全。
 <CardGrid>
 	<LinkCard title="快速上手" href="quickstart/" description="五分钟内写出第一个 Raddyfile 并跑通流量。" />
 	<LinkCard title="配置指南" href="config/" description="Raddyfile 背后的心智模型:请求如何流经你的配置。" />
-	<LinkCard title="常见配置" href="guides/static-files/" description="可直接抄的配置:静态托管、HTTP→HTTPS 重定向、API 代理。" />
+	<LinkCard title="HTTPS 与 TLS" href="guides/https-tls/" description="自动 HTTPS、tls 指令、上游 TLS、mTLS 与 HTTP/2。" />
+	<LinkCard title="路由与匹配器" href="guides/routing/" description="按路径、主机、方法、请求头、查询参数、客户端 IP 或协议路由。" />
 	<LinkCard title="指令参考" href="config/directives/" description="每条指令的语法与示例。" />
 	<LinkCard title="CLI 参考" href="cli/" description="所有 `raddy` 子命令与选项。" />
 	<LinkCard title="运维" href="operations/metrics/" description="指标、访问日志与性能基线。" />

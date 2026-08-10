@@ -1,7 +1,11 @@
 ---
 title: 访问日志
-description: raddy 用 --access-log 写入的结构化 JSON 访问日志。
+description: raddy 经 --access-log 或 access_log 指令写出的 JSON 与 Common Log Format 访问日志。
 ---
+
+raddy 为每个完成的请求写一行访问日志。你可以从 CLI 或从 Raddyfile 配置它。
+
+## 经 CLI:`--access-log`
 
 传入 `--access-log <file>`,把每个完成的请求以一行结构化 JSON 追加到指定
 文件:
@@ -13,7 +17,32 @@ raddy run -c Raddyfile --access-log /var/log/raddy/access.jsonl
 每行是一个独立的 JSON 对象(JSON Lines)。**追加**(绝不截断),因此你可以在
 raddy 运行期间轮转文件,它会继续写入新路径。
 
-## 字段
+## 经 Raddyfile:`access_log`
+
+[`access_log` 指令](../../config/directives/#access_log) 在配置中配置日志,支持
+两种格式:
+
+```caddyfile
+{
+    access_log /var/log/raddy/access.log format=json   # 或 format=common
+}
+
+api.example.com {
+    access_log off        # 仅关闭该站点的日志
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+- 全局块:`access_log <path> [format=<json|common>]` 设置实例日志文件与格式;
+  `access_log off` 关闭整个实例的日志。
+- 站点块:`access_log off` 仅关闭该站点的日志。
+- Raddyfile 与 `--access-log` 同时设置时,**标志胜出**。
+
+`format=common` 写经典 combined 日志行
+(`%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"`);`json`(默认)写
+下面的结构化行。
+
+## JSON 字段
 
 | 字段 | 类型 | 含义 |
 |---|---|---|

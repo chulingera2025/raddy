@@ -34,20 +34,40 @@ static.example.com {
 ## 两类指令
 
 请求匹配到站点后,raddy **严格按书写顺序**执行该站点的每一行。每行要么是
-终端,要么是修饰符:
+终端、修饰符,要么是守卫:
 
-- **终端指令**决定*由谁服务*请求:`reverse_proxy`、`file_server`、`redir`。
-  第一个匹配的终端**结束站点**——后续行不再执行。
+- **终端指令**决定*由谁服务*请求:`reverse_proxy`、`file_server`、`redir`、
+  `respond`、`error`。第一个匹配的终端**结束站点**——后续行不再执行。终端
+  可携带内联[匹配器](../guides/routing/);不匹配的终端是空操作,执行继续。
 - **修饰指令**描述*如何服务*,与位置无关:`header_up`、`header_down`、
-  `encode`、`rate_limit`。它们作用于服务该块的终端,即使写在终端之后。
+  `encode`、`rewrite`。它们作用于服务该块的终端,即使写在终端之后。
+- **守卫指令**决定*谁可以被服务*:`rate_limit`、`basic_auth`、`forward_auth`。
+  它们像修饰指令一样——作用于服务该块的任意终端——并在守卫失败时拒绝请求
+  (`429`、`401`)。
 
 > **Caddy 用户:** Caddy 会在后台重排指令顺序;raddy 不会。顺序由你控制,
 > 第一个匹配者胜出。
 
-### `handle` 把路径与终端分组
+### 匹配器选择哪些请求由指令服务
 
-`handle /path/* { ... }` 是作用域块:若路径匹配,块内行执行并**停止匹配**;
-否则跳过继续。可以理解为"这个路径,用这个终端"。
+[匹配器](../guides/routing/)是一组匹配项——`path`、`host`、`method`、`header`、
+`query`、`remote_ip`、`protocol`——必须全部匹配。匹配器附着在 `handle` 块上,
+也可内联附着在终端上:
+
+```caddyfile
+handle path /status method GET {
+    respond 200 ok
+}
+```
+
+各项以空格分隔并 AND;没有括号或 `&&`。`handle /static/*` 是
+`handle path /static/*` 的简写。
+
+### `handle` 把匹配器与终端分组
+
+`handle <matcher> { ... }` 是作用域块:若匹配器匹配,块内行执行并**停止匹配**;
+否则跳过继续。可以理解为"这些请求,用这个终端"。`handle_path` 与之相同,
+只是会在块内终端运行前剥离被匹配的路径前缀。
 
 ## 一次请求的追踪
 
@@ -93,5 +113,6 @@ api.example.com {
 ## 完整语言
 
 - [指令参考](directives/) —— 每条指令、语法与示例
+- [路由与匹配器](../guides/routing/) —— 匹配器、`rewrite`、`handle_path`、`respond`、`error`
 - [站点 · 端口 · HTTPS](sites/) —— 匹配、catch-all、证书
 - [可信代理](trusted-proxies/) —— "真实"客户端 IP 从哪来
