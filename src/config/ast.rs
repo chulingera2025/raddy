@@ -21,8 +21,11 @@
 //! applied to whichever terminal serves), so the request plane never interprets
 //! the file line by line.
 
+use pingora::tls::x509::X509;
+use pingora::utils::tls::CertKey;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -329,6 +332,8 @@ pub enum Directive {
         lb_policy: LbPolicy,
         /// `health_check` inside the block (none = no active health check).
         health_check: Option<HealthCheckSpec>,
+        /// TLS sub-directives for `https://` upstreams (spec §5.4).
+        tls: ProxyTlsConfig,
     },
     Handle {
         path: String,
@@ -370,7 +375,26 @@ pub enum Directive {
 pub struct Upstream {
     pub host: String,
     pub port: u16,
+    /// `https://` scheme prefix → the upstream connection is TLS (spec §5.4).
+    pub tls: bool,
     pub resolved: Option<SocketAddr>,
+}
+
+/// TLS sub-directives of a `reverse_proxy` block (spec §5.4), in parse form.
+/// They apply to every `https://` upstream in the block.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyTlsConfig {
+    /// `tls_servername <host>`: SNI/hostname sent to the upstream (default: the
+    /// upstream host). Required when the address is an IP but the cert is for a
+    /// name.
+    pub servername: Option<String>,
+    /// `tls_skip_verify`: disable upstream certificate and hostname verification.
+    pub skip_verify: bool,
+    /// `tls_ca <pem-file>`: extra root CA(s), repeatable.
+    pub ca_files: Vec<String>,
+    /// `tls_cert <cert-file> <key-file>`: a client certificate for upstream mTLS.
+    pub cert_file: Option<String>,
+    pub key_file: Option<String>,
 }
 
 /// A path matcher: a request path matches if it falls under the prefix.
@@ -466,15 +490,59 @@ pub struct Terminal {
     pub modifiers: Vec<Modifier>,
 }
 
+/// A compiled upstream: the resolved address plus the peer metadata needed to
+/// build the pingora `HttpPeer` (the original host for the default SNI, and the
+/// `https://` scheme).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamPeer {
+    pub addr: SocketAddr,
+    /// `https://` scheme → TLS to this upstream (spec §5.4).
+    pub tls: bool,
+    /// The original upstream host — the default SNI for TLS (empty for plain
+    /// HTTP, or when the operator overrides it with `tls_servername`).
+    pub host: String,
+}
+
+/// Compiled TLS options for a `reverse_proxy` block that has at least one
+/// `https://` upstream (spec §5.4). Immutable config data, carried in the
+/// snapshot (ADR-011); the parsed certificates are built once at compile time.
+#[derive(Clone)]
+pub struct UpstreamTls {
+    /// Verify the upstream certificate and hostname (default true;
+    /// `tls_skip_verify` clears it).
+    pub verify_cert: bool,
+    /// SNI/hostname override (`tls_servername`); empty = per-upstream host.
+    pub servername: String,
+    /// Extra root CAs parsed from `tls_ca` PEM files. System roots are also
+    /// trusted.
+    pub ca: Option<Arc<Box<[X509]>>>,
+    /// Client certificate for upstream mTLS (`tls_cert`).
+    pub client_cert: Option<Arc<CertKey>>,
+}
+
+impl std::fmt::Debug for UpstreamTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamTls")
+            .field("verify_cert", &self.verify_cert)
+            .field("servername", &self.servername)
+            .field("ca", &self.ca.as_ref().map(|ca| ca.len()))
+            .field("client_cert", &self.client_cert.is_some())
+            .finish()
+    }
+}
+
 /// The runtime behavior of a terminal directive.
 #[derive(Debug, Clone)]
 pub enum TerminalKind {
     ReverseProxy {
-        upstreams: Vec<SocketAddr>,
+        upstreams: Vec<UpstreamPeer>,
         /// The selection policy (round-robin unless `lb_policy` is set).
         lb_policy: LbPolicy,
         /// The active health-check spec, if configured.
         health_check: Option<HealthCheckSpec>,
+        /// Block-level TLS options for `https://` upstreams (None when the
+        /// block has no TLS upstream).
+        tls: Option<UpstreamTls>,
     },
     /// Static file serving; runtime lands in M5.
     FileServer { root: String },

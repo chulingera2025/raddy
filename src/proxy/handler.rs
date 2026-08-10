@@ -20,8 +20,8 @@
 //! so the upstream Connector's connection pools survive (ADR-011).
 
 use crate::config::ast::{
-    Cidr, Encoding, LbPolicy, Modifier, SiteKey, TemplatePart, TerminalKind, ValueTemplate,
-    Variable,
+    Cidr, Encoding, LbPolicy, Modifier, SiteKey, TemplatePart, TerminalKind, UpstreamTls,
+    ValueTemplate, Variable,
 };
 use crate::config::snapshot::ConfigStore;
 use crate::proxy::compress;
@@ -36,7 +36,7 @@ use pingora::proxy::Session;
 use serde::Serialize;
 use std::fs::File;
 use std::io::{self, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -94,6 +94,9 @@ pub struct ProxyCtx {
     terminal_index: usize,
     /// The load-balancing spec of the selected terminal.
     lb_spec: Option<LbSpec>,
+    /// Compiled TLS options for a `https://` reverse-proxy block (spec §5.4);
+    /// `None` for plain-HTTP terminals.
+    tls: Option<UpstreamTls>,
     /// The effective modifier directives (block-level + terminal-scoped).
     modifiers: Vec<Modifier>,
     /// The site's `encode` priorities (empty = no compression).
@@ -207,6 +210,7 @@ impl ProxyHttp for ProxyHandler {
                             upstreams,
                             lb_policy,
                             health_check,
+                            tls,
                         } => {
                             ctx.site_key = Some(site.key.clone());
                             ctx.terminal_index = index;
@@ -215,6 +219,7 @@ impl ProxyHttp for ProxyHandler {
                                 policy: *lb_policy,
                                 health_check: *health_check,
                             });
+                            ctx.tls = tls.clone();
                             ctx.modifiers = modifiers;
                             ctx.encode_algos = encode_algos(&ctx.modifiers);
                             // Continue to upstream_peer for forwarding.
@@ -271,8 +276,23 @@ impl ProxyHttp for ProxyHandler {
         let addr = balancer
             .select(&key)
             .ok_or_else(|| Error::explain(HTTPStatus(502), "no healthy upstreams available"))?;
-        // v0.1: plain-HTTP upstreams only (Q8) — no TLS, empty SNI.
-        Ok(Box::new(HttpPeer::new(addr, false, String::new())))
+        // Find the selected upstream to learn its scheme and original host (the
+        // default SNI); the balancer only ever selects configured upstreams.
+        let upstream = lb_spec.upstreams.iter().find(|p| p.addr == addr);
+        let is_tls = upstream.is_some_and(|p| p.tls);
+        let default_sni = upstream.map_or("", |p| p.host.as_str());
+        let peer = if is_tls {
+            // A `https://` upstream (spec §5.4): TLS with the compiled options.
+            // `UpstreamTls` is always present when any upstream is TLS (the
+            // validator guarantees it), so fall back to plain HTTP defensively.
+            match ctx.tls.as_ref() {
+                Some(tls) => build_tls_peer(addr, default_sni, tls),
+                None => HttpPeer::new(addr, false, String::new()),
+            }
+        } else {
+            HttpPeer::new(addr, false, String::new())
+        };
+        Ok(Box::new(peer))
     }
 
     async fn upstream_request_filter(
@@ -384,6 +404,23 @@ impl ProxyHttp for ProxyHandler {
             }
         }
     }
+}
+
+/// Build a TLS `HttpPeer` to a `https://` upstream (spec §5.4): SNI from the
+/// compiled options (falling back to the upstream host), certificate
+/// verification unless `tls_skip_verify`, plus any custom CA and client cert.
+fn build_tls_peer(addr: SocketAddr, default_sni: &str, tls: &UpstreamTls) -> HttpPeer {
+    let sni = if tls.servername.is_empty() {
+        default_sni.to_string()
+    } else {
+        tls.servername.clone()
+    };
+    let mut peer = HttpPeer::new(addr, true, sni);
+    peer.options.verify_cert = tls.verify_cert;
+    peer.options.verify_hostname = tls.verify_cert;
+    peer.options.ca = tls.ca.clone();
+    peer.client_cert_key = tls.client_cert.clone();
+    peer
 }
 
 /// Build a structured access-log entry from the session and context.

@@ -133,6 +133,86 @@ impl Drop for EchoUpstream {
     }
 }
 
+/// A minimal HTTPS upstream (spec §5.4): accepts TCP connections, wraps them in
+/// TLS with a self-signed certificate for `localhost`, and answers
+/// `label=secure`. The certificate is deliberately untrusted by system roots,
+/// so a proxy that verifies upstream certs must be configured with
+/// `tls_skip_verify` (or the operator must trust the test CA).
+struct TlsEchoUpstream {
+    port: u16,
+    hits: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TlsEchoUpstream {
+    fn spawn() -> (u16, TlsEchoUpstream) {
+        use openssl::ssl::{SslAcceptor, SslMethod};
+        let (port, listener) = bind_listener();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        let x509 = openssl::x509::X509::from_pem(cert_pem.as_bytes()).unwrap();
+        let pkey = openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).unwrap();
+        builder.set_certificate(&x509).unwrap();
+        builder.set_private_key(&pkey).unwrap();
+        let acceptor = builder.build();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits_thread = hits.clone();
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(stream) = stream else { continue };
+                hits_thread.fetch_add(1, Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let Ok(mut tls) = acceptor.accept(stream) else {
+                        return;
+                    };
+                    let mut buf = [0u8; 4096];
+                    let _ = tls.read(&mut buf);
+                    let body = "label=secure";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (
+            port,
+            TlsEchoUpstream {
+                port,
+                hits,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+
+    fn hit_count(&self) -> usize {
+        self.hits.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TlsEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// An upstream that keeps connections alive (no `Connection: close`) and counts
 /// *distinct* connections, so a client can assert connection reuse across
 /// requests and reloads.
@@ -594,6 +674,48 @@ fn round_robin_across_upstreams() {
         a.hit_count(),
         b.hit_count()
     );
+}
+
+#[test]
+fn https_upstream_is_proxied_with_skip_verify() {
+    // An `https://` upstream (spec §5.4) with `tls_skip_verify`: raddy talks TLS
+    // to the self-signed test upstream and returns its body unchanged.
+    let (up_port, up) = TlsEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    reverse_proxy {{\n        to https://127.0.0.1:{up_port}\n        tls_skip_verify\n    }}\n}}\n"
+        )
+    });
+    wait_until(
+        || try_request(raddy.port(), Some("localhost"), "/").is_some(),
+        "server to accept requests",
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=secure");
+    assert!(
+        up.hit_count() >= 1,
+        "the TLS upstream must have served the request"
+    );
+}
+
+#[test]
+fn https_upstream_untrusted_cert_yields_502() {
+    // The same self-signed upstream without `tls_skip_verify`: certificate
+    // verification fails and raddy answers 502 rather than forwarding.
+    let (up_port, _up) = TlsEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(":{port} {{\n    reverse_proxy https://127.0.0.1:{up_port}\n}}\n")
+    });
+    wait_until(
+        || try_request(raddy.port(), Some("localhost"), "/").is_some(),
+        "server to accept requests",
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 502);
+    // The upstream is reached only to the TLS handshake, never to its HTTP
+    // response — its body must not leak through a failed verification.
+    assert_ne!(resp.body, "label=secure");
 }
 
 #[test]

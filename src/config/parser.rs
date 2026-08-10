@@ -385,8 +385,9 @@ impl<'a> Parser<'a> {
         let mut targets: Vec<String> = Vec::new();
         let mut lb_policy = None;
         let mut health_check = None;
+        let mut tls = ProxyTlsConfig::default();
         if block_open {
-            // Block form: `{ to <upstream>... [lb_policy <p>] [health_check { ... }] }`.
+            // Block form: `{ to <upstream>... [lb_policy <p>] [health_check { ... }] [tls_* ...] }`.
             loop {
                 match self.peek() {
                     Some(Token {
@@ -426,6 +427,46 @@ impl<'a> Parser<'a> {
                         }
                         health_check = Some(self.parse_health_check(nested)?);
                     }
+                    "tls_servername" => {
+                        if nested {
+                            return Err(self.err("unexpected '{' after tls_servername"));
+                        }
+                        if tls.servername.is_some() {
+                            return Err(self.err("duplicate tls_servername"));
+                        }
+                        if line.len() != 2 {
+                            return Err(self.err("tls_servername requires exactly one argument"));
+                        }
+                        tls.servername = Some(line[1].clone());
+                    }
+                    "tls_skip_verify" => {
+                        if nested {
+                            return Err(self.err("unexpected '{' after tls_skip_verify"));
+                        }
+                        if line.len() != 1 {
+                            return Err(self.err("tls_skip_verify takes no arguments"));
+                        }
+                        tls.skip_verify = true;
+                    }
+                    "tls_ca" => {
+                        if nested {
+                            return Err(self.err("unexpected '{' after tls_ca"));
+                        }
+                        if line.len() != 2 {
+                            return Err(self.err("tls_ca requires exactly one argument"));
+                        }
+                        tls.ca_files.push(line[1].clone());
+                    }
+                    "tls_cert" => {
+                        if nested {
+                            return Err(self.err("unexpected '{' after tls_cert"));
+                        }
+                        if line.len() != 3 {
+                            return Err(self.err("tls_cert requires a certificate and a key file"));
+                        }
+                        tls.cert_file = Some(line[1].clone());
+                        tls.key_file = Some(line[2].clone());
+                    }
                     other => {
                         return Err(self.err(format!(
                             "unexpected directive '{other}' in reverse_proxy block"
@@ -452,6 +493,7 @@ impl<'a> Parser<'a> {
             to,
             lb_policy: lb_policy.unwrap_or(LbPolicy::RoundRobin),
             health_check,
+            tls,
         })
     }
 
@@ -547,10 +589,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_upstream(&self, s: &str) -> Result<Upstream, ConfigError> {
-        if s.starts_with('[') {
+        // Optional scheme prefix decides whether the upstream connection is TLS
+        // (spec §5.4); a bare `host:port` stays plain HTTP.
+        let (tls, rest) = if let Some(r) = s.strip_prefix("https://") {
+            (true, r)
+        } else if let Some(r) = s.strip_prefix("http://") {
+            (false, r)
+        } else {
+            (false, s)
+        };
+        if rest.starts_with('[') {
             return Err(self.err("IPv6 upstream addresses are not supported in v0.1"));
         }
-        let (host, port_str) = s
+        let (host, port_str) = rest
             .rsplit_once(':')
             .ok_or_else(|| self.err(format!("upstream '{s}' must be host:port")))?;
         if host.is_empty() {
@@ -560,6 +611,7 @@ impl<'a> Parser<'a> {
         Ok(Upstream {
             host: host.to_string(),
             port,
+            tls,
             resolved: None,
         })
     }
@@ -998,6 +1050,7 @@ mod tests {
                 to,
                 lb_policy,
                 health_check,
+                ..
             } => {
                 assert!(matcher.is_none());
                 assert_eq!(to.len(), 2);

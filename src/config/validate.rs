@@ -23,6 +23,7 @@ use crate::config::ast::*;
 use crate::config::resolver::resolve_host;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// Validate a parsed Raddyfile, resolve upstreams, and compile it.
 ///
@@ -90,19 +91,16 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                 to,
                 lb_policy,
                 health_check,
-            } => {
-                let upstreams = resolve_upstreams(file, to, resolve_host)?;
-                let matchers = matcher.iter().cloned().collect();
-                terminals.push(Terminal {
-                    matchers,
-                    kind: TerminalKind::ReverseProxy {
-                        upstreams,
-                        lb_policy: *lb_policy,
-                        health_check: *health_check,
-                    },
-                    modifiers: Vec::new(),
-                });
-            }
+                tls,
+            } => terminals.push(compile_reverse_proxy_terminal(
+                file,
+                matcher.as_ref(),
+                None,
+                to,
+                *lb_policy,
+                *health_check,
+                tls,
+            )?),
             Directive::Handle { path, directives } => {
                 compile_handle_block(file, path, directives, &mut terminals)?
             }
@@ -200,22 +198,16 @@ fn compile_handle_block(
                 to,
                 lb_policy,
                 health_check,
-            } => {
-                let upstreams = resolve_upstreams(file, to, resolve_host)?;
-                let mut matchers = vec![path_matcher.clone()];
-                if let Some(m) = matcher {
-                    matchers.push(m.clone());
-                }
-                block_terminals.push(Terminal {
-                    matchers,
-                    kind: TerminalKind::ReverseProxy {
-                        upstreams,
-                        lb_policy: *lb_policy,
-                        health_check: *health_check,
-                    },
-                    modifiers: Vec::new(),
-                });
-            }
+                tls,
+            } => block_terminals.push(compile_reverse_proxy_terminal(
+                file,
+                matcher.as_ref(),
+                Some(&path_matcher),
+                to,
+                *lb_policy,
+                *health_check,
+                tls,
+            )?),
             Directive::FileServer => block_terminals.push(Terminal {
                 matchers: vec![path_matcher.clone()],
                 kind: TerminalKind::FileServer {
@@ -297,12 +289,111 @@ fn compile_handle_block(
 /// injectable so tests never touch the network; the production resolver
 /// (`crate::config::resolver::resolve_host`) applies a timeout and a bounded
 /// thread pool, so a hung DNS server yields a diagnosable error, never a hang.
+/// Compile a `reverse_proxy` directive into a terminal: resolve the upstream
+/// targets (keeping each one's TLS scheme and original host), and compile the
+/// block's TLS sub-directives.
+fn compile_reverse_proxy_terminal(
+    file: &str,
+    matcher: Option<&PathMatcher>,
+    handle_path_matcher: Option<&PathMatcher>,
+    to: &[Upstream],
+    lb_policy: LbPolicy,
+    health_check: Option<HealthCheckSpec>,
+    tls: &ProxyTlsConfig,
+) -> Result<Terminal, ConfigError> {
+    let upstreams = resolve_upstreams(file, to, resolve_host)?;
+    let tls = build_upstream_tls(file, tls, to.iter().any(|u| u.tls))?;
+    // The `handle_path` prefix matcher (if any) comes before the inline matcher.
+    let mut matchers = Vec::with_capacity(2);
+    if let Some(m) = handle_path_matcher {
+        matchers.push(m.clone());
+    }
+    if let Some(m) = matcher {
+        matchers.push(m.clone());
+    }
+    Ok(Terminal {
+        matchers,
+        kind: TerminalKind::ReverseProxy {
+            upstreams,
+            lb_policy,
+            health_check,
+            tls,
+        },
+        modifiers: Vec::new(),
+    })
+}
+
+/// Compile the block's `tls` sub-directives (spec §5.4) into [`UpstreamTls`],
+/// reading and parsing the CA and client-certificate files once at build time.
+/// Returns `Ok(None)` when the block has no `https://` upstream — TLS options
+/// are then rejected as meaningless.
+fn build_upstream_tls(
+    file: &str,
+    config: &ProxyTlsConfig,
+    has_tls: bool,
+) -> Result<Option<UpstreamTls>, ConfigError> {
+    if !has_tls {
+        if config.servername.is_some()
+            || config.skip_verify
+            || !config.ca_files.is_empty()
+            || config.cert_file.is_some()
+        {
+            return Err(validate_error(
+                file,
+                "tls_servername / tls_skip_verify / tls_ca / tls_cert require an https:// upstream",
+            ));
+        }
+        return Ok(None);
+    }
+    // Extra root CAs (PEM), appended to the system roots.
+    let ca = if config.ca_files.is_empty() {
+        None
+    } else {
+        let mut stack = Vec::new();
+        for path in &config.ca_files {
+            let pem = std::fs::read_to_string(path)
+                .map_err(|e| validate_error(file, format!("failed to read CA file {path}: {e}")))?;
+            let certs = pingora::tls::x509::X509::stack_from_pem(pem.as_bytes()).map_err(|e| {
+                validate_error(file, format!("invalid CA certificate in {path}: {e}"))
+            })?;
+            stack.extend(certs);
+        }
+        Some(Arc::new(stack.into_boxed_slice()))
+    };
+    // Client certificate for upstream mTLS, if configured.
+    let client_cert = match (&config.cert_file, &config.key_file) {
+        (Some(cert), Some(key)) => {
+            let cert_pem = std::fs::read_to_string(cert).map_err(|e| {
+                validate_error(file, format!("failed to read certificate file {cert}: {e}"))
+            })?;
+            let key_pem = std::fs::read_to_string(key)
+                .map_err(|e| validate_error(file, format!("failed to read key file {key}: {e}")))?;
+            let cert_key = crate::tls::cert_key_from_pem(&cert_pem, &key_pem)
+                .map_err(|e| validate_error(file, format!("invalid client certificate: {e}")))?;
+            Some(Arc::new(cert_key))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(validate_error(
+                file,
+                "tls_cert requires both a certificate and a key file",
+            ))
+        }
+        (None, None) => None,
+    };
+    Ok(Some(UpstreamTls {
+        verify_cert: !config.skip_verify,
+        servername: config.servername.clone().unwrap_or_default(),
+        ca,
+        client_cert,
+    }))
+}
+
 fn resolve_upstreams(
     file: &str,
     to: &[Upstream],
     resolver: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, String>,
-) -> Result<Vec<SocketAddr>, ConfigError> {
-    let mut resolved: Vec<SocketAddr> = Vec::new();
+) -> Result<Vec<UpstreamPeer>, ConfigError> {
+    let mut resolved: Vec<UpstreamPeer> = Vec::new();
     for upstream in to {
         let addrs = resolver(&upstream.host, upstream.port)
             .map_err(|message| validate_error(file, message))?;
@@ -316,8 +407,12 @@ fn resolve_upstreams(
             ));
         }
         for addr in addrs {
-            if !resolved.contains(&addr) {
-                resolved.push(addr);
+            if !resolved.iter().any(|peer| peer.addr == addr) {
+                resolved.push(UpstreamPeer {
+                    addr,
+                    tls: upstream.tls,
+                    host: upstream.host.clone(),
+                });
             }
         }
     }
@@ -407,7 +502,8 @@ mod tests {
         match &site.terminals[0].kind {
             TerminalKind::ReverseProxy { upstreams, .. } => {
                 assert_eq!(upstreams.len(), 1);
-                assert_eq!(upstreams[0].port(), 8080);
+                assert_eq!(upstreams[0].addr.port(), 8080);
+                assert!(!upstreams[0].tls, "a bare upstream stays plain HTTP");
             }
             other => panic!("expected reverse proxy, got {other:?}"),
         }
@@ -451,7 +547,7 @@ mod tests {
                     "localhost must resolve to at least one address"
                 );
                 assert!(
-                    upstreams.iter().all(|a| a.port() == 8080),
+                    upstreams.iter().all(|a| a.addr.port() == 8080),
                     "every resolved address must keep the configured port"
                 );
             }
@@ -464,8 +560,25 @@ mod tests {
         Upstream {
             host: host.to_string(),
             port,
+            tls: false,
             resolved: None,
         }
+    }
+
+    /// A `https://` test upstream entry (spec §5.4).
+    fn tls_upstream(host: &str, port: u16) -> Upstream {
+        Upstream {
+            host: host.to_string(),
+            port,
+            tls: true,
+            resolved: None,
+        }
+    }
+
+    /// Extract the resolved addresses for order/dedup assertions (host and TLS
+    /// scheme are asserted separately where relevant).
+    fn addrs_of(peers: &[UpstreamPeer]) -> Vec<SocketAddr> {
+        peers.iter().map(|p| p.addr).collect()
     }
 
     fn addr(n: u8) -> SocketAddr {
@@ -483,7 +596,7 @@ mod tests {
             _ => unreachable!(),
         })
         .unwrap();
-        assert_eq!(got, vec![addr(1), addr(2), addr(3)]);
+        assert_eq!(addrs_of(&got), vec![addr(1), addr(2), addr(3)]);
     }
 
     #[test]
@@ -496,7 +609,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            got,
+            addrs_of(&got),
             vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 9000)]
         );
     }
@@ -529,7 +642,7 @@ mod tests {
         let to = vec![upstream("x.test", 80)];
         let got =
             resolve_upstreams("test", &to, |_, _| Ok(vec![addr(3), addr(1), addr(2)])).unwrap();
-        assert_eq!(got, vec![addr(3), addr(1), addr(2)]);
+        assert_eq!(addrs_of(&got), vec![addr(3), addr(1), addr(2)]);
     }
 
     #[test]
@@ -593,5 +706,103 @@ mod tests {
         assert!(err
             .to_string()
             .contains("trusted_proxies is only allowed at the global or site-block level"));
+    }
+
+    #[test]
+    fn parses_https_upstream_scheme() {
+        // `https://` on a target flips the upstream to TLS (spec §5.4); the
+        // bare form stays plain HTTP.
+        let cfg = compile(":8080 {\n    reverse_proxy https://127.0.0.1:8443\n}\n").unwrap();
+        match &cfg.sites[0].terminals[0].kind {
+            TerminalKind::ReverseProxy { upstreams, tls, .. } => {
+                assert_eq!(upstreams.len(), 1);
+                assert!(upstreams[0].tls);
+                assert_eq!(upstreams[0].host, "127.0.0.1");
+                let tls = tls
+                    .as_ref()
+                    .expect("an https upstream compiles TLS options");
+                assert!(tls.verify_cert, "verification is on by default");
+                assert!(tls.servername.is_empty());
+                assert!(tls.ca.is_none());
+                assert!(tls.client_cert.is_none());
+            }
+            other => panic!("expected reverse proxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compiles_tls_subdirectives() {
+        let cfg = compile(
+            ":8080 {\n    reverse_proxy {\n        to https://127.0.0.1:8443\n        tls_servername api.internal\n        tls_skip_verify\n    }\n}\n",
+        )
+        .unwrap();
+        match &cfg.sites[0].terminals[0].kind {
+            TerminalKind::ReverseProxy { upstreams, tls, .. } => {
+                assert!(upstreams[0].tls);
+                let tls = tls.as_ref().expect("TLS options compiled");
+                assert!(!tls.verify_cert, "tls_skip_verify clears verification");
+                assert_eq!(tls.servername, "api.internal");
+            }
+            other => panic!("expected reverse proxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_tls_options_without_https_upstream() {
+        let err = compile(
+            ":8080 {\n    reverse_proxy {\n        to 127.0.0.1:8443\n        tls_servername api.internal\n    }\n}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("require an https:// upstream"));
+    }
+
+    #[test]
+    fn tls_ca_requires_valid_pem() {
+        let err = compile(
+            ":8080 {\n    reverse_proxy {\n        to https://127.0.0.1:8443\n        tls_ca /nonexistent/ca.pem\n    }\n}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to read CA file"));
+    }
+
+    #[test]
+    fn tls_cert_reads_pem_files() {
+        // Generate a self-signed client cert and write it (plus its key) to
+        // temp files; the compiled TLS config must parse them.
+        let dir = std::env::temp_dir();
+        let stem = format!("raddy-tls-cert-{}", std::process::id());
+        let cert_path = dir.join(format!("{stem}.pem"));
+        let key_path = dir.join(format!("{stem}.key"));
+        let cert = rcgen::generate_simple_self_signed(vec!["client.test".to_string()]).unwrap();
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        let cfg = compile(&format!(
+            ":8080 {{\n    reverse_proxy {{\n        to https://127.0.0.1:8443\n        tls_cert {} {}\n    }}\n}}\n",
+            cert_path.display(),
+            key_path.display()
+        ))
+        .unwrap();
+        match &cfg.sites[0].terminals[0].kind {
+            TerminalKind::ReverseProxy { tls, .. } => {
+                let tls = tls.as_ref().expect("TLS options compiled");
+                assert!(tls.client_cert.is_some());
+            }
+            other => panic!("expected reverse proxy, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn resolve_upstreams_keeps_tls_scheme() {
+        let to = vec![tls_upstream("secure.test", 8443)];
+        let got = resolve_upstreams("test", &to, |_, port| {
+            Ok(vec![SocketAddr::new("10.0.0.9".parse().unwrap(), port)])
+        })
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].tls);
+        assert_eq!(got[0].host, "secure.test");
+        assert_eq!(got[0].addr.port(), 8443);
     }
 }

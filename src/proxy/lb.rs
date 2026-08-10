@@ -23,7 +23,7 @@
 //! balancers can be created/replaced on reload without touching the server's
 //! fixed service set.
 
-use crate::config::ast::{HealthCheckSpec, LbPolicy, SiteKey, TerminalKind};
+use crate::config::ast::{HealthCheckSpec, LbPolicy, SiteKey, TerminalKind, UpstreamPeer};
 use async_trait::async_trait;
 use pingora::lb::health_check;
 use pingora::lb::selection::{BackendIter, BackendSelection, Consistent, Random, RoundRobin};
@@ -51,9 +51,11 @@ pub trait BackendSelector: Send + Sync {
 }
 
 /// The specification that determines when a balancer must be rebuilt (ADR-011).
+/// Carries the resolved upstream peers (address + TLS scheme + original host),
+/// so changing any of them rebuilds the balancer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LbSpec {
-    pub upstreams: Vec<SocketAddr>,
+    pub upstreams: Vec<UpstreamPeer>,
     pub policy: LbPolicy,
     pub health_check: Option<HealthCheckSpec>,
 }
@@ -115,6 +117,7 @@ impl LoadBalancerPool {
                     upstreams,
                     lb_policy,
                     health_check,
+                    ..
                 } = &terminal.kind
                 else {
                     continue;
@@ -202,7 +205,7 @@ pub fn spawn_health_check_runner(pool: Arc<LoadBalancerPool>) {
 fn build_balancer(spec: &LbSpec) -> Arc<dyn BackendSelector> {
     // The upstreams were resolved by the validator, so they parse back as
     // `SocketAddr`; a failure here is a programming error.
-    let addrs: Vec<String> = spec.upstreams.iter().map(|a| a.to_string()).collect();
+    let addrs: Vec<String> = spec.upstreams.iter().map(|p| p.addr.to_string()).collect();
     match spec.policy {
         LbPolicy::RoundRobin => wrap(
             LoadBalancer::<RoundRobin>::try_from_iter(addrs).expect("resolved upstreams"),
@@ -275,7 +278,11 @@ mod tests {
     fn spec(policy: LbPolicy, upstreams: &[&str]) -> LbSpec {
         let upstreams = upstreams
             .iter()
-            .map(|s| s.parse().expect("test upstream"))
+            .map(|s| UpstreamPeer {
+                addr: s.parse().expect("test upstream"),
+                tls: false,
+                host: String::new(),
+            })
             .collect();
         LbSpec {
             upstreams,
