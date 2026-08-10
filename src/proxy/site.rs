@@ -111,6 +111,7 @@ mod tests {
             modifiers: Vec::new(),
             trusted_proxies: None,
             tls: None,
+            access_log_off: false,
         }
     }
 
@@ -124,6 +125,7 @@ mod tests {
             modifiers: Vec::new(),
             trusted_proxies: None,
             tls: None,
+            access_log_off: false,
         }
     }
 

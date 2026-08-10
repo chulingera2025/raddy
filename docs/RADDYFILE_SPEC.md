@@ -128,7 +128,7 @@ trusted, so the default must be pinned down:
 | `basic_auth` | `basic_auth <user> <bcrypt-hash>` — HTTP Basic auth guard (see Section 5.10) | Available |
 | `forward_auth` | `forward_auth <target>` — delegate auth to an upstream (see Section 5.10) | Available |
 | `import` / `(name)` | `import <file|name>` multi-file includes / snippets, `{$ENV}` expansion (see Section 5.12) | Available |
-| `access_log` | `access_log <path> [format=<json|common>]` or `off` (see Section 5.13) | Planned |
+| `access_log` | `access_log <path> [format=<json|common>]` or `off` (see Section 5.13) | Available |
 
 **Single-instance vs cluster rate limiting**: rate limiting is per-instance
 (each instance counts independently); cluster-wide (shared) counting requires
@@ -478,6 +478,8 @@ api.example.com {
 ```
 
 ### 5.13 Access log configuration
+
+**Status: Available.**
 
 The `--access-log` CLI flag appends JSON access logs. The Raddyfile can
 configure access logging more precisely:

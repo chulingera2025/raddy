@@ -26,7 +26,9 @@
 //! touching any listener). The upgrade socket path must agree between old and
 //! new process.
 
-use crate::config::ast::{CompiledConfig, LogLevel, SiteKey, TlsSource};
+use crate::config::ast::{
+    AccessLogDirective, AccessLogFormat, CompiledConfig, LogLevel, SiteKey, TlsSource,
+};
 use crate::config::snapshot::{self, ConfigStore};
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
@@ -77,6 +79,8 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     let snapshot = snapshot::build(config_path)?;
     let ports = snapshot.listeners();
     let email = snapshot.global.acme_email.clone();
+    // The access-log directive (spec §5.13); read before `snapshot` is moved.
+    let global_access_log = snapshot.global.access_log.clone();
     let startup_hosts = hosts_needing_certs(&snapshot);
     // Computed before `snapshot` is moved into the store below (used later to
     // decide which listeners are TLS).
@@ -132,15 +136,20 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     spawn_health_check_runner(lb_pool.clone());
 
     let config_store = Arc::new(ConfigStore::new(snapshot));
+    // Access log destination (spec §5.13): the `--access-log` CLI flag wins;
+    // otherwise the global `access_log` directive. `access_log off` (or neither)
+    // disables it.
     let access_log = match &opts.access_log {
-        Some(path) => Some(Mutex::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| format!("failed to open access log {}: {e}", path.display()))?,
-        )),
-        None => None,
+        Some(path) => Some(open_access_log(
+            path,
+            global_access_log_format(&global_access_log),
+        )?),
+        None => match &global_access_log {
+            Some(AccessLogDirective::File { path, format }) => {
+                Some(open_access_log(std::path::Path::new(path), *format)?)
+            }
+            _ => None,
+        },
     };
     // Single-node rate limiter (M10): process-lifetime, so bucket state
     // survives reloads like the LB pool (ADR-011).
@@ -347,6 +356,31 @@ fn generate_internal_cert(host: &str) -> Result<pingora::utils::tls::CertKey, St
     let cert = rcgen::generate_simple_self_signed(vec![host.to_string()])
         .map_err(|e| format!("failed to generate internal certificate for {host}: {e}"))?;
     crate::tls::cert_key_from_pem(&cert.cert.pem(), &cert.signing_key.serialize_pem())
+}
+
+/// Open the access-log file (spec §5.13), creating it if needed.
+fn open_access_log(
+    path: &Path,
+    format: AccessLogFormat,
+) -> Result<crate::proxy::handler::AccessLog, Box<dyn Error>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("failed to open access log {}: {e}", path.display()))?;
+    Ok(crate::proxy::handler::AccessLog {
+        file: Mutex::new(file),
+        format,
+    })
+}
+
+/// The access-log format to use for the `--access-log` flag: the global
+/// directive's format when set, otherwise JSON (spec §5.13).
+fn global_access_log_format(global: &Option<AccessLogDirective>) -> AccessLogFormat {
+    match global {
+        Some(AccessLogDirective::File { format, .. }) => *format,
+        _ => AccessLogFormat::Json,
+    }
 }
 
 /// The renewal scan interval: hourly by default, overridable via

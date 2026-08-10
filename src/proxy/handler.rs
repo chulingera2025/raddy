@@ -20,8 +20,8 @@
 //! so the upstream Connector's connection pools survive (ADR-011).
 
 use crate::config::ast::{
-    Cidr, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec, SiteKey, TemplatePart,
-    TerminalKind, UpstreamTls, ValueTemplate, Variable,
+    AccessLogFormat, Cidr, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec, SiteKey,
+    TemplatePart, TerminalKind, UpstreamTls, ValueTemplate, Variable,
 };
 use crate::config::snapshot::ConfigStore;
 use crate::proxy::compress;
@@ -42,6 +42,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// The access-log destination and format (spec §5.13).
+pub struct AccessLog {
+    pub file: Mutex<File>,
+    pub format: AccessLogFormat,
+}
+
 /// The process-lifetime proxy handler.
 pub struct ProxyHandler {
     store: Arc<ConfigStore>,
@@ -52,8 +58,8 @@ pub struct ProxyHandler {
     challenges: Arc<ChallengeStore>,
     /// Single-node rate limiter (M10, ADR-011: state survives reloads).
     rate_limiter: Arc<RateLimiter>,
-    /// Optional structured access-log destination (M5).
-    access_log: Option<Mutex<File>>,
+    /// Optional access-log destination and format (spec §5.13).
+    access_log: Option<AccessLog>,
 }
 
 impl ProxyHandler {
@@ -61,7 +67,7 @@ impl ProxyHandler {
     pub fn new(
         store: Arc<ConfigStore>,
         challenges: Arc<ChallengeStore>,
-        access_log: Option<Mutex<File>>,
+        access_log: Option<AccessLog>,
         pool: Arc<LoadBalancerPool>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
@@ -108,6 +114,19 @@ impl ProxyHandler {
         }
         Ok(None)
     }
+
+    /// Whether the selected site disabled access logging with `access_log off`
+    /// (spec §5.13).
+    fn site_access_log_off(&self, ctx: &ProxyCtx) -> bool {
+        let Some(key) = ctx.site_key.as_ref() else {
+            return false;
+        };
+        self.store
+            .load()
+            .sites
+            .iter()
+            .any(|site| &site.key == key && site.access_log_off)
+    }
 }
 
 /// One structured access-log line (M5).
@@ -120,6 +139,8 @@ struct AccessLogEntry {
     path: String,
     status: u16,
     duration_ms: u128,
+    /// Response body bytes written to the client.
+    bytes: usize,
 }
 
 /// Per-request state carried across the `ProxyHttp` hook chain.
@@ -161,6 +182,10 @@ pub struct ProxyCtx {
     /// Response headers from a passing `forward_auth` upstream (spec §5.10),
     /// copied onto the request before the real upstream sees it.
     forward_auth_headers: Vec<(String, String)>,
+    /// Response body bytes written to the client (spec §5.13), counted in
+    /// `response_body_filter` for the proxied path and by the direct-respond
+    /// terminals.
+    response_bytes: usize,
 }
 
 #[async_trait]
@@ -512,6 +537,10 @@ impl ProxyHttp for ProxyHandler {
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
         let Some(encoder) = ctx.encoder.as_mut() else {
+            // Uncompressed chunk: count the bytes written downstream.
+            if let Some(chunk) = body {
+                ctx.response_bytes += chunk.len();
+            }
             return Ok(None);
         };
         let chunk = body.take().unwrap_or_default();
@@ -531,6 +560,9 @@ impl ProxyHttp for ProxyHandler {
         if !out.is_empty() {
             *body = Some(Bytes::from(out));
         }
+        if let Some(chunk) = body {
+            ctx.response_bytes += chunk.len();
+        }
         Ok(None)
     }
 
@@ -539,14 +571,25 @@ impl ProxyHttp for ProxyHandler {
         if let Some(start) = ctx.start {
             crate::observ::metrics::record_request(start.elapsed().as_secs_f64());
         }
-        // Structured JSON access log (if configured).
+        // Access log (spec §5.13), if configured.
         let Some(log) = &self.access_log else {
             return;
         };
+        // A site that set `access_log off` is excluded.
+        if self.site_access_log_off(ctx) {
+            return;
+        }
         if let Some(entry) = access_log_entry(session, ctx) {
-            if let Ok(mut guard) = log.lock() {
-                let _ = serde_json::to_writer(&mut *guard, &entry);
-                let _ = writeln!(guard);
+            if let Ok(mut guard) = log.file.lock() {
+                match log.format {
+                    AccessLogFormat::Json => {
+                        let _ = serde_json::to_writer(&mut *guard, &entry);
+                        let _ = writeln!(guard);
+                    }
+                    AccessLogFormat::Common => {
+                        let _ = writeln!(guard, "{}", common_log_line(&entry, session));
+                    }
+                }
                 let _ = guard.flush();
             }
         }
@@ -734,7 +777,69 @@ fn access_log_entry(session: &Session, ctx: &ProxyCtx) -> Option<AccessLogEntry>
         path,
         status,
         duration_ms,
+        bytes: ctx.response_bytes,
     })
+}
+
+/// The classic combined log line for the `common` format (spec §5.13):
+/// `%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"`.
+fn common_log_line(entry: &AccessLogEntry, session: &Session) -> String {
+    let referer = header_or_dash(session, http::header::REFERER);
+    let user_agent = header_or_dash(session, http::header::USER_AGENT);
+    let ts = common_log_time(entry.ts);
+    format!(
+        "{} - - [{}] \"{} {} HTTP/1.1\" {} {} \"{}\" \"{}\"",
+        entry.client, ts, entry.method, entry.path, entry.status, entry.bytes, referer, user_agent
+    )
+}
+
+/// A request header value or `-` for the common log format.
+fn header_or_dash(session: &Session, name: http::header::HeaderName) -> String {
+    session
+        .req_header()
+        .headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// Format an epoch-millis timestamp as `[10/Aug/2026:06:00:00 +0000]`.
+fn common_log_time(epoch_ms: u64) -> String {
+    // A tiny hand-rolled formatter keeps the combined log line dependency-free.
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = epoch_ms / 1000;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Days since epoch → (year, month, day) via the civil-from-days algorithm.
+    let (year, month, day) = civil_from_days(days as i64);
+    format!(
+        "{:02}/{}/{:04}:{:02}:{:02}:{:02} +0000",
+        day,
+        MONTHS[month as usize - 1],
+        year,
+        hour,
+        min,
+        sec
+    )
+}
+
+/// Convert days since the Unix epoch to a (year, month, day) date
+/// (Howard Hinnant's civil-from-days algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
 }
 
 /// The current wall clock in epoch milliseconds (the access-log `ts`).
@@ -1335,5 +1440,24 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
         assert_eq!(values, vec!["origin, Accept-Encoding".to_string()]);
+    }
+
+    #[test]
+    fn common_log_time_epoch_and_known_date() {
+        // Epoch → the classic combined-log timestamp (the caller adds brackets).
+        assert_eq!(common_log_time(0), "01/Jan/1970:00:00:00 +0000");
+        // 2026-08-10 00:00:00 UTC = 20_675 days since the epoch (counted leap
+        // years); the civil-from-days conversion must agree.
+        let known = 20_675u64 * 86_400 * 1000;
+        assert_eq!(common_log_time(known), "10/Aug/2026:00:00:00 +0000");
+    }
+
+    #[test]
+    fn common_log_time_handles_time_of_day() {
+        // 12:34:56 on the epoch day, in milliseconds.
+        assert_eq!(
+            common_log_time((12 * 3600 + 34 * 60 + 56) * 1000),
+            "01/Jan/1970:12:34:56 +0000"
+        );
     }
 }

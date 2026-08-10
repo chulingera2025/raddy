@@ -89,6 +89,8 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
     // table; `forward_auth` is a single delegation target (last wins).
     let mut basic_users: Vec<(String, String)> = Vec::new();
     let mut forward_auth: Option<String> = None;
+    // Site-block `access_log off` (spec §5.13).
+    let mut access_log_off = false;
 
     for directive in &site.directives {
         match directive {
@@ -183,6 +185,7 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
             Directive::Tls { config } => merge_tls(&mut site_tls, config),
             Directive::BasicAuth { user, hash } => basic_users.push((user.clone(), hash.clone())),
             Directive::ForwardAuth { target } => forward_auth = Some(target.clone()),
+            Directive::AccessLogOff => access_log_off = true,
         }
     }
 
@@ -222,6 +225,7 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
         modifiers,
         trusted_proxies: site_trusted,
         tls: site_tls,
+        access_log_off,
     })
 }
 
@@ -359,6 +363,12 @@ fn compile_handle_block(
             }
             Directive::BasicAuth { user, hash } => basic_users.push((user.clone(), hash.clone())),
             Directive::ForwardAuth { target } => forward_auth = Some(target.clone()),
+            Directive::AccessLogOff => {
+                return Err(validate_error(
+                    file,
+                    "access_log is only allowed at the global or site-block level",
+                ))
+            }
         }
     }
 

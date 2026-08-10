@@ -572,6 +572,7 @@ impl<'a> Parser<'a> {
             "error" => self.parse_error(words, block_open),
             "basic_auth" => self.parse_basic_auth(words, block_open),
             "forward_auth" => self.parse_forward_auth(words, block_open),
+            "access_log" => self.parse_access_log(words, block_open),
             "rate_limit" => self.parse_rate_limit(words, block_open),
             "trusted_proxies" => self.parse_trusted_proxies(words, block_open),
             "tls" => self.parse_tls(words, block_open),
@@ -1370,9 +1371,64 @@ impl<'a> Parser<'a> {
                     api_token: words[2].clone(),
                 });
             }
+            "access_log" => {
+                global.access_log = Some(self.parse_access_log_directive(words)?);
+            }
             other => return Err(self.err(format!("unknown global directive '{other}'"))),
         }
         Ok(())
+    }
+
+    /// Parse the global `access_log` value: `off`, or a path plus an optional
+    /// `format=<json|common>` (spec §5.13).
+    fn parse_access_log_directive(
+        &self,
+        words: &[String],
+    ) -> Result<AccessLogDirective, ConfigError> {
+        if words.len() == 2 && words[1] == "off" {
+            return Ok(AccessLogDirective::Off);
+        }
+        if !(2..=3).contains(&words.len()) {
+            return Err(self.err(
+                "access_log expects: access_log <path> [format=<json|common>] | access_log off",
+            ));
+        }
+        let mut format = AccessLogFormat::Json;
+        if let Some(arg) = words.get(2) {
+            format = match arg.strip_prefix("format=") {
+                Some("json") => AccessLogFormat::Json,
+                Some("common") => AccessLogFormat::Common,
+                Some(other) => {
+                    return Err(self.err(format!(
+                        "invalid access_log format '{other}' (expected json or common)"
+                    )))
+                }
+                None => {
+                    return Err(self.err(format!(
+                        "unexpected argument '{arg}' (expected 'format=<json|common>')"
+                    )))
+                }
+            };
+        }
+        Ok(AccessLogDirective::File {
+            path: words[1].clone(),
+            format,
+        })
+    }
+
+    /// Parse a site-block `access_log off` (spec §5.13).
+    fn parse_access_log(
+        &self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after access_log"));
+        }
+        if words.len() != 2 || words[1] != "off" {
+            return Err(self.err("site-block access_log only supports 'off'"));
+        }
+        Ok(Directive::AccessLogOff)
     }
 }
 
@@ -2153,5 +2209,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("failed to read imported file"));
+    }
+
+    #[test]
+    fn parses_global_access_log_directive() {
+        let input = "{\n    access_log /tmp/raddy.log format=common\n}\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert!(matches!(
+            rf.global.access_log,
+            Some(AccessLogDirective::File {
+                format: AccessLogFormat::Common,
+                ..
+            })
+        ));
+        // `access_log off` disables it.
+        let input = "{\n    access_log off\n}\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert_eq!(rf.global.access_log, Some(AccessLogDirective::Off));
+    }
+
+    #[test]
+    fn parses_site_access_log_off() {
+        let input = ":8080 {\n    access_log off\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert!(matches!(rf.sites[0].directives[0], Directive::AccessLogOff));
     }
 }

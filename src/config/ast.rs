@@ -254,6 +254,30 @@ pub struct GlobalConfig {
     /// DNS-01 challenge credentials (spec §5.3); when set, certificate
     /// issuance uses DNS-01 instead of HTTP-01.
     pub dns_challenge: Option<DnsChallenge>,
+    /// Access-log configuration (spec §5.13); `None` = disabled unless the
+    /// `--access-log` CLI flag is given.
+    pub access_log: Option<AccessLogDirective>,
+}
+
+/// The format of access-log lines (spec §5.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessLogFormat {
+    /// One JSON object per request (the `--access-log` default).
+    Json,
+    /// The classic combined log line.
+    Common,
+}
+
+/// The `access_log` directive's configuration (spec §5.13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessLogDirective {
+    /// `access_log off` — disable access logging for the instance.
+    Off,
+    /// `access_log <path> [format=<json|common>]`.
+    File {
+        path: String,
+        format: AccessLogFormat,
+    },
 }
 
 /// DNS-01 challenge configuration (spec §5.3).
@@ -393,6 +417,9 @@ pub enum Directive {
     ForwardAuth {
         target: String,
     },
+    /// Site-block `access_log off` — disable access logging for this site
+    /// (spec §5.13).
+    AccessLogOff,
     /// Site-scoped `trusted_proxies`, overriding the global list for this site
     /// (spec §4). Compiled into [`CompiledSite::trusted_proxies`].
     TrustedProxies {
@@ -601,6 +628,9 @@ pub struct CompiledSite {
     /// Per-site TLS configuration (spec §5.7): certificate source and the TLS
     /// options applied per SNI. `None` = ACME default, no overrides.
     pub tls: Option<TlsConfig>,
+    /// Site-block `access_log off` (spec §5.13): this site is excluded from the
+    /// access log.
+    pub access_log_off: bool,
 }
 
 /// A compiled terminal directive.

@@ -1451,6 +1451,66 @@ fn file_import_splices_site_directives() {
 }
 
 #[test]
+fn access_log_common_format_is_written() {
+    // The global `access_log <path> format=common` directive (spec §5.13)
+    // writes classic combined log lines.
+    let log_path =
+        std::env::temp_dir().join(format!("raddy_access_common_{}.log", std::process::id()));
+    let (up_port, _up) = EchoUpstream::spawn("logged");
+    let log_c = log_path.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            "{{\n    access_log {} format=common\n}}\n:{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            log_c.display()
+        )
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/x");
+    assert_eq!(resp.status, 200);
+    wait_until(
+        || {
+            std::fs::read_to_string(&log_path)
+                .map(|s| s.contains("GET /x HTTP/1.1"))
+                .unwrap_or(false)
+        },
+        "the common access-log line to appear",
+    );
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        content.contains("GET /x HTTP/1.1"),
+        "common log line missing: {content}"
+    );
+    assert!(content.contains(" 200 "), "status missing: {content}");
+    let _ = std::fs::remove_file(&log_path);
+}
+
+#[test]
+fn access_log_off_skips_a_site() {
+    // A site with `access_log off` (spec §5.13) produces no access-log line even
+    // when logging is enabled by the `--access-log` flag.
+    let log_path =
+        std::env::temp_dir().join(format!("raddy_access_off_{}.log", std::process::id()));
+    let (up_port, _up) = EchoUpstream::spawn("off");
+    let args = vec![String::from("--access-log"), log_path.display().to_string()];
+    let raddy = RadRaddy::spawn_with_args(
+        |port| {
+            format!(":{port} {{\n    access_log off\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n")
+        },
+        &args,
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    // The logging hook runs after the response is written; give it a moment,
+    // then assert no 200 line (the probe's 400s may still appear).
+    thread::sleep(Duration::from_millis(300));
+    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !content.contains("\"status\":200"),
+        "access_log off must skip the site: {content}"
+    );
+    let _ = std::fs::remove_file(&log_path);
+}
+
+#[test]
 fn missing_host_returns_400() {
     let (up_port, _up) = EchoUpstream::spawn("A");
     let raddy =
