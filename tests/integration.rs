@@ -523,6 +523,12 @@ impl RadRaddy {
         Self::spawn_with_args(config_for, &[])
     }
 
+    /// Spawn with a config plus extra environment variables for the child
+    /// (used for `{$ENV}` expansion, spec §5.12).
+    fn spawn_with_env(config_for: impl Fn(u16) -> String, env: &[(&str, &str)]) -> RadRaddy {
+        Self::spawn_with_env_probe(config_for, env, ReadyProbe::Plain)
+    }
+
     /// Spawn with extra CLI arguments (e.g. `--metrics-addr`, `--access-log`).
     fn spawn_with_args(config_for: impl Fn(u16) -> String, extra: &[String]) -> RadRaddy {
         Self::spawn_with_probe(config_for, extra, ReadyProbe::Plain)
@@ -539,6 +545,46 @@ impl RadRaddy {
     /// readiness is a TCP accept only.
     fn spawn_tcp(config_for: impl Fn(u16) -> String) -> RadRaddy {
         Self::spawn_with_probe(config_for, &[], ReadyProbe::Tcp)
+    }
+
+    fn spawn_with_env_probe(
+        config_for: impl Fn(u16) -> String,
+        env: &[(&str, &str)],
+        probe: ReadyProbe,
+    ) -> RadRaddy {
+        loop {
+            let port = free_port();
+            let config = config_for(port);
+            let config_path = std::env::temp_dir().join(format!(
+                "raddy_integration_{}_{}.Raddyfile",
+                std::process::id(),
+                port
+            ));
+            std::fs::write(&config_path, &config).unwrap();
+            let mut cmd = Command::new(BIN);
+            cmd.args(["run", "-c"]).arg(&config_path);
+            cmd.env("RUST_LOG", "error").stderr(Stdio::inherit());
+            for (name, value) in env {
+                cmd.env(name, value);
+            }
+            let child = cmd.spawn().expect("failed to spawn the raddy binary");
+            let mut raddy = RadRaddy {
+                child,
+                port,
+                config_path,
+            };
+            let ready = match probe {
+                ReadyProbe::Plain => raddy.wait_for_ready(),
+                ReadyProbe::Tls => raddy.wait_for_ready_tls(),
+                ReadyProbe::Tcp => raddy.wait_for_ready_tcp(),
+            };
+            if ready {
+                return raddy;
+            }
+            // The child exited (bind failure) or never listened; retry.
+            let _ = raddy.child.kill();
+            let _ = raddy.child.wait();
+        }
     }
 
     fn spawn_with_probe(
@@ -1369,6 +1415,39 @@ fn rate_limit_keys_on_header_value() {
         send_request_hdr(raddy.port(), Some("localhost"), "/", &["X-API-Key: key2"]).status,
         200
     );
+}
+
+#[test]
+fn env_vars_expand_in_config() {
+    // `{$ENV}` (spec §5.12) is expanded from the process environment at parse
+    // time, so an upstream target can come from an env var.
+    let (up_port, _up) = EchoUpstream::spawn("env");
+    let upstream = format!("127.0.0.1:{up_port}");
+    let raddy = RadRaddy::spawn_with_env(
+        |port| format!(":{port} {{\n    reverse_proxy {{$UPSTREAM}}\n}}\n"),
+        &[("UPSTREAM", upstream.as_str())],
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=env");
+}
+
+#[test]
+fn file_import_splices_site_directives() {
+    let (up_port, _up) = EchoUpstream::spawn("imported");
+    let imported = std::env::temp_dir().join(format!(
+        "raddy_site_import_{}.Raddyfile",
+        std::process::id()
+    ));
+    std::fs::write(&imported, format!("reverse_proxy 127.0.0.1:{up_port}\n")).unwrap();
+    let imported_c = imported.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(":{port} {{\n    import {}\n}}\n", imported_c.display())
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=imported");
+    let _ = std::fs::remove_file(&imported);
 }
 
 #[test]

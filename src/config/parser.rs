@@ -20,15 +20,41 @@
 
 use crate::config::ast::*;
 use crate::config::lexer::{lex, Token, TokenKind};
+use std::collections::HashMap;
+
+/// The maximum size of a file pulled in by `import` (spec §5.12), so a config
+/// can never read unbounded input (e.g. `/dev/zero`).
+const MAX_IMPORT_BYTES: u64 = 1 << 20;
 
 /// Parse a Raddyfile into its source AST.
+///
+/// The input is preprocessed before the grammar parse (spec §5.12): `{$ENV}`
+/// placeholders are expanded from the environment, `(name)` snippet definitions
+/// are captured, and `import` statements are spliced in (recursively).
 pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
-    let tokens = lex(input).map_err(|message| ConfigError::Parse {
+    let expanded = expand_env(input).map_err(|message| ConfigError::Parse {
         file: file.to_string(),
         line: 1,
         col: 1,
         message,
     })?;
+    let tokens = lex(&expanded).map_err(|message| ConfigError::Parse {
+        file: file.to_string(),
+        line: 1,
+        col: 1,
+        message,
+    })?;
+    let mut snippets = HashMap::new();
+    let mut stack = Vec::new();
+    let tokens =
+        expand_imports(file, tokens, &mut snippets, &mut stack, true).map_err(|message| {
+            ConfigError::Parse {
+                file: file.to_string(),
+                line: 1,
+                col: 1,
+                message,
+            }
+        })?;
     Parser {
         file,
         tokens,
@@ -36,6 +62,184 @@ pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
         stmt_pos: (1, 1),
     }
     .parse_raddyfile()
+}
+
+/// Expand environment variables in a config's raw text (spec §5.12): every
+/// `{$NAME}` is replaced by the value of `NAME`. A missing variable or an
+/// unterminated placeholder is a parse error.
+fn expand_env(input: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("{$") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err("unterminated '{$...}' environment placeholder".to_string());
+        };
+        let name = &after[..end];
+        if name.is_empty() {
+            return Err("empty environment variable name in '{$}'".to_string());
+        }
+        let value =
+            std::env::var(name).map_err(|_| format!("environment variable '{name}' is not set"))?;
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Expand `import` statements and collect `(name)` snippets in a token stream
+/// (spec §5.12). Snippet definitions at the top level are captured and removed;
+/// an `import <target>` at any nesting level is replaced by the snippet's tokens
+/// (when `<target>` names a snippet) or by the recursively-expanded tokens of
+/// the named file (resolved relative to `file`).
+fn expand_imports(
+    file: &str,
+    tokens: Vec<Token>,
+    snippets: &mut HashMap<String, Vec<Token>>,
+    stack: &mut Vec<String>,
+    top_level: bool,
+) -> Result<Vec<Token>, String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        match &token.kind {
+            TokenKind::Newline | TokenKind::RBrace => {
+                out.push(token.clone());
+                i += 1;
+            }
+            TokenKind::LBrace => {
+                let (content, end) = capture_block(&tokens, i);
+                if end == i {
+                    // Unclosed block; leave it for the parser to reject.
+                    out.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                out.push(token.clone());
+                out.extend(expand_imports(file, content, snippets, stack, false)?);
+                out.push(tokens[end].clone());
+                i = end + 1;
+            }
+            TokenKind::Word(_) => {
+                // Read the statement's words (up to a newline, `{`, or `}`).
+                let mut words: Vec<Token> = Vec::new();
+                let mut j = i;
+                let mut opens_block = false;
+                while j < tokens.len() {
+                    match &tokens[j].kind {
+                        TokenKind::Word(_) => {
+                            words.push(tokens[j].clone());
+                            j += 1;
+                        }
+                        TokenKind::LBrace => {
+                            opens_block = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                // A top-level `(name) { ... }` is a snippet definition.
+                if top_level && opens_block && words.len() == 1 {
+                    if let Some(snippet_name) = strip_snippet_name(word_str(&words[0])) {
+                        let (content, end) = capture_block(&tokens, j);
+                        snippets.insert(snippet_name.to_string(), content);
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                // `import <target>` splices a snippet or an imported file.
+                if words.len() == 2 && word_str(&words[0]) == "import" {
+                    let target = word_str(&words[1]);
+                    if let Some(snippet) = snippets.get(target).cloned() {
+                        out.extend(snippet);
+                    } else {
+                        let (imported_path, imported_text) = read_imported(file, target)?;
+                        if stack.contains(&imported_path) {
+                            return Err(format!("import cycle involving {imported_path}"));
+                        }
+                        stack.push(imported_path.clone());
+                        let expanded = expand_env(&imported_text)?;
+                        let imported_tokens = lex(&expanded)
+                            .map_err(|message| format!("{imported_path}: {message}"))?;
+                        out.extend(expand_imports(
+                            &imported_path,
+                            imported_tokens,
+                            snippets,
+                            stack,
+                            true,
+                        )?);
+                        stack.pop();
+                    }
+                    i = j;
+                    continue;
+                }
+                out.extend(words);
+                i = j;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read an imported file (spec §5.12), resolving `target` relative to `file`'s
+/// directory, bounded to [`MAX_IMPORT_BYTES`].
+fn read_imported(file: &str, target: &str) -> Result<(String, String), String> {
+    use std::io::Read;
+    let path = std::path::Path::new(file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(target);
+    let mut content = String::new();
+    let f = std::fs::File::open(&path)
+        .map_err(|e| format!("failed to read imported file {}: {e}", path.display()))?;
+    f.take(MAX_IMPORT_BYTES)
+        .read_to_string(&mut content)
+        .map_err(|e| format!("failed to read imported file {}: {e}", path.display()))?;
+    Ok((path.display().to_string(), content))
+}
+
+/// The word content of a token (assumed to be a `Word`).
+fn word_str(token: &Token) -> &str {
+    match &token.kind {
+        TokenKind::Word(w) => w.as_str(),
+        _ => unreachable!("word_str called on a non-word token"),
+    }
+}
+
+/// The snippet name of a `(name)` token, or `None`.
+fn strip_snippet_name(token: &str) -> Option<&str> {
+    token
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .filter(|name| !name.is_empty())
+}
+
+/// Given tokens starting at an `{`, return the tokens between the braces and
+/// the index of the matching `}` (or the opening index when unclosed).
+fn capture_block(tokens: &[Token], lb: usize) -> (Vec<Token>, usize) {
+    let mut depth = 0usize;
+    let mut end = lb;
+    for (k, token) in tokens.iter().enumerate().skip(lb) {
+        match token.kind {
+            TokenKind::LBrace => depth += 1,
+            TokenKind::RBrace => {
+                depth -= 1;
+                if depth == 0 {
+                    end = k;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end == lb {
+        // Unclosed block (no matching `}`); leave it for the parser to reject.
+        return (Vec::new(), lb);
+    }
+    (tokens[lb + 1..end].to_vec(), end)
 }
 
 /// The default port for a named site without an explicit port (M4 binds TLS).
@@ -1911,5 +2115,43 @@ mod tests {
             }
             other => panic!("expected rate_limit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snippet_import_is_spliced() {
+        // A `(name)` definition is captured and `import name` splices it
+        // (spec §5.12), including inside a site block.
+        let input = "(base) {\n    header_up X-Raddy yes\n}\n:8080 {\n    import base\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert_eq!(rf.sites.len(), 1);
+        let directives = &rf.sites[0].directives;
+        assert_eq!(directives.len(), 2);
+        assert!(matches!(directives[0], Directive::HeaderUp { .. }));
+        assert!(matches!(directives[1], Directive::ReverseProxy { .. }));
+    }
+
+    #[test]
+    fn file_import_is_spliced() {
+        let dir = std::env::temp_dir();
+        let imported = dir.join(format!("raddy_import_{}.Raddyfile", std::process::id()));
+        std::fs::write(&imported, "reverse_proxy 127.0.0.1:9000\n").unwrap();
+        let input = format!(":8080 {{\n    import {}\n}}\n", imported.display());
+        let rf = parse("test", &input).unwrap();
+        assert_eq!(rf.sites[0].directives.len(), 1);
+        assert!(matches!(
+            rf.sites[0].directives[0],
+            Directive::ReverseProxy { .. }
+        ));
+        let _ = std::fs::remove_file(&imported);
+    }
+
+    #[test]
+    fn missing_import_file_is_an_error() {
+        let err = parse(
+            "test",
+            ":8080 {\n    import /nonexistent/raddy_import_file\n}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to read imported file"));
     }
 }
