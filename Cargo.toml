@@ -1,6 +1,6 @@
 [package]
 name = "raddy"
-version = "0.2.1"
+version = "0.2.10"
 edition = "2021"
 authors = ["chulingera2025"]
 description = "A minimal high-performance reverse proxy gateway built on Cloudflare Pingora"
