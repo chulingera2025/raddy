@@ -23,22 +23,27 @@ use crate::config::lexer::{lex, Token, TokenKind};
 use std::collections::HashMap;
 
 /// The maximum size of a file pulled in by `import` (spec §5.12), so a config
-/// can never read unbounded input (e.g. `/dev/zero`).
+/// can never read unbounded input (e.g. `/dev/zero`). An oversized file is an
+/// error, never a silent truncation.
 const MAX_IMPORT_BYTES: u64 = 1 << 20;
+/// The maximum `import` nesting depth (spec §5.12).
+const MAX_IMPORT_DEPTH: usize = 32;
 
 /// Parse a Raddyfile into its source AST.
 ///
 /// The input is preprocessed before the grammar parse (spec §5.12): `{$ENV}`
-/// placeholders are expanded from the environment, `(name)` snippet definitions
-/// are captured, and `import` statements are spliced in (recursively).
+/// placeholders are expanded from the environment (at the token level, so a
+/// value cannot change the configuration structure), `(name)` snippet
+/// definitions are captured, and `import` statements are spliced in
+/// (recursively).
 pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
-    let expanded = expand_env(input).map_err(|message| ConfigError::Parse {
+    let tokens = lex(input).map_err(|message| ConfigError::Parse {
         file: file.to_string(),
         line: 1,
         col: 1,
         message,
     })?;
-    let tokens = lex(&expanded).map_err(|message| ConfigError::Parse {
+    let tokens = expand_env_tokens(tokens).map_err(|message| ConfigError::Parse {
         file: file.to_string(),
         line: 1,
         col: 1,
@@ -64,31 +69,36 @@ pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
     .parse_raddyfile()
 }
 
-/// Expand environment variables in a config's raw text (spec §5.12): every
-/// `{$NAME}` is replaced by the value of `NAME`. A missing variable or an
-/// unterminated placeholder is a parse error.
-fn expand_env(input: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(start) = rest.find("{$") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
-            return Err("unterminated '{$...}' environment placeholder".to_string());
-        };
-        let name = &after[..end];
-        if name.is_empty() {
-            return Err("empty environment variable name in '{$}'".to_string());
+/// Expand `{$ENV}` placeholders at the token level (spec §5.12): a word token
+/// that is exactly `{$NAME}` is replaced by the value of `NAME` as a single
+/// argument token, so a value containing spaces, `#`, braces, or newlines
+/// cannot change the configuration structure (P2). A missing variable is an
+/// error.
+fn expand_env_tokens(tokens: Vec<Token>) -> Result<Vec<Token>, String> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match &token.kind {
+            TokenKind::Word(word) if is_env_token(word) => {
+                let name = &word[2..word.len() - 1];
+                let value = std::env::var(name)
+                    .map_err(|_| format!("environment variable '{name}' is not set"))?;
+                out.push(Token {
+                    kind: TokenKind::Word(value),
+                    ..token
+                });
+            }
+            _ => out.push(token),
         }
-        let value =
-            std::env::var(name).map_err(|_| format!("environment variable '{name}' is not set"))?;
-        out.push_str(&value);
-        rest = &after[end + 1..];
     }
-    out.push_str(rest);
     Ok(out)
 }
 
+/// Whether a word token is an `{$NAME}` environment placeholder.
+fn is_env_token(word: &str) -> bool {
+    word.starts_with("{$") && word.ends_with('}') && word.len() >= 4
+}
+
+/// Expand environment variables in a config's raw text (spec §5.12): every
 /// Expand `import` statements and collect `(name)` snippets in a token stream
 /// (spec §5.12). Snippet definitions at the top level are captured and removed;
 /// an `import <target>` at any nesting level is replaced by the snippet's tokens
@@ -156,13 +166,19 @@ fn expand_imports(
                     if let Some(snippet) = snippets.get(target).cloned() {
                         out.extend(snippet);
                     } else {
+                        if stack.len() >= MAX_IMPORT_DEPTH {
+                            return Err(format!(
+                                "import nesting exceeds {MAX_IMPORT_DEPTH} levels"
+                            ));
+                        }
                         let (imported_path, imported_text) = read_imported(file, target)?;
                         if stack.contains(&imported_path) {
                             return Err(format!("import cycle involving {imported_path}"));
                         }
                         stack.push(imported_path.clone());
-                        let expanded = expand_env(&imported_text)?;
-                        let imported_tokens = lex(&expanded)
+                        let imported_tokens = lex(&imported_text)
+                            .map_err(|message| format!("{imported_path}: {message}"))?;
+                        let imported_tokens = expand_env_tokens(imported_tokens)
                             .map_err(|message| format!("{imported_path}: {message}"))?;
                         out.extend(expand_imports(
                             &imported_path,
@@ -185,20 +201,32 @@ fn expand_imports(
 }
 
 /// Read an imported file (spec §5.12), resolving `target` relative to `file`'s
-/// directory, bounded to [`MAX_IMPORT_BYTES`].
+/// directory. The path is canonicalized (so `./a` and `././a` are the same file
+/// for cycle detection) and the read is bounded to [`MAX_IMPORT_BYTES`]; an
+/// oversized file is an error, never a silent truncation (P2).
 fn read_imported(file: &str, target: &str) -> Result<(String, String), String> {
     use std::io::Read;
     let path = std::path::Path::new(file)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(target);
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("failed to read imported file {}: {e}", path.display()))?;
     let mut content = String::new();
-    let f = std::fs::File::open(&path)
-        .map_err(|e| format!("failed to read imported file {}: {e}", path.display()))?;
-    f.take(MAX_IMPORT_BYTES)
+    let f = std::fs::File::open(&canonical)
+        .map_err(|e| format!("failed to read imported file {}: {e}", canonical.display()))?;
+    let bytes = f
+        .take(MAX_IMPORT_BYTES + 1)
         .read_to_string(&mut content)
-        .map_err(|e| format!("failed to read imported file {}: {e}", path.display()))?;
-    Ok((path.display().to_string(), content))
+        .map_err(|e| format!("failed to read imported file {}: {e}", canonical.display()))?;
+    if bytes as u64 > MAX_IMPORT_BYTES {
+        return Err(format!(
+            "imported file {} exceeds the {} byte limit",
+            canonical.display(),
+            MAX_IMPORT_BYTES
+        ));
+    }
+    Ok((canonical.display().to_string(), content))
 }
 
 /// The word content of a token (assumed to be a `Word`).
@@ -1000,9 +1028,37 @@ impl<'a> Parser<'a> {
         ) {
             return Ok(None);
         }
+        // `remote_ip` consumes one or more CIDRs (spec §5.9), so it is parsed
+        // before the fixed-arity path.
+        if kind == "remote_ip" {
+            if tokens.len() < 2 {
+                return Err(self.err("matcher 'remote_ip' is missing arguments"));
+            }
+            let mut cidrs = Vec::new();
+            let mut k = 1;
+            while k < tokens.len() {
+                match Cidr::parse(&tokens[k]) {
+                    Ok(cidr) => {
+                        cidrs.push(cidr);
+                        k += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if cidrs.is_empty() {
+                return Err(self.err("matcher 'remote_ip' requires at least one CIDR"));
+            }
+            let matcher = Matcher::RemoteIp(cidrs);
+            let matcher = if negated {
+                Matcher::Not(Box::new(matcher))
+            } else {
+                matcher
+            };
+            return Ok(Some((matcher, k)));
+        }
         // Validate arity before indexing `tokens` below.
         let arity = match kind {
-            "path" | "host" | "method" | "remote_ip" | "protocol" => 1,
+            "path" | "host" | "method" | "protocol" => 1,
             "header" | "query" => 2,
             _ => unreachable!("matcher keyword checked above"),
         };
@@ -1021,9 +1077,6 @@ impl<'a> Parser<'a> {
                 key: tokens[1].clone(),
                 value: tokens[2].clone(),
             },
-            "remote_ip" => {
-                Matcher::RemoteIp(Cidr::parse(&tokens[1]).map_err(|message| self.err(message))?)
-            }
             "protocol" => Matcher::Protocol(match tokens[1].as_str() {
                 "http" => Protocol::Http,
                 "https" => Protocol::Https,
@@ -1062,34 +1115,37 @@ impl<'a> Parser<'a> {
         Ok(Directive::Rewrite { to })
     }
 
-    /// Parse `respond <status> [<body>]` (terminal, spec §5.9).
+    /// Parse `respond <matcher> <status> [<body>]` (terminal, spec §5.9).
     fn parse_respond(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
         if block_open {
             return Err(self.err("unexpected '{' after respond"));
         }
-        if !(2..=3).contains(&words.len()) {
-            return Err(self.err("respond expects: respond <status> [<body>]"));
+        let (matcher, rest) = self.parse_matchers(&words[1..])?;
+        if !(1..=2).contains(&rest.len()) {
+            return Err(self.err("respond expects: respond <matcher> <status> [<body>]"));
         }
-        let status = words[1]
+        let status = rest[0]
             .parse::<u16>()
-            .map_err(|_| self.err(format!("invalid respond status '{}'", words[1])))?;
+            .map_err(|_| self.err(format!("invalid respond status '{}'", rest[0])))?;
         if !(100..=599).contains(&status) {
             return Err(self.err("respond status must be between 100 and 599"));
         }
         Ok(Directive::Respond {
+            matcher,
             status,
-            body: words.get(2).cloned(),
+            body: rest.get(1).cloned(),
         })
     }
 
-    /// Parse `error [<status>] [<message>]` (terminal, spec §5.9).
+    /// Parse `error <matcher> [<status>] [<message>]` (terminal, spec §5.9).
     fn parse_error(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
         if block_open {
             return Err(self.err("unexpected '{' after error"));
         }
+        let (matcher, rest) = self.parse_matchers(&words[1..])?;
         let mut status = None;
         let mut message = None;
-        for arg in &words[1..] {
+        for arg in rest {
             if let Ok(code) = arg.parse::<u16>() {
                 if status.is_some() {
                     return Err(self.err("duplicate error status"));
@@ -1105,7 +1161,11 @@ impl<'a> Parser<'a> {
                 message = Some(arg.clone());
             }
         }
-        Ok(Directive::Error { status, message })
+        Ok(Directive::Error {
+            matcher,
+            status,
+            message,
+        })
     }
 
     /// Parse `basic_auth <user> <bcrypt-hash>` (guard, spec §5.10).
@@ -2119,7 +2179,12 @@ mod tests {
         assert!(matches!(directives[0], Directive::HandlePath { .. }));
         assert!(matches!(directives[1], Directive::Rewrite { .. }));
         match &directives[2] {
-            Directive::Respond { status, body } => {
+            Directive::Respond {
+                matcher,
+                status,
+                body,
+            } => {
+                assert!(matcher.is_empty());
                 assert_eq!(*status, 200);
                 assert_eq!(body.as_deref(), Some("ok"));
             }
@@ -2233,5 +2298,56 @@ mod tests {
         let input = ":8080 {\n    access_log off\n    reverse_proxy 127.0.0.1:9000\n}\n";
         let rf = parse("test", input).unwrap();
         assert!(matches!(rf.sites[0].directives[0], Directive::AccessLogOff));
+    }
+
+    #[test]
+    fn remote_ip_matcher_accepts_multiple_cidrs() {
+        let input = ":8080 {\n    handle remote_ip 10.0.0.0/8 192.168.0.0/16 {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Handle { matcher, .. } => {
+                assert!(matches!(
+                    matcher.as_slice(),
+                    [Matcher::RemoteIp(cidrs)] if cidrs.len() == 2
+                ));
+            }
+            other => panic!("expected handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn respond_accepts_inline_matcher() {
+        let input = ":8080 {\n    respond path /health 200 ok\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Respond {
+                matcher,
+                status,
+                body,
+            } => {
+                assert_eq!(matcher.len(), 1);
+                assert_eq!(*status, 200);
+                assert_eq!(body.as_deref(), Some("ok"));
+            }
+            other => panic!("expected respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_cycle_is_detected_via_canonical_path() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("raddy_cycle_a_{}.Raddyfile", std::process::id()));
+        let b = dir.join(format!("raddy_cycle_b_{}.Raddyfile", std::process::id()));
+        let a_name = a.file_name().unwrap().to_str().unwrap().to_string();
+        let b_name = b.file_name().unwrap().to_str().unwrap().to_string();
+        // Textually different `./` prefixes still canonicalize to the same file,
+        // so the cycle must be caught (P2).
+        std::fs::write(&a, format!("import ./{b_name}\n")).unwrap();
+        std::fs::write(&b, format!("import ././{a_name}\n")).unwrap();
+        let input = format!(":8080 {{\n    import {}\n}}\n", a.display());
+        let err = parse("test", &input).unwrap_err();
+        assert!(err.to_string().contains("import cycle"), "err: {err}");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 }

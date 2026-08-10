@@ -46,6 +46,7 @@ pub async fn serve(
     path: &str,
     encode: &[Encoding],
     modifiers: &[Modifier],
+    bytes_written: &mut usize,
 ) -> Result<()> {
     // Only GET and HEAD are served.
     let method = session.req_header().method.clone();
@@ -225,10 +226,14 @@ pub async fn serve(
                     Error::because(InternalError, "response compression failed", e)
                 })?);
             }
+            // Count the compressed bytes actually sent (the access-log `%b`,
+            // spec §5.13).
+            *bytes_written += out.len();
             session
                 .write_response_body(Some(Bytes::from(out)), last)
                 .await?;
         } else {
+            *bytes_written += n;
             session
                 .write_response_body(Some(Bytes::copy_from_slice(raw)), last)
                 .await?;

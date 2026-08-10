@@ -157,8 +157,12 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                 });
             }
             Directive::Rewrite { to } => modifiers.push(Modifier::Rewrite { to: to.clone() }),
-            Directive::Respond { status, body } => terminals.push(Terminal {
-                matchers: Vec::new(),
+            Directive::Respond {
+                matcher,
+                status,
+                body,
+            } => terminals.push(Terminal {
+                matchers: matcher.clone(),
                 kind: TerminalKind::Respond {
                     status: *status,
                     body: body.clone(),
@@ -166,8 +170,12 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                 modifiers: Vec::new(),
                 strip_prefix: None,
             }),
-            Directive::Error { status, message } => terminals.push(Terminal {
-                matchers: Vec::new(),
+            Directive::Error {
+                matcher,
+                status,
+                message,
+            } => terminals.push(Terminal {
+                matchers: matcher.clone(),
                 kind: TerminalKind::Error {
                     status: status.unwrap_or(500),
                     message: message.clone(),
@@ -298,24 +306,40 @@ fn compile_handle_block(
                     strip_prefix: strip_prefix.clone(),
                 });
             }
-            Directive::Respond { status, body } => block_terminals.push(Terminal {
-                matchers: matcher.to_vec(),
-                kind: TerminalKind::Respond {
-                    status: *status,
-                    body: body.clone(),
-                },
-                modifiers: Vec::new(),
-                strip_prefix: strip_prefix.clone(),
-            }),
-            Directive::Error { status, message } => block_terminals.push(Terminal {
-                matchers: matcher.to_vec(),
-                kind: TerminalKind::Error {
-                    status: status.unwrap_or(500),
-                    message: message.clone(),
-                },
-                modifiers: Vec::new(),
-                strip_prefix: strip_prefix.clone(),
-            }),
+            Directive::Respond {
+                matcher: inline,
+                status,
+                body,
+            } => {
+                let mut matchers = matcher.to_vec();
+                matchers.extend(inline.iter().cloned());
+                block_terminals.push(Terminal {
+                    matchers,
+                    kind: TerminalKind::Respond {
+                        status: *status,
+                        body: body.clone(),
+                    },
+                    modifiers: Vec::new(),
+                    strip_prefix: strip_prefix.clone(),
+                });
+            }
+            Directive::Error {
+                matcher: inline,
+                status,
+                message,
+            } => {
+                let mut matchers = matcher.to_vec();
+                matchers.extend(inline.iter().cloned());
+                block_terminals.push(Terminal {
+                    matchers,
+                    kind: TerminalKind::Error {
+                        status: status.unwrap_or(500),
+                        message: message.clone(),
+                    },
+                    modifiers: Vec::new(),
+                    strip_prefix: strip_prefix.clone(),
+                });
+            }
             Directive::Rewrite { to } => {
                 scoped_modifiers.push(Modifier::Rewrite { to: to.clone() })
             }

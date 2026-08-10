@@ -397,14 +397,16 @@ pub enum Directive {
     Rewrite {
         to: ValueTemplate,
     },
-    /// `respond <status> [<body>]` — answer directly (terminal, spec §5.9).
+    /// `respond <matcher> <status> [<body>]` — answer directly (terminal, §5.9).
     Respond {
+        matcher: Vec<Matcher>,
         status: u16,
         body: Option<String>,
     },
-    /// `error [<status>] [<message>]` — trigger the internal error response
-    /// (terminal, spec §5.9).
+    /// `error <matcher> [<status>] [<message>]` — trigger the internal error
+    /// response (terminal, §5.9).
     Error {
+        matcher: Vec<Matcher>,
         status: Option<u16>,
         message: Option<String>,
     },
@@ -542,8 +544,9 @@ pub enum Matcher {
     Header { name: String, value: String },
     /// `query <key> <value>` — a query parameter `key` equals `value`.
     Query { key: String, value: String },
-    /// `remote_ip <cidr>` — the real client IP (spec §4) is within the network.
-    RemoteIp(Cidr),
+    /// `remote_ip <cidr>...` — the real client IP (spec §4) is within any of
+    /// the listed networks.
+    RemoteIp(Vec<Cidr>),
     /// `protocol <http|https>` — the transport of the receiving listener.
     Protocol(Protocol),
     /// `!<term>` — negates a matcher term.

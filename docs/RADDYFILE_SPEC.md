@@ -403,13 +403,17 @@ api.example.com {
     handle_path /api/* {
         reverse_proxy 127.0.0.1:8080
     }
-    handle (path /status && method GET) {
+    handle path /status method GET {
         respond 200 ok
     }
     rewrite /app/{uri}
     reverse_proxy 127.0.0.1:9000
 }
 ```
+
+> Matcher terms are space-separated and ANDed — there are no parentheses or `&&`
+> operators (`handle path /status method GET`, not `handle (path /status && method GET)`).
+> Matchers also attach to `reverse_proxy`, `respond`, and `error` the same way.
 
 ### 5.10 `basic_auth` / `forward_auth`
 

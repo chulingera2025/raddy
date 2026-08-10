@@ -289,6 +289,10 @@ impl ProxyHttp for ProxyHandler {
                 // value; requests that fail before a site is selected
                 // (ACME/400/404) fall back to the TCP peer.
                 ctx.effective_client_ip = client_ip(session, &trusted);
+                // The site is recorded for every terminal (and the within-site
+                // 404), so `access_log off` (spec §5.13) excludes redir,
+                // file_server, respond, and error requests too (P2).
+                ctx.site_key = Some(site.key.clone());
                 for (index, terminal) in site.terminals.iter().enumerate() {
                     if !matchers_match(&terminal.matchers, session, ctx.effective_client_ip, is_tls)
                     {
@@ -357,7 +361,6 @@ impl ProxyHttp for ProxyHandler {
                             health_check,
                             tls,
                         } => {
-                            ctx.site_key = Some(site.key.clone());
                             ctx.terminal_index = index;
                             ctx.lb_spec = Some(LbSpec {
                                 upstreams: upstreams.clone(),
@@ -379,6 +382,7 @@ impl ProxyHttp for ProxyHandler {
                                 &serve_path,
                                 &encode,
                                 &modifiers,
+                                &mut ctx.response_bytes,
                             )
                             .await?;
                             return Ok(true);
@@ -393,6 +397,7 @@ impl ProxyHttp for ProxyHandler {
                                     )?;
                                     apply_header_down(&modifiers, session, &mut resp);
                                     session.write_response_header(Box::new(resp), false).await?;
+                                    ctx.response_bytes += body.len();
                                     session
                                         .write_response_body(Some(Bytes::from(body.clone())), true)
                                         .await?;
@@ -416,6 +421,7 @@ impl ProxyHttp for ProxyHandler {
                                     )?;
                                     apply_header_down(&modifiers, session, &mut resp);
                                     session.write_response_header(Box::new(resp), false).await?;
+                                    ctx.response_bytes += body.len();
                                     session.write_response_body(Some(body), true).await?;
                                 }
                                 None => {
@@ -1014,7 +1020,9 @@ fn matcher_matches(
         Matcher::Query { key, value } => {
             query_value(session, key).is_some_and(|v| v == value.as_str())
         }
-        Matcher::RemoteIp(cidr) => ip.is_some_and(|addr| cidr.contains(addr)),
+        Matcher::RemoteIp(cidrs) => {
+            ip.is_some_and(|addr| cidrs.iter().any(|cidr| cidr.contains(addr)))
+        }
         Matcher::Protocol(protocol) => match protocol {
             crate::config::ast::Protocol::Http => !is_tls,
             crate::config::ast::Protocol::Https => is_tls,

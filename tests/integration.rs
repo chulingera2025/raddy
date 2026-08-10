@@ -1457,6 +1457,20 @@ fn env_vars_expand_in_config() {
 }
 
 #[test]
+fn env_var_with_special_chars_is_a_single_argument() {
+    // Token-level {$ENV} expansion (spec §5.12, P2): a value containing spaces
+    // and `#` is one directive argument — it cannot turn into a comment or
+    // split into multiple arguments.
+    let raddy = RadRaddy::spawn_with_env(
+        |port| format!(":{port} {{\n    respond 200 {{$BODY}}\n}}\n"),
+        &[("BODY", "hello # world")],
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "hello # world");
+}
+
+#[test]
 fn file_import_splices_site_directives() {
     let (up_port, _up) = EchoUpstream::spawn("imported");
     let imported = std::env::temp_dir().join(format!(
@@ -1530,6 +1544,31 @@ fn access_log_off_skips_a_site() {
     assert!(
         !content.contains("\"status\":200"),
         "access_log off must skip the site: {content}"
+    );
+    let _ = std::fs::remove_file(&log_path);
+}
+
+#[test]
+fn access_log_off_excludes_respond_terminal() {
+    // `access_log off` also excludes non-proxy terminals (respond/error/redir/
+    // file_server) from the log (P2), and their bodies are counted.
+    let log_path = std::env::temp_dir().join(format!(
+        "raddy_access_off_respond_{}.log",
+        std::process::id()
+    ));
+    let args = vec![String::from("--access-log"), log_path.display().to_string()];
+    let raddy = RadRaddy::spawn_with_args(
+        |port| format!(":{port} {{\n    access_log off\n    respond 200 hello-world\n}}\n"),
+        &args,
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "hello-world");
+    thread::sleep(Duration::from_millis(300));
+    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !content.contains("\"status\":200"),
+        "an off respond site must not be logged: {content}"
     );
     let _ = std::fs::remove_file(&log_path);
 }
