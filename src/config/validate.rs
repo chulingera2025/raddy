@@ -96,22 +96,28 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                 tls,
             } => terminals.push(compile_reverse_proxy_terminal(
                 file,
-                matcher.as_ref(),
+                matcher.clone(),
                 None,
                 to,
                 *lb_policy,
                 *health_check,
                 tls,
             )?),
-            Directive::Handle { path, directives } => {
-                compile_handle_block(file, path, directives, &mut terminals)?
-            }
+            Directive::Handle {
+                matcher,
+                directives,
+            } => compile_handle_block(file, matcher, false, directives, &mut terminals)?,
+            Directive::HandlePath {
+                matcher,
+                directives,
+            } => compile_handle_block(file, matcher, true, directives, &mut terminals)?,
             Directive::FileServer => terminals.push(Terminal {
                 matchers: Vec::new(),
                 kind: TerminalKind::FileServer {
                     root: String::new(),
                 },
                 modifiers: Vec::new(),
+                strip_prefix: None,
             }),
             Directive::Root { path } => roots.push(path.clone()),
             Directive::HeaderUp { name, value } => {
@@ -141,8 +147,28 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                     matchers: Vec::new(),
                     kind: TerminalKind::Redir { to, code: *code },
                     modifiers: Vec::new(),
+                    strip_prefix: None,
                 });
             }
+            Directive::Rewrite { to } => modifiers.push(Modifier::Rewrite { to: to.clone() }),
+            Directive::Respond { status, body } => terminals.push(Terminal {
+                matchers: Vec::new(),
+                kind: TerminalKind::Respond {
+                    status: *status,
+                    body: body.clone(),
+                },
+                modifiers: Vec::new(),
+                strip_prefix: None,
+            }),
+            Directive::Error { status, message } => terminals.push(Terminal {
+                matchers: Vec::new(),
+                kind: TerminalKind::Error {
+                    status: status.unwrap_or(500),
+                    message: message.clone(),
+                },
+                modifiers: Vec::new(),
+                strip_prefix: None,
+            }),
             Directive::TrustedProxies { networks } => {
                 // Last occurrence wins (same as the global block).
                 site_trusted = Some(networks.clone());
@@ -182,19 +208,28 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
     })
 }
 
-/// Compile the directives inside a `handle` block.
+/// Compile the directives inside a `handle` (or `handle_path`) block.
 ///
-/// Every terminal inherits the handle's path matcher and the block's own
-/// modifiers. The returned terminals already carry their handle-scoped
-/// modifiers; block-level modifiers are appended later in [`compile_site`].
+/// Every terminal inherits the block's matchers (spec §5.9); a `handle_path`
+/// block additionally strips the matched path prefix before its terminal
+/// serves. The returned terminals already carry their handle-scoped modifiers;
+/// block-level modifiers are appended later in [`compile_site`].
 fn compile_handle_block(
     file: &str,
-    path: &str,
+    matcher: &[Matcher],
+    strip: bool,
     directives: &[Directive],
     out: &mut Vec<Terminal>,
 ) -> Result<(), ConfigError> {
-    let path_matcher = PathMatcher {
-        prefix: crate::config::parser::strip_matcher_wildcard(path).to_string(),
+    // The path prefix a `handle_path` block strips (the first `path` matcher;
+    // a handle_path with no path matcher strips nothing).
+    let strip_prefix = if strip {
+        matcher.iter().find_map(|m| match m {
+            Matcher::Path(prefix) => Some(prefix.clone()),
+            _ => None,
+        })
+    } else {
+        None
     };
     let mut scoped_modifiers: Vec<Modifier> = Vec::new();
     let mut roots: Vec<String> = Vec::new();
@@ -203,35 +238,62 @@ fn compile_handle_block(
     for directive in directives {
         match directive {
             Directive::ReverseProxy {
-                matcher,
+                matcher: inline,
                 to,
                 lb_policy,
                 health_check,
                 tls,
-            } => block_terminals.push(compile_reverse_proxy_terminal(
-                file,
-                matcher.as_ref(),
-                Some(&path_matcher),
-                to,
-                *lb_policy,
-                *health_check,
-                tls,
-            )?),
+            } => {
+                let mut matchers = matcher.to_vec();
+                matchers.extend(inline.iter().cloned());
+                block_terminals.push(compile_reverse_proxy_terminal(
+                    file,
+                    matchers,
+                    strip_prefix.clone(),
+                    to,
+                    *lb_policy,
+                    *health_check,
+                    tls,
+                )?);
+            }
             Directive::FileServer => block_terminals.push(Terminal {
-                matchers: vec![path_matcher.clone()],
+                matchers: matcher.to_vec(),
                 kind: TerminalKind::FileServer {
                     root: String::new(),
                 },
                 modifiers: Vec::new(),
+                strip_prefix: strip_prefix.clone(),
             }),
             Directive::Redir { to, code } => {
                 let to =
                     ValueTemplate::parse(to).map_err(|message| validate_error(file, message))?;
                 block_terminals.push(Terminal {
-                    matchers: vec![path_matcher.clone()],
+                    matchers: matcher.to_vec(),
                     kind: TerminalKind::Redir { to, code: *code },
                     modifiers: Vec::new(),
+                    strip_prefix: strip_prefix.clone(),
                 });
+            }
+            Directive::Respond { status, body } => block_terminals.push(Terminal {
+                matchers: matcher.to_vec(),
+                kind: TerminalKind::Respond {
+                    status: *status,
+                    body: body.clone(),
+                },
+                modifiers: Vec::new(),
+                strip_prefix: strip_prefix.clone(),
+            }),
+            Directive::Error { status, message } => block_terminals.push(Terminal {
+                matchers: matcher.to_vec(),
+                kind: TerminalKind::Error {
+                    status: status.unwrap_or(500),
+                    message: message.clone(),
+                },
+                modifiers: Vec::new(),
+                strip_prefix: strip_prefix.clone(),
+            }),
+            Directive::Rewrite { to } => {
+                scoped_modifiers.push(Modifier::Rewrite { to: to.clone() })
             }
             Directive::Root { path } => roots.push(path.clone()),
             Directive::HeaderUp { name, value } => {
@@ -269,7 +331,7 @@ fn compile_handle_block(
                     "tls is only allowed at the site-block level",
                 ));
             }
-            Directive::Handle { .. } => {
+            Directive::Handle { .. } | Directive::HandlePath { .. } => {
                 return Err(validate_error(
                     file,
                     "nested handle blocks are not supported in v0.1",
@@ -309,8 +371,8 @@ fn compile_handle_block(
 /// block's TLS sub-directives.
 fn compile_reverse_proxy_terminal(
     file: &str,
-    matcher: Option<&PathMatcher>,
-    handle_path_matcher: Option<&PathMatcher>,
+    matchers: Vec<Matcher>,
+    strip_prefix: Option<String>,
     to: &[Upstream],
     lb_policy: LbPolicy,
     health_check: Option<HealthCheckSpec>,
@@ -318,14 +380,6 @@ fn compile_reverse_proxy_terminal(
 ) -> Result<Terminal, ConfigError> {
     let upstreams = resolve_upstreams(file, to, resolve_host)?;
     let tls = build_upstream_tls(file, tls, to.iter().any(|u| u.tls))?;
-    // The `handle_path` prefix matcher (if any) comes before the inline matcher.
-    let mut matchers = Vec::with_capacity(2);
-    if let Some(m) = handle_path_matcher {
-        matchers.push(m.clone());
-    }
-    if let Some(m) = matcher {
-        matchers.push(m.clone());
-    }
     Ok(Terminal {
         matchers,
         kind: TerminalKind::ReverseProxy {
@@ -335,6 +389,7 @@ fn compile_reverse_proxy_terminal(
             tls,
         },
         modifiers: Vec::new(),
+        strip_prefix,
     })
 }
 

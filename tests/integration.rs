@@ -297,6 +297,64 @@ impl Drop for UpgradeEchoUpstream {
     }
 }
 
+/// An upstream that answers `path=<request path>`, so tests can assert what
+/// path a `handle_path` strip or `rewrite` produced (spec §5.9).
+struct PathEchoUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PathEchoUpstream {
+    fn spawn() -> (u16, PathEchoUpstream) {
+        let (port, listener) = bind_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 8192];
+                    if stream.read(&mut buf).is_err() {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let body = format!("path={path}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (
+            port,
+            PathEchoUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for PathEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// An upstream that keeps connections alive (no `Connection: close`) and counts
 /// *distinct* connections, so a client can assert connection reuse across
 /// requests and reloads.
@@ -1080,6 +1138,93 @@ fn h2_negotiated_on_tls_listener() {
         tls_negotiated_alpn(raddy.port(), "localhost").as_deref(),
         Some("h2")
     );
+}
+
+#[test]
+fn method_matcher_routes_requests() {
+    // A `method` matcher (spec §5.9) routes by request method within one site.
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, _b) = EchoUpstream::spawn("B");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle method GET {{\n        reverse_proxy 127.0.0.1:{a_port}\n    }}\n    handle method POST {{\n        reverse_proxy 127.0.0.1:{b_port}\n    }}\n}}\n"
+        )
+    });
+    let get = send_request_method("GET", raddy.port(), Some("localhost"), "/", &[]);
+    assert_eq!(get.status, 200);
+    assert_eq!(get.body, "label=A");
+    let post = send_request_method("POST", raddy.port(), Some("localhost"), "/", &[]);
+    assert_eq!(post.status, 200);
+    assert_eq!(post.body, "label=B");
+}
+
+#[test]
+fn host_matcher_selects_within_catch_all() {
+    // A `host` matcher routes by the normalized Host header inside a catch-all.
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, _b) = EchoUpstream::spawn("B");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle host api.example.com {{\n        reverse_proxy 127.0.0.1:{a_port}\n    }}\n    handle host www.example.com {{\n        reverse_proxy 127.0.0.1:{b_port}\n    }}\n}}\n"
+        )
+    });
+    let api = send_request(raddy.port(), Some("api.example.com"), "/");
+    assert_eq!(api.body, "label=A");
+    let www = send_request(raddy.port(), Some("www.example.com"), "/");
+    assert_eq!(www.body, "label=B");
+}
+
+#[test]
+fn respond_terminal_answers_directly() {
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle path /health {{\n        respond 200 ok\n    }}\n    reverse_proxy 127.0.0.1:1\n}}\n"
+        )
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/health");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "ok");
+    // A path outside the handle falls through to the reverse proxy (dead
+    // upstream → 502), proving the handle is mutually exclusive.
+    let resp = send_request(raddy.port(), Some("localhost"), "/other");
+    assert_eq!(resp.status, 502);
+}
+
+#[test]
+fn error_terminal_returns_status() {
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle path /boom {{\n        error 503\n    }}\n    reverse_proxy 127.0.0.1:1\n}}\n"
+        )
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/boom");
+    assert_eq!(resp.status, 503);
+}
+
+#[test]
+fn handle_path_strips_prefix() {
+    // `handle_path /api/*` strips the prefix before the upstream sees it.
+    let (up_port, _up) = PathEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle_path /api/* {{\n        reverse_proxy 127.0.0.1:{up_port}\n    }}\n    reverse_proxy 127.0.0.1:1\n}}\n"
+        )
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/api/users/1");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "path=/users/1");
+}
+
+#[test]
+fn rewrite_modifier_changes_path() {
+    // A `rewrite` modifier (spec §5.9) transforms the path the upstream sees.
+    let (up_port, _up) = PathEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(":{port} {{\n    rewrite /v1{{uri}}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n")
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/x");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "path=/v1/x");
 }
 
 #[test]

@@ -117,6 +117,10 @@ pub struct ProxyCtx {
     /// fail before a site is selected (ACME/400/404) or when the peer address is
     /// unavailable — callers then fall back to the TCP peer.
     effective_client_ip: Option<IpAddr>,
+    /// The request path the selected terminal serves, after any `handle_path`
+    /// prefix strip and `rewrite` modifiers (spec §5.9). `None` until a
+    /// reverse-proxy terminal is selected (only forwarding needs it).
+    serve_path: Option<String>,
 }
 
 #[async_trait]
@@ -162,18 +166,20 @@ impl ProxyHttp for ProxyHandler {
             site::Selection::Site(site) => {
                 // Owned so a mutable session borrow can coexist while matching.
                 let path = request_path(session).to_string();
+                let is_tls = session_is_tls(session);
                 // Site-scoped `trusted_proxies` override the global list (§4).
                 let trusted: Vec<Cidr> = match &site.trusted_proxies {
                     Some(networks) => networks.clone(),
                     None => config.global.trusted_proxies.clone(),
                 };
                 // Resolve the effective client IP once per site (§4). rate_limit,
-                // `ip_hash`, and the access log all consume this same value;
-                // requests that fail before a site is selected (ACME/400/404)
-                // fall back to the TCP peer.
+                // `ip_hash`, matchers, and the access log all consume this same
+                // value; requests that fail before a site is selected
+                // (ACME/400/404) fall back to the TCP peer.
                 ctx.effective_client_ip = client_ip(session, &trusted);
                 for (index, terminal) in site.terminals.iter().enumerate() {
-                    if !matchers_match(&terminal.matchers, &path) {
+                    if !matchers_match(&terminal.matchers, session, ctx.effective_client_ip, is_tls)
+                    {
                         continue;
                     }
                     // Effective modifiers: block-level then terminal-scoped
@@ -193,6 +199,11 @@ impl ProxyHttp for ProxyHandler {
                             }
                         }
                     }
+                    // The effective request path the terminal serves: `handle_path`
+                    // strips its matched prefix, then `rewrite` modifiers
+                    // transform the path (spec §5.9).
+                    let serve_path =
+                        serving_path(terminal.strip_prefix.as_deref(), &modifiers, &path, session);
                     match &terminal.kind {
                         TerminalKind::Redir { to, code } => {
                             let location = expand_template(to, session);
@@ -222,13 +233,61 @@ impl ProxyHttp for ProxyHandler {
                             ctx.tls = tls.clone();
                             ctx.modifiers = modifiers;
                             ctx.encode_algos = encode_algos(&ctx.modifiers);
+                            ctx.serve_path = Some(serve_path);
                             // Continue to upstream_peer for forwarding.
                             return Ok(false);
                         }
                         TerminalKind::FileServer { root } => {
                             let encode = encode_algos(&modifiers);
-                            crate::proxy::fs::serve(session, root, &path, &encode, &modifiers)
-                                .await?;
+                            crate::proxy::fs::serve(
+                                session,
+                                root,
+                                &serve_path,
+                                &encode,
+                                &modifiers,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                        TerminalKind::Respond { status, body } => {
+                            let mut resp = ResponseHeader::build(*status, None)?;
+                            match body {
+                                Some(body) => {
+                                    resp.insert_header(
+                                        http::header::CONTENT_LENGTH,
+                                        body.len().to_string(),
+                                    )?;
+                                    apply_header_down(&modifiers, session, &mut resp);
+                                    session.write_response_header(Box::new(resp), false).await?;
+                                    session
+                                        .write_response_body(Some(Bytes::from(body.clone())), true)
+                                        .await?;
+                                }
+                                None => {
+                                    resp.insert_header(http::header::CONTENT_LENGTH, "0")?;
+                                    apply_header_down(&modifiers, session, &mut resp);
+                                    session.write_response_header(Box::new(resp), true).await?;
+                                }
+                            }
+                            return Ok(true);
+                        }
+                        TerminalKind::Error { status, message } => {
+                            match message {
+                                Some(message) => {
+                                    let body = Bytes::from(message.clone());
+                                    let mut resp = ResponseHeader::build(*status, None)?;
+                                    resp.insert_header(
+                                        http::header::CONTENT_LENGTH,
+                                        body.len().to_string(),
+                                    )?;
+                                    apply_header_down(&modifiers, session, &mut resp);
+                                    session.write_response_header(Box::new(resp), false).await?;
+                                    session.write_response_body(Some(body), true).await?;
+                                }
+                                None => {
+                                    session.respond_error(*status).await?;
+                                }
+                            }
                             return Ok(true);
                         }
                     }
@@ -301,6 +360,22 @@ impl ProxyHttp for ProxyHandler {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Path rewrite (spec §5.9): the request may have been transformed by a
+        // `handle_path` prefix strip or a `rewrite` modifier; rebuild the
+        // upstream URI so the backend sees the effective path.
+        if let Some(serve_path) = &ctx.serve_path {
+            if serve_path != session.req_header().uri.path() {
+                let path_and_query = match session.req_header().uri.query() {
+                    Some(query) if !query.is_empty() && !serve_path.contains('?') => {
+                        format!("{serve_path}?{query}")
+                    }
+                    _ => serve_path.clone(),
+                };
+                if let Ok(uri) = http::Uri::from_maybe_shared(path_and_query) {
+                    upstream_request.uri = uri;
+                }
+            }
+        }
         let ops = header_ops(&ctx.modifiers, true, session);
         apply_header_ops(&ops, |name, value| {
             let _ = upstream_request.insert_header(name, value);
@@ -533,11 +608,114 @@ fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[Cidr]) -> IpAdd
     peer
 }
 
-/// All matchers must match for a terminal to serve (ADR-012).
-fn matchers_match(matchers: &[crate::config::ast::PathMatcher], path: &str) -> bool {
+/// All matchers must match for a terminal to serve (spec §5.9, ADR-012).
+fn matchers_match(
+    matchers: &[crate::config::ast::Matcher],
+    session: &Session,
+    ip: Option<IpAddr>,
+    is_tls: bool,
+) -> bool {
     matchers
         .iter()
-        .all(|matcher| path_matches(&matcher.prefix, path))
+        .all(|matcher| matcher_matches(matcher, session, ip, is_tls))
+}
+
+/// Evaluate a single matcher term against the request (spec §5.9).
+fn matcher_matches(
+    matcher: &crate::config::ast::Matcher,
+    session: &Session,
+    ip: Option<IpAddr>,
+    is_tls: bool,
+) -> bool {
+    use crate::config::ast::Matcher;
+    match matcher {
+        Matcher::Path(prefix) => path_matches(prefix, request_path(session)),
+        Matcher::Host(host) => normalized_host(session) == host.as_str(),
+        Matcher::Method(method) => session.req_header().method.as_str() == method.as_str(),
+        Matcher::Header { name, value } => session
+            .req_header()
+            .headers
+            .get(name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == value.as_str()),
+        Matcher::Query { key, value } => {
+            query_value(session, key).is_some_and(|v| v == value.as_str())
+        }
+        Matcher::RemoteIp(cidr) => ip.is_some_and(|addr| cidr.contains(addr)),
+        Matcher::Protocol(protocol) => match protocol {
+            crate::config::ast::Protocol::Http => !is_tls,
+            crate::config::ast::Protocol::Https => is_tls,
+        },
+        Matcher::Not(inner) => !matcher_matches(inner, session, ip, is_tls),
+    }
+}
+
+/// The normalized Host header (port stripped, trailing dot stripped,
+/// ASCII-lowercased) — the same normalization site selection applies.
+fn normalized_host(session: &Session) -> String {
+    let host = host_header(session).unwrap_or_default();
+    let host = match host.iter().position(|&b| b == b':') {
+        Some(i) => &host[..i],
+        None => host,
+    };
+    let host = if host.last() == Some(&b'.') {
+        &host[..host.len() - 1]
+    } else {
+        host
+    };
+    String::from_utf8_lossy(host).to_ascii_lowercase()
+}
+
+/// The value of a query parameter (raw, not percent-decoded).
+fn query_value(session: &Session, key: &str) -> Option<String> {
+    let query = session.req_header().uri.query()?;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Whether the request arrived over TLS (the `protocol` matcher input).
+fn session_is_tls(session: &Session) -> bool {
+    session
+        .digest()
+        .is_some_and(|digest| digest.ssl_digest.is_some())
+}
+
+/// The effective request path a terminal serves: `handle_path` strips its
+/// matched prefix, then `rewrite` modifiers replace the path (spec §5.9).
+fn serving_path(
+    strip_prefix: Option<&str>,
+    modifiers: &[Modifier],
+    path: &str,
+    session: &Session,
+) -> String {
+    let mut out = path.to_string();
+    if let Some(prefix) = strip_prefix {
+        if let Some(stripped) = strip_path_prefix(prefix, &out) {
+            out = stripped;
+        }
+    }
+    for modifier in modifiers {
+        if let Modifier::Rewrite { to } = modifier {
+            out = expand_template(to, session);
+        }
+    }
+    out
+}
+
+/// Strip a matched path prefix (`/api` → `/` for `/api`; `/api/users` →
+/// `/users`); returns `None` when `path` is not under `prefix`.
+fn strip_path_prefix(prefix: &str, path: &str) -> Option<String> {
+    if prefix == "/" || path == prefix {
+        return Some("/".to_string());
+    }
+    path.strip_prefix(prefix)
+        .filter(|rest| rest.starts_with('/'))
+        .map(|rest| rest.to_string())
 }
 
 /// A prefix match: the request path equals the prefix or falls under it

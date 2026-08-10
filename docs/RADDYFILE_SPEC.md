@@ -121,10 +121,10 @@ trusted, so the default must be pinned down:
 | `dns_challenge` | `dns_challenge cloudflare <api_token>` — DNS-01 issuance via a DNS provider (Cloudflare today; see Section 5.3) | Available |
 | `tls_alpn_challenge` | prove control via TLS-ALPN-01 on port 443 instead of HTTP-01 (see Section 5.8) | Planned |
 | `tls` | per-site TLS source and options: `tls [<cert> <key> | internal]`, `min_version`, `max_version`, `ciphers`, `client_auth` (see Section 5.7) | Available |
-| `rewrite` | `rewrite <matcher> <to>` — rewrite the request URI before forwarding (modifier; see Section 5.9) | Planned |
-| `handle_path` | like `handle`, but strips the matched path prefix from the URI (see Section 5.9) | Planned |
-| `respond` | `respond <status> [<body>]` — answer directly with a status/body (terminal; see Section 5.9) | Planned |
-| `error` | `error [<status>] [<message>]` — trigger the internal error response (terminal; see Section 5.9) | Planned |
+| `rewrite` | `rewrite <to>` — rewrite the request URI before forwarding (modifier; see Section 5.9) | Available |
+| `handle_path` | like `handle`, but strips the matched path prefix from the URI (see Section 5.9) | Available |
+| `respond` | `respond <status> [<body>]` — answer directly with a status/body (terminal; see Section 5.9) | Available |
+| `error` | `error [<status>] [<message>]` — trigger the internal error response (terminal; see Section 5.9) | Available |
 | `basic_auth` | `basic_auth <user> <bcrypt-hash>` — HTTP Basic auth guard (see Section 5.10) | Planned |
 | `forward_auth` | `forward_auth <target>` — delegate auth to an upstream (see Section 5.10) | Planned |
 | `import` / `(name)` | `import <file|name>` multi-file includes / snippets (see Section 5.12) | Planned |
@@ -358,21 +358,23 @@ port 443 is reachable:
 
 ### 5.9 Matchers, `rewrite`, `handle_path`, `respond`, `error`
 
+**Status: Available.**
+
 **Matchers** generalize the path-only inline matcher. A matcher is a sequence of
 matcher terms; all terms must match (AND). A bare value starting with `/` is
 shorthand for `path`:
 
-- `path <glob>...` — the request path matches any glob (`*` within a segment,
-  `**` across segments). `path /api/*` — shorthand `handle /api/*`.
-- `host <host>...` — the normalized Host header equals any value (port stripped,
-  ASCII-lowercased).
-- `method <method>...` — the request method is one of the listed values (e.g.
-  `GET POST`).
-- `header <name> <value>` — request header `name` equals `value` (case-insensitive
-  name; exact value).
+- `path <prefix>` — the request path equals the prefix or falls under it
+  (`/api` matches `/api` and `/api/...`, not `/apix`). A trailing `*` is
+  stripped (`/api/*` ≡ `/api`); the prefix `/` matches every path.
+- `host <host>` — the normalized Host header (port stripped, trailing dot
+  stripped, ASCII-lowercased) equals the value.
+- `method <method>` — the request method equals the value (e.g. `GET`).
+- `header <name> <value>` — request header `name` equals `value` (name
+  case-insensitive; value exact).
 - `query <key> <value>` — a query parameter `key` whose value equals `value`.
 - `remote_ip <cidr>...` — the real client IP (per the Section 4 trust model) is
-  within any listed network.
+  within the listed network.
 - `protocol <http|https>` — the transport of the listener that received the
   request.
 - A term prefixed with `!` negates it (e.g. `!path /admin/*`).
@@ -383,17 +385,18 @@ directive directly: `handle path /a/* host example.com { ... }`.
 
 New directives introduced with matchers:
 
-- `rewrite <matcher> <to>` or `rewrite <to>`: a **modifier** that rewrites the
-  request URI before it is forwarded. The terminal still serves the request, but
-  the upstream sees the rewritten path. Matching is not re-run after a rewrite.
+- `rewrite <to>`: a **modifier** that rewrites the request URI before it is
+  forwarded. The terminal still serves the request, but the upstream sees the
+  rewritten path (placeholders `{host}`, `{uri}`, `{remote_host}` are
+  supported). Conditional rewrites belong inside a `handle` block.
 - `handle_path <matcher> { ... }`: like `handle`, but the matched path prefix is
   stripped from the URI before the block's terminal runs — so
   `handle_path /api/* { reverse_proxy }` forwards `/users/1`, not
   `/api/users/1`.
 - `respond <status> [<body>]`: a **terminal** that answers directly with the
-  given status and optional body (a `3xx` status sets the body as `Location`).
+  given status and optional body.
 - `error [<status>] [<message>]`: a **terminal** that triggers raddy's internal
-  error response with the given status (default **500**) and message.
+  error response with the given status (default **500**) and optional message.
 
 ```caddyfile
 api.example.com {
@@ -403,7 +406,7 @@ api.example.com {
     handle (path /status && method GET) {
         respond 200 ok
     }
-    rewrite path /old/* /new/{uri:path}
+    rewrite /app/{uri}
     reverse_proxy 127.0.0.1:9000
 }
 ```
@@ -554,3 +557,8 @@ api.example.com {
 - DNS-01 providers beyond Cloudflare are **deferred** — one GitHub issue per
   provider (community contributions welcome).
 - Upstream HTTP/2 is future work (Section 5.6); cleartext h2c is not planned.
+- **TLS-ALPN-01 (Section 5.8) is deferred**: instant-acme 0.8.5 keeps the account
+  key internal and Pingora 0.8's `TlsSettings` has no dynamic ALPN callback that
+  can swap in the `acme-tls/1` validation certificate, so it cannot be built
+  without forking a dependency. HTTP-01 and DNS-01 cover the reachability cases
+  otherwise.

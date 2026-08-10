@@ -355,13 +355,17 @@ impl<'a> Parser<'a> {
         let name = words.first().expect("dispatch called with empty words");
         match name.as_str() {
             "reverse_proxy" => self.parse_reverse_proxy(words, block_open),
-            "handle" => self.parse_handle(words, block_open),
+            "handle" => self.parse_handle(words, block_open, false),
+            "handle_path" => self.parse_handle(words, block_open, true),
             "header_up" => self.parse_header(words, block_open, true),
             "header_down" => self.parse_header(words, block_open, false),
             "file_server" => self.parse_file_server(words, block_open),
             "root" => self.parse_root(words, block_open),
             "encode" => self.parse_encode(words, block_open),
             "redir" => self.parse_redir(words, block_open),
+            "rewrite" => self.parse_rewrite(words, block_open),
+            "respond" => self.parse_respond(words, block_open),
+            "error" => self.parse_error(words, block_open),
             "rate_limit" => self.parse_rate_limit(words, block_open),
             "trusted_proxies" => self.parse_trusted_proxies(words, block_open),
             "tls" => self.parse_tls(words, block_open),
@@ -374,14 +378,10 @@ impl<'a> Parser<'a> {
         words: &[String],
         block_open: bool,
     ) -> Result<Directive, ConfigError> {
-        let mut rest = &words[1..];
-        let mut matcher = None;
-        if let Some(first) = rest.first() {
-            if first.starts_with('/') {
-                matcher = Some(self.parse_path_matcher(first)?);
-                rest = &rest[1..];
-            }
-        }
+        // Optional inline matcher (spec §5.9): a bare `/path`, or matcher terms
+        // (`method GET`, `host api.example.com`, …). The remaining tokens are
+        // the upstream targets (non-block form).
+        let (matcher, rest) = self.parse_matchers(&words[1..])?;
 
         let mut targets: Vec<String> = Vec::new();
         let mut lb_policy = None;
@@ -617,26 +617,36 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a `handle` (or, with `strip`, `handle_path`) block: a matcher plus
+    /// a directive block (spec §5.9).
     fn parse_handle(
         &mut self,
         words: &[String],
         block_open: bool,
+        strip: bool,
     ) -> Result<Directive, ConfigError> {
-        if words.len() != 2 {
-            return Err(self.err("handle requires exactly one path argument"));
+        let (matcher, rest) = self.parse_matchers(&words[1..])?;
+        if matcher.is_empty() {
+            return Err(self.err("handle requires a matcher"));
         }
-        let path = &words[1];
-        if !path.starts_with('/') {
-            return Err(self.err("handle path must start with '/'"));
+        if let Some(extra) = rest.first() {
+            return Err(self.err(format!("unexpected '{extra}' after the handle matcher")));
         }
         if !block_open {
             return Err(self.err("handle requires a block"));
         }
         let directives = self.parse_directive_block()?;
-        Ok(Directive::Handle {
-            path: path.clone(),
-            directives,
-        })
+        if strip {
+            Ok(Directive::HandlePath {
+                matcher,
+                directives,
+            })
+        } else {
+            Ok(Directive::Handle {
+                matcher,
+                directives,
+            })
+        }
     }
 
     fn parse_header(
@@ -731,17 +741,159 @@ impl<'a> Parser<'a> {
         Ok(Directive::Redir { to: target, code })
     }
 
-    fn parse_path_matcher(&self, s: &str) -> Result<PathMatcher, ConfigError> {
-        let prefix = strip_matcher_wildcard(s);
-        if prefix.is_empty() {
-            return Err(self.err("path matcher must not be empty"));
+    /// Parse matcher terms (spec §5.9) from the head of `tokens`, stopping at
+    /// the first token that is not a matcher keyword / bare `/path` / `!`.
+    /// Returns the matchers and the unconsumed remainder (upstream targets, a
+    /// rewrite target, …).
+    fn parse_matchers<'t>(
+        &self,
+        tokens: &'t [String],
+    ) -> Result<(Vec<Matcher>, &'t [String]), ConfigError> {
+        let mut matchers = Vec::new();
+        let mut rest = tokens;
+        while let Some((matcher, consumed)) = self.parse_one_matcher(rest)? {
+            matchers.push(matcher);
+            rest = &rest[consumed..];
         }
-        if !prefix.starts_with('/') {
-            return Err(self.err("path matcher must start with '/'"));
+        Ok((matchers, rest))
+    }
+
+    /// Parse a single matcher term if `tokens` starts with one. Returns the
+    /// matcher and the number of tokens it consumed.
+    fn parse_one_matcher(
+        &self,
+        tokens: &[String],
+    ) -> Result<Option<(Matcher, usize)>, ConfigError> {
+        let Some(first) = tokens.first() else {
+            return Ok(None);
+        };
+        if first.starts_with('/') {
+            // Bare `/path` shorthand for `path /path`.
+            if first.len() < 2 {
+                return Err(self.err("path matcher must not be empty"));
+            }
+            return Ok(Some((
+                Matcher::Path(strip_matcher_wildcard(first).to_string()),
+                1,
+            )));
         }
-        Ok(PathMatcher {
-            prefix: prefix.to_string(),
+        // Negation: `!kind ...`.
+        let (negated, kind) = match first.strip_prefix('!') {
+            Some(kind) => (true, kind),
+            None => (false, first.as_str()),
+        };
+        if !matches!(
+            kind,
+            "path" | "host" | "method" | "header" | "query" | "remote_ip" | "protocol"
+        ) {
+            return Ok(None);
+        }
+        // Validate arity before indexing `tokens` below.
+        let arity = match kind {
+            "path" | "host" | "method" | "remote_ip" | "protocol" => 1,
+            "header" | "query" => 2,
+            _ => unreachable!("matcher keyword checked above"),
+        };
+        if tokens.len() <= arity {
+            return Err(self.err(format!("matcher '{kind}' is missing arguments")));
+        }
+        let matcher = match kind {
+            "path" => Matcher::Path(strip_matcher_wildcard(&tokens[1]).to_string()),
+            "host" => Matcher::Host(tokens[1].clone()),
+            "method" => Matcher::Method(tokens[1].clone()),
+            "header" => Matcher::Header {
+                name: tokens[1].clone(),
+                value: tokens[2].clone(),
+            },
+            "query" => Matcher::Query {
+                key: tokens[1].clone(),
+                value: tokens[2].clone(),
+            },
+            "remote_ip" => {
+                Matcher::RemoteIp(Cidr::parse(&tokens[1]).map_err(|message| self.err(message))?)
+            }
+            "protocol" => Matcher::Protocol(match tokens[1].as_str() {
+                "http" => Protocol::Http,
+                "https" => Protocol::Https,
+                other => {
+                    return Err(self.err(format!(
+                        "invalid protocol '{other}' (expected http or https)"
+                    )))
+                }
+            }),
+            _ => unreachable!("matcher keyword checked above"),
+        };
+        let matcher = if negated {
+            Matcher::Not(Box::new(matcher))
+        } else {
+            matcher
+        };
+        Ok(Some((matcher, arity + 1)))
+    }
+
+    /// Parse `rewrite <to>` — rewrite the request URI before the terminal
+    /// serves (modifier, spec §5.9). Conditional rewrites belong in a `handle`
+    /// block. Placeholder fragments (`{uri}`) are separate tokens, so they are
+    /// concatenated like `redir`'s target.
+    fn parse_rewrite(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after rewrite"));
+        }
+        if words.len() < 2 {
+            return Err(self.err("rewrite requires a target"));
+        }
+        let target = concat_tokens(&words[1..]);
+        if target.is_empty() {
+            return Err(self.err("rewrite target must not be empty"));
+        }
+        let to = ValueTemplate::parse(&target).map_err(|message| self.err(message))?;
+        Ok(Directive::Rewrite { to })
+    }
+
+    /// Parse `respond <status> [<body>]` (terminal, spec §5.9).
+    fn parse_respond(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after respond"));
+        }
+        if !(2..=3).contains(&words.len()) {
+            return Err(self.err("respond expects: respond <status> [<body>]"));
+        }
+        let status = words[1]
+            .parse::<u16>()
+            .map_err(|_| self.err(format!("invalid respond status '{}'", words[1])))?;
+        if !(100..=599).contains(&status) {
+            return Err(self.err("respond status must be between 100 and 599"));
+        }
+        Ok(Directive::Respond {
+            status,
+            body: words.get(2).cloned(),
         })
+    }
+
+    /// Parse `error [<status>] [<message>]` (terminal, spec §5.9).
+    fn parse_error(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after error"));
+        }
+        let mut status = None;
+        let mut message = None;
+        for arg in &words[1..] {
+            if let Ok(code) = arg.parse::<u16>() {
+                if status.is_some() {
+                    return Err(self.err("duplicate error status"));
+                }
+                if !(100..=599).contains(&code) {
+                    return Err(self.err("error status must be between 100 and 599"));
+                }
+                status = Some(code);
+            } else {
+                if message.is_some() {
+                    return Err(self.err("duplicate error message"));
+                }
+                message = Some(arg.clone());
+            }
+        }
+        Ok(Directive::Error { status, message })
     }
 
     /// Parse `trusted_proxies <cidr>...` (spec §4).
@@ -1101,8 +1253,14 @@ mod tests {
         let site = &rf.sites[0];
         assert_eq!(site.directives.len(), 3);
         match &site.directives[0] {
-            Directive::Handle { path, directives } => {
-                assert_eq!(path, "/static/*");
+            Directive::Handle {
+                matcher,
+                directives,
+            } => {
+                assert!(matches!(
+                    matcher.as_slice(),
+                    [Matcher::Path(prefix)] if prefix == "/static"
+                ));
                 assert_eq!(directives.len(), 3);
             }
             other => panic!("expected handle, got {other:?}"),
@@ -1115,7 +1273,7 @@ mod tests {
         let rf = parse("test", input).unwrap();
         match &rf.sites[0].directives[0] {
             Directive::ReverseProxy { matcher, to, .. } => {
-                assert!(matcher.is_some());
+                assert!(!matcher.is_empty());
                 assert_eq!(to.len(), 2);
                 assert_eq!(to[0].host, "127.0.0.1");
                 assert_eq!(to[0].port, 8081);
@@ -1137,7 +1295,7 @@ mod tests {
                 health_check,
                 ..
             } => {
-                assert!(matcher.is_none());
+                assert!(matcher.is_empty());
                 assert_eq!(to.len(), 2);
                 assert_eq!(*lb_policy, LbPolicy::Random);
                 let hc = health_check.as_ref().expect("health check");
@@ -1563,5 +1721,108 @@ mod tests {
             }
             let _ = parse("fuzz", &input);
         }
+    }
+
+    #[test]
+    fn parses_general_matchers() {
+        // `handle <matcher>` accepts matcher terms beyond the bare path
+        // (spec §5.9), ANDed together.
+        let input = "example.com {\n    handle method GET host api.example.com {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Handle {
+                matcher,
+                directives,
+            } => {
+                assert_eq!(matcher.len(), 2);
+                assert!(matches!(matcher[0], Matcher::Method(ref m) if m == "GET"));
+                assert!(matches!(matcher[1], Matcher::Host(ref h) if h == "api.example.com"));
+                assert_eq!(directives.len(), 1);
+            }
+            other => panic!("expected handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_header_query_remote_ip_and_protocol_matchers() {
+        let input = "example.com {\n    handle header Content-Type application/json query page 1 remote_ip 10.0.0.0/8 protocol https {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Handle { matcher, .. } => {
+                assert!(matches!(
+                    matcher[0],
+                    Matcher::Header { ref name, ref value }
+                        if name == "Content-Type" && value == "application/json"
+                ));
+                assert!(matches!(
+                    matcher[1],
+                    Matcher::Query { ref key, ref value } if key == "page" && value == "1"
+                ));
+                assert!(matches!(matcher[2], Matcher::RemoteIp(_)));
+                assert!(matches!(matcher[3], Matcher::Protocol(Protocol::Https)));
+            }
+            other => panic!("expected handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_negated_matcher() {
+        let input = "example.com {\n    handle !path /admin/* {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Handle { matcher, .. } => {
+                assert!(matches!(
+                    matcher[0],
+                    Matcher::Not(ref inner) if matches!(**inner, Matcher::Path(ref p) if p == "/admin")
+                ));
+            }
+            other => panic!("expected handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reverse_proxy_inline_matcher_is_general() {
+        let input =
+            ":8080 {\n    reverse_proxy method POST {\n        to 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::ReverseProxy { matcher, to, .. } => {
+                assert!(matches!(matcher.as_slice(), [Matcher::Method(ref m)] if m == "POST"));
+                assert_eq!(to.len(), 1);
+            }
+            other => panic!("expected reverse_proxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_handle_path_and_rewrite_and_respond_and_error() {
+        let input = "example.com {\n    handle_path /api/* {\n        reverse_proxy 127.0.0.1:9000\n    }\n    rewrite /v1\n    respond 200 ok\n    error 503\n}\n";
+        let rf = parse("test", input).unwrap();
+        let directives = &rf.sites[0].directives;
+        assert!(matches!(directives[0], Directive::HandlePath { .. }));
+        assert!(matches!(directives[1], Directive::Rewrite { .. }));
+        match &directives[2] {
+            Directive::Respond { status, body } => {
+                assert_eq!(*status, 200);
+                assert_eq!(body.as_deref(), Some("ok"));
+            }
+            other => panic!("expected respond, got {other:?}"),
+        }
+        match &directives[3] {
+            Directive::Error { status, .. } => assert_eq!(*status, Some(503)),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_matcher_with_missing_arguments() {
+        let err = parse(
+            "test",
+            "example.com {\n    handle method {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("matcher 'method' is missing arguments"));
     }
 }

@@ -326,7 +326,8 @@ impl SiteKey {
 #[derive(Debug, Clone)]
 pub enum Directive {
     ReverseProxy {
-        matcher: Option<PathMatcher>,
+        /// Inline matcher (spec §5.9); empty = always matches.
+        matcher: Vec<Matcher>,
         to: Vec<Upstream>,
         /// `lb_policy` inside the block (defaults to round-robin).
         lb_policy: LbPolicy,
@@ -336,7 +337,13 @@ pub enum Directive {
         tls: ProxyTlsConfig,
     },
     Handle {
-        path: String,
+        matcher: Vec<Matcher>,
+        directives: Vec<Directive>,
+    },
+    /// Like `handle`, but the matched path prefix is stripped from the URI
+    /// before the block's terminal runs (spec §5.9).
+    HandlePath {
+        matcher: Vec<Matcher>,
         directives: Vec<Directive>,
     },
     HeaderUp {
@@ -357,6 +364,22 @@ pub enum Directive {
     Redir {
         to: String,
         code: u16,
+    },
+    /// `rewrite <to>` — rewrite the request URI before forwarding (modifier,
+    /// spec §5.9). Conditional rewrites belong inside a `handle` block.
+    Rewrite {
+        to: ValueTemplate,
+    },
+    /// `respond <status> [<body>]` — answer directly (terminal, spec §5.9).
+    Respond {
+        status: u16,
+        body: Option<String>,
+    },
+    /// `error [<status>] [<message>]` — trigger the internal error response
+    /// (terminal, spec §5.9).
+    Error {
+        status: Option<u16>,
+        message: Option<String>,
     },
     /// Site-scoped `trusted_proxies`, overriding the global list for this site
     /// (spec §4). Compiled into [`CompiledSite::trusted_proxies`].
@@ -454,11 +477,38 @@ pub struct TlsConfig {
     pub client_auth: Option<ClientAuth>,
 }
 
-/// A path matcher: a request path matches if it falls under the prefix.
+/// The transport of the listener that received a request (`protocol` matcher).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Http,
+    Https,
+}
+
+/// One matcher term (spec §5.9). A directive or `handle` block may carry
+/// several terms; all must match (AND). A term prefixed with `!` negates it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathMatcher {
-    /// The prefix path (with or without a trailing `*`), e.g. `/api/*`.
-    pub prefix: String,
+pub enum Matcher {
+    /// `path <prefix>` — the request path equals the prefix or falls under it
+    /// (`/api` matches `/api` and `/api/...`, not `/apix`). A bare `/path`
+    /// value is shorthand for this. `*` at the end is stripped (`/api/*`).
+    Path(String),
+    /// `host <host>` — the normalized Host header (port stripped,
+    /// ASCII-lowercased) equals the value.
+    Host(String),
+    /// `method <method>` — the request method equals the value (case-sensitive;
+    /// write `GET`, `POST`, …).
+    Method(String),
+    /// `header <name> <value>` — the request header `name` equals `value`
+    /// (header name case-insensitive; value exact).
+    Header { name: String, value: String },
+    /// `query <key> <value>` — a query parameter `key` equals `value`.
+    Query { key: String, value: String },
+    /// `remote_ip <cidr>` — the real client IP (spec §4) is within the network.
+    RemoteIp(Cidr),
+    /// `protocol <http|https>` — the transport of the receiving listener.
+    Protocol(Protocol),
+    /// `!<term>` — negates a matcher term.
+    Not(Box<Matcher>),
 }
 
 /// A compression algorithm for the `encode` directive (runtime in M5).
@@ -542,12 +592,15 @@ pub struct CompiledSite {
 /// A compiled terminal directive.
 #[derive(Debug, Clone)]
 pub struct Terminal {
-    /// Matchers (e.g. a `handle` path and/or an inline matcher); empty means
-    /// always matches. All matchers must match for the terminal to serve.
-    pub matchers: Vec<PathMatcher>,
+    /// Matchers (spec §5.9); empty means always matches. All matchers must
+    /// match for the terminal to serve.
+    pub matchers: Vec<Matcher>,
     pub kind: TerminalKind,
     /// Modifiers scoped to this terminal (from an enclosing `handle` block).
     pub modifiers: Vec<Modifier>,
+    /// A path prefix stripped from the request before the terminal serves
+    /// (the `handle_path` prefix, spec §5.9). `None` = serve the full path.
+    pub strip_prefix: Option<String>,
 }
 
 /// A compiled upstream: the resolved address plus the peer metadata needed to
@@ -608,6 +661,13 @@ pub enum TerminalKind {
     FileServer { root: String },
     /// A redirect; the target is a template expanded at request time.
     Redir { to: ValueTemplate, code: u16 },
+    /// Answer directly with a status and optional body (spec §5.9).
+    Respond { status: u16, body: Option<String> },
+    /// Trigger the internal error response with a status/message (spec §5.9).
+    Error {
+        status: u16,
+        message: Option<String>,
+    },
 }
 
 /// A declarative transform or guard, applied regardless of position (ADR-012).
@@ -628,6 +688,10 @@ pub enum Modifier {
     /// A rate-limit guard (spec §5.2).
     RateLimit {
         spec: RateSpec,
+    },
+    /// Rewrite the request URI before forwarding (spec §5.9).
+    Rewrite {
+        to: ValueTemplate,
     },
 }
 
