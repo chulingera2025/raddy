@@ -1055,21 +1055,31 @@ impl<'a> Parser<'a> {
         if block_open {
             return Err(self.err("unexpected '{' after rate_limit"));
         }
-        if !(3..=4).contains(&words.len()) {
-            return Err(self.err("rate_limit expects: rate_limit <remote_ip> <rate> [burst=<n>]"));
+        if words.len() < 3 {
+            return Err(self.err("rate_limit expects: rate_limit <key> <rate> [burst=<n>]"));
         }
-        // Only `remote_ip` is supported in v0.1.2 (spec §5.2).
-        let key = match words[1].as_str() {
-            "remote_ip" => RateLimitKey::RemoteIp,
+        // The key selects what is counted (spec §5.2): `remote_ip` or
+        // `header <name>`.
+        let (key, rate_idx) = match words[1].as_str() {
+            "remote_ip" => (RateLimitKey::RemoteIp, 2),
+            "header" => {
+                if words.len() < 4 {
+                    return Err(self.err("rate_limit header expects: header <name> <rate>"));
+                }
+                (RateLimitKey::Header(words[2].clone()), 3)
+            }
             other => {
                 return Err(self.err(format!(
-                    "unknown rate_limit key '{other}' (only 'remote_ip' is supported)"
+                    "unknown rate_limit key '{other}' (expected 'remote_ip' or 'header <name>')"
                 )))
             }
         };
-        let (count, unit) = parse_rate(&words[2]).map_err(|message| self.err(message))?;
+        let rate = words
+            .get(rate_idx)
+            .ok_or_else(|| self.err("rate_limit requires a rate after the key"))?;
+        let (count, unit) = parse_rate(rate).map_err(|message| self.err(message))?;
         let mut burst = count;
-        if let Some(arg) = words.get(3) {
+        if let Some(arg) = words.get(rate_idx + 1) {
             match arg.strip_prefix("burst=") {
                 Some(value) => {
                     burst = value
@@ -1887,5 +1897,19 @@ mod tests {
         }
         assert!(matches!(directives[1], Directive::ForwardAuth { .. }));
         assert!(matches!(directives[2], Directive::ReverseProxy { .. }));
+    }
+
+    #[test]
+    fn parses_rate_limit_header_key() {
+        let input =
+            ":8080 {\n    rate_limit header X-API-Key 10r/s\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::RateLimit { spec } => {
+                assert_eq!(spec.key, RateLimitKey::Header("X-API-Key".to_string()));
+                assert_eq!(spec.count, 10);
+            }
+            other => panic!("expected rate_limit, got {other:?}"),
+        }
     }
 }

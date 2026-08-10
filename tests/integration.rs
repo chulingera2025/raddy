@@ -1342,6 +1342,36 @@ fn forward_auth_delegates_and_rejects() {
 }
 
 #[test]
+fn rate_limit_keys_on_header_value() {
+    // `rate_limit header <name>` (spec §5.2) buckets per header value.
+    let (up_port, _up) = EchoUpstream::spawn("limited");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    rate_limit header X-API-Key 2r/s\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+        )
+    });
+    let key1 = "X-API-Key: key1";
+    assert_eq!(
+        send_request_hdr(raddy.port(), Some("localhost"), "/", &[key1]).status,
+        200
+    );
+    assert_eq!(
+        send_request_hdr(raddy.port(), Some("localhost"), "/", &[key1]).status,
+        200
+    );
+    // The third request with the same key is rate limited.
+    assert_eq!(
+        send_request_hdr(raddy.port(), Some("localhost"), "/", &[key1]).status,
+        429
+    );
+    // A different key has its own bucket.
+    assert_eq!(
+        send_request_hdr(raddy.port(), Some("localhost"), "/", &["X-API-Key: key2"]).status,
+        200
+    );
+}
+
+#[test]
 fn missing_host_returns_400() {
     let (up_port, _up) = EchoUpstream::spawn("A");
     let raddy =

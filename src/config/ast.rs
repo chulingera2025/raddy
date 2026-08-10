@@ -98,11 +98,14 @@ impl Cidr {
     }
 }
 
-/// The key a `rate_limit` directive counts on. `remote_ip` is the only key in
-/// v0.1.2 (spec §5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The key a `rate_limit` directive counts on (spec §5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RateLimitKey {
+    /// The real client IP per the Section 4 trust model.
     RemoteIp,
+    /// The value of the request header `name`. Requests without that header
+    /// share a single bucket.
+    Header(String),
 }
 
 /// The time unit of a rate.
@@ -128,9 +131,9 @@ impl RateUnit {
 
 /// A compiled `rate_limit` spec: what to count on, plus a token bucket with a
 /// refill rate and capacity (spec §5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateSpec {
-    /// What the limit counts (`remote_ip` in v0.1.2).
+    /// What the limit counts.
     pub key: RateLimitKey,
     /// Tokens refilled per `unit`.
     pub count: u64,

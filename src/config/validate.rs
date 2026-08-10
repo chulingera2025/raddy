@@ -177,7 +177,9 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
                 // Last occurrence wins (same as the global block).
                 site_trusted = Some(networks.clone());
             }
-            Directive::RateLimit { spec } => modifiers.push(Modifier::RateLimit { spec: *spec }),
+            Directive::RateLimit { spec } => {
+                modifiers.push(Modifier::RateLimit { spec: spec.clone() })
+            }
             Directive::Tls { config } => merge_tls(&mut site_tls, config),
             Directive::BasicAuth { user, hash } => basic_users.push((user.clone(), hash.clone())),
             Directive::ForwardAuth { target } => forward_auth = Some(target.clone()),
@@ -335,7 +337,7 @@ fn compile_handle_block(
                 });
             }
             Directive::RateLimit { spec } => {
-                scoped_modifiers.push(Modifier::RateLimit { spec: *spec });
+                scoped_modifiers.push(Modifier::RateLimit { spec: spec.clone() });
             }
             Directive::TrustedProxies { .. } => {
                 return Err(validate_error(

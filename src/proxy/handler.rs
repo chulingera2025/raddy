@@ -20,8 +20,8 @@
 //! so the upstream Connector's connection pools survive (ADR-011).
 
 use crate::config::ast::{
-    Cidr, Encoding, LbPolicy, Modifier, SiteKey, TemplatePart, TerminalKind, UpstreamTls,
-    ValueTemplate, Variable,
+    Cidr, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec, SiteKey, TemplatePart,
+    TerminalKind, UpstreamTls, ValueTemplate, Variable,
 };
 use crate::config::snapshot::ConfigStore;
 use crate::proxy::compress;
@@ -227,12 +227,15 @@ impl ProxyHttp for ProxyHandler {
                     let mut modifiers = site.modifiers.clone();
                     modifiers.extend(terminal.modifiers.iter().cloned());
                     // Rate limiting (spec §5.2): each `rate_limit` directive has
-                    // its own per-(terminal, client IP) token bucket; an empty
-                    // bucket rejects the request with 429.
-                    if let Some(ip) = ctx.effective_client_ip {
-                        for (offset, modifier) in modifiers.iter().enumerate() {
-                            if let Modifier::RateLimit { spec } = modifier {
-                                if !self.rate_limiter.allow(&site.key, index, offset, ip, spec) {
+                    // its own token bucket, keyed by `remote_ip` or a request
+                    // header value; an empty bucket rejects the request with 429.
+                    for (offset, modifier) in modifiers.iter().enumerate() {
+                        if let Modifier::RateLimit { spec } = modifier {
+                            if let Some(key) = rate_limit_key(session, ctx, spec) {
+                                if !self
+                                    .rate_limiter
+                                    .allow(&site.key, index, offset, &key, spec)
+                                {
                                     session.respond_error(429).await?;
                                     return Ok(true);
                                 }
@@ -873,6 +876,32 @@ fn query_value(session: &Session, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The counter identity for a `rate_limit` spec (spec §5.2): the effective
+/// client IP for `remote_ip`, or the request header value for `header <name>`
+/// (requests without the header share one bucket).
+fn rate_limit_key(session: &Session, ctx: &ProxyCtx, spec: &RateSpec) -> Option<String> {
+    match &spec.key {
+        RateLimitKey::RemoteIp => ctx
+            .effective_client_ip
+            .map(|ip| ip.to_string())
+            .or_else(|| {
+                session
+                    .client_addr()
+                    .and_then(|addr| addr.as_inet())
+                    .map(|addr| addr.ip().to_string())
+            }),
+        RateLimitKey::Header(name) => Some(
+            session
+                .req_header()
+                .headers
+                .get(name.as_str())
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    }
 }
 
 /// Whether the request arrived over TLS (the `protocol` matcher input).
