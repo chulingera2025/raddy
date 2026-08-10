@@ -321,32 +321,27 @@ fn map_site_addr(words: &[String]) -> Result<String, String> {
     }
 }
 
-/// Normalize a reverse-proxy upstream: strip the scheme and any URI path,
-/// default the port. A trailing path (unusual for Caddy) is dropped like nginx.
+/// Normalize a reverse-proxy upstream: strip the `http://` scheme, keep the
+/// `https://` scheme (raddy supports TLS upstreams, spec §5.4), default the
+/// port, and drop any URI path (unusual for Caddy; dropped like nginx).
 fn normalize_upstream(target: &str) -> Result<String, String> {
     if target.starts_with('[') {
         return Err(format!("IPv6 upstream '{target}' is not supported"));
     }
-    let rest = match target.split_once("://") {
-        Some(("http", rest)) => rest,
-        // Raddy v0.1.2 has plain-HTTP upstreams only; skipping https upstreams
-        // rather than silently downgrading them.
-        Some(("https", _)) => {
-            return Err(format!(
-                "https upstream '{target}' skipped (raddy supports plain-HTTP upstreams only)"
-            ))
-        }
+    let (scheme, rest) = match target.split_once("://") {
+        Some(("http", rest)) => ("", rest),
+        Some(("https", rest)) => ("https://", rest),
         Some((other, _)) => return Err(format!("unsupported upstream scheme '{other}'")),
-        None => target,
+        None => ("", target),
     };
     let host_port = rest.split('/').next().unwrap_or("").to_string();
     if host_port.is_empty() {
         return Err("empty upstream target".to_string());
     }
     if host_port.contains(':') {
-        Ok(host_port)
+        Ok(format!("{scheme}{host_port}"))
     } else {
-        Ok(format!("{host_port}:80"))
+        Ok(format!("{scheme}{host_port}:80"))
     }
 }
 
@@ -506,10 +501,19 @@ mod tests {
     }
 
     #[test]
-    fn https_upstream_is_skipped_with_warning() {
+    fn https_upstream_is_converted_with_scheme() {
+        // raddy supports `https://` upstreams (spec §5.4), so the converter
+        // passes the TLS target through rather than skipping it.
         let c = convert("example.com {\n    reverse_proxy https://127.0.0.1:8443\n}\n").unwrap();
-        assert!(c.raddyfile.trim().is_empty());
-        assert!(c.warnings.iter().any(|w| w.contains("https upstream")));
+        assert!(c.raddyfile.contains("https://127.0.0.1:8443"));
+        assert!(c.warnings.iter().all(|w| !w.contains("https upstream")));
+    }
+
+    #[test]
+    fn plain_http_upstream_scheme_is_stripped() {
+        let c = convert("example.com {\n    reverse_proxy http://127.0.0.1:8080\n}\n").unwrap();
+        assert!(c.raddyfile.contains("reverse_proxy 127.0.0.1:8080"));
+        assert!(!c.raddyfile.contains("http://"));
     }
 
     #[test]
