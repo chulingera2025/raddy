@@ -341,7 +341,9 @@ fn normalize_upstream(target: &str) -> Result<String, String> {
     if host_port.contains(':') {
         Ok(format!("{scheme}{host_port}"))
     } else {
-        Ok(format!("{scheme}{host_port}:80"))
+        // Default the port by scheme: 443 for TLS, 80 otherwise (P1).
+        let default_port = if scheme.is_empty() { 80 } else { 443 };
+        Ok(format!("{scheme}{host_port}:{default_port}"))
     }
 }
 
@@ -507,6 +509,16 @@ mod tests {
         let c = convert("example.com {\n    reverse_proxy https://127.0.0.1:8443\n}\n").unwrap();
         assert!(c.raddyfile.contains("https://127.0.0.1:8443"));
         assert!(c.warnings.iter().all(|w| !w.contains("https upstream")));
+    }
+
+    #[test]
+    fn https_upstream_defaults_to_port_443() {
+        // A portless https target defaults to 443, not 80 (P1).
+        let c = convert("example.com {\n    reverse_proxy https://backend.example\n}\n").unwrap();
+        assert!(c.raddyfile.contains("https://backend.example:443"));
+        // A portless plain target still defaults to 80.
+        let c = convert("example.com {\n    reverse_proxy http://backend.example\n}\n").unwrap();
+        assert!(c.raddyfile.contains("reverse_proxy backend.example:80"));
     }
 
     #[test]

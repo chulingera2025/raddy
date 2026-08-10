@@ -188,32 +188,22 @@ impl SniCallback {
             }
         }
         if let Some(client_auth) = &tls.client_auth {
-            match self.ca_certs(&client_auth.ca_file) {
-                Some(certs) => {
-                    // `require` also rejects clients that present no certificate.
-                    let mode = match client_auth.mode {
-                        ClientAuthMode::Require => {
-                            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
-                        }
-                        ClientAuthMode::Optional => SslVerifyMode::PEER,
-                    };
-                    ssl.set_verify(mode);
-                    match self.build_ca_store(&certs) {
-                        Some(store) => {
-                            if let Err(e) = ssl.set_verify_cert_store(store) {
-                                tracing::warn!("failed to set mTLS CA store: {e}");
-                            }
-                        }
-                        None => tracing::warn!(
-                            "tls client_auth CA file {} could not be loaded; clients are not verified",
-                            client_auth.ca_file
-                        ),
-                    }
+            // `require` also rejects clients that present no certificate.
+            let mode = match client_auth.mode {
+                ClientAuthMode::Require => {
+                    SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
                 }
-                None => tracing::warn!(
-                    "tls client_auth CA file {} unreadable; clients are not verified",
-                    client_auth.ca_file
-                ),
+                ClientAuthMode::Optional => SslVerifyMode::PEER,
+            };
+            ssl.set_verify(mode);
+            // Fail closed: the trust store is always set — an unreadable CA (or
+            // a store-build failure) falls back to an EMPTY store, so `require`
+            // rejects every client (no certificate chains, and absent
+            // certificates are refused by FAIL_IF_NO_PEER_CERT) instead of
+            // silently disabling client authentication.
+            let store = self.ca_store(&client_auth.ca_file);
+            if let Err(e) = ssl.set_verify_cert_store(store) {
+                tracing::warn!("failed to set mTLS CA store: {e}");
             }
         }
     }
@@ -228,28 +218,47 @@ impl SniCallback {
             .and_then(|site| site.tls.clone())
     }
 
-    /// Parse (and cache) an mTLS CA PEM file into its certificates.
+    /// Parse (and cache) an mTLS CA PEM file into its certificates. A missing or
+    /// unparsable CA is logged and yields `None` (the caller fails closed).
     fn ca_certs(&self, path: &str) -> Option<Arc<Vec<X509>>> {
         if let Ok(cache) = self.ca_cache.lock() {
             if let Some(certs) = cache.get(path) {
                 return Some(certs.clone());
             }
         }
-        let pem = std::fs::read_to_string(path).ok()?;
-        let certs: Arc<Vec<X509>> = Arc::new(X509::stack_from_pem(pem.as_bytes()).ok()?);
+        let pem = match std::fs::read_to_string(path) {
+            Ok(pem) => pem,
+            Err(e) => {
+                tracing::error!(
+                    "tls client_auth CA file {path} unreadable ({e}); rejecting mTLS clients"
+                );
+                return None;
+            }
+        };
+        let certs: Arc<Vec<X509>> = match X509::stack_from_pem(pem.as_bytes()) {
+            Ok(certs) => Arc::new(certs),
+            Err(e) => {
+                tracing::error!(
+                    "tls client_auth CA file {path} is not valid PEM ({e}); rejecting mTLS clients"
+                );
+                return None;
+            }
+        };
         if let Ok(mut cache) = self.ca_cache.lock() {
             cache.insert(path.to_string(), certs.clone());
         }
         Some(certs)
     }
 
-    /// Build a trust store from cached CA certificates.
-    fn build_ca_store(&self, certs: &[X509]) -> Option<X509Store> {
-        let mut builder = X509StoreBuilder::new().ok()?;
-        for cert in certs {
+    /// Build the mTLS trust store from the cached CA certificates. An unreadable
+    /// CA falls back to an empty store (fail closed), never an unset one.
+    fn ca_store(&self, path: &str) -> X509Store {
+        let certs = self.ca_certs(path).unwrap_or_default();
+        let mut builder = X509StoreBuilder::new().expect("X509StoreBuilder::new cannot fail");
+        for cert in certs.iter() {
             let _ = builder.add_cert(cert.clone());
         }
-        Some(builder.build())
+        builder.build()
     }
 }
 

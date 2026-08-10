@@ -41,12 +41,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+/// `forward_auth` connect timeout (P1): a hung auth server must fail the
+/// request instead of occupying the worker and socket indefinitely.
+const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// `forward_auth` per-read/write timeout.
+const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The access-log destination and format (spec §5.13).
 pub struct AccessLog {
     pub file: Mutex<File>,
     pub format: AccessLogFormat,
 }
+
+/// Bounds concurrent bcrypt verifications (P1): bcrypt is deliberately slow, so
+/// an attacker flooding valid usernames must not saturate the blocking pool.
+const BCRYPT_MAX_CONCURRENCY: usize = 4;
 
 /// The process-lifetime proxy handler.
 pub struct ProxyHandler {
@@ -60,6 +71,9 @@ pub struct ProxyHandler {
     rate_limiter: Arc<RateLimiter>,
     /// Optional access-log destination and format (spec §5.13).
     access_log: Option<AccessLog>,
+    /// Caps concurrent `bcrypt::verify` calls (P1): bcrypt is deliberately
+    /// expensive, so it runs on a bounded blocking pool behind this semaphore.
+    bcrypt_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ProxyHandler {
@@ -77,6 +91,7 @@ impl ProxyHandler {
             challenges,
             access_log,
             rate_limiter,
+            bcrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(BCRYPT_MAX_CONCURRENCY)),
         }
     }
 
@@ -99,7 +114,7 @@ impl ProxyHandler {
             })
             .flatten()
             .collect();
-        if !users.is_empty() && !basic_auth_matches(session, &users) {
+        if !users.is_empty() && !self.basic_auth_matches(session, &users).await? {
             return Ok(Some(AuthReject::BasicUnauthorized));
         }
         // `forward_auth`: last occurrence wins.
@@ -113,6 +128,38 @@ impl ProxyHandler {
             }
         }
         Ok(None)
+    }
+
+    /// Whether the request's Basic credentials match any configured user.
+    ///
+    /// `bcrypt::verify` is deliberately slow, so it runs off the async worker on
+    /// a bounded blocking pool behind [`BCRYPT_MAX_CONCURRENCY`] (P1) — an
+    /// attacker flooding valid usernames cannot pin the Pingora/Tokio workers.
+    async fn basic_auth_matches(
+        &self,
+        session: &Session,
+        users: &[&(String, String)],
+    ) -> Result<bool, Box<Error>> {
+        let Some((user, password)) = basic_credentials(session) else {
+            return Ok(false);
+        };
+        // Owned copies move into the blocking task (users are few).
+        let users: Vec<(String, String)> =
+            users.iter().map(|(u, h)| (u.clone(), h.clone())).collect();
+        let permit = self
+            .bcrypt_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::explain(InternalError, "bcrypt semaphore closed"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            users.iter().any(|(configured, hash)| {
+                configured == &user && bcrypt::verify(&password, hash).unwrap_or(false)
+            })
+        })
+        .await
+        .map_err(|e| Error::because(InternalError, "bcrypt verify task failed", e))
     }
 
     /// Whether the selected site disabled access logging with `access_log off`
@@ -629,34 +676,22 @@ enum ForwardAuthOutcome {
     Reject(u16),
 }
 
-/// Whether the request's Basic credentials match any configured user.
-fn basic_auth_matches(session: &Session, users: &[&(String, String)]) -> bool {
+/// Decode the request's HTTP Basic credentials as `(user, password)`, or `None`
+/// when the header is absent or malformed.
+fn basic_credentials(session: &Session) -> Option<(String, String)> {
     use base64::Engine;
-    let Some(auth) = session
+    let auth = session
         .req_header()
         .headers
-        .get(http::header::AUTHORIZATION)
-    else {
-        return false;
-    };
-    let Ok(auth) = auth.to_str() else {
-        return false;
-    };
-    let Some(encoded) = auth.strip_prefix("Basic ") else {
-        return false;
-    };
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return false;
-    };
-    let Ok(decoded) = String::from_utf8(decoded) else {
-        return false;
-    };
-    let Some((user, password)) = decoded.split_once(':') else {
-        return false;
-    };
-    users.iter().any(|(configured, hash)| {
-        configured == user && bcrypt::verify(password, hash).unwrap_or(false)
-    })
+        .get(http::header::AUTHORIZATION)?;
+    let auth = auth.to_str().ok()?;
+    let encoded = auth.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (user, password) = decoded.split_once(':')?;
+    Some((user.to_string(), password.to_string()))
 }
 
 /// Delegate authentication to the `host:port` target (spec §5.10): forward a
@@ -673,8 +708,11 @@ async fn forward_auth_check(
     let port: u16 = port
         .parse()
         .map_err(|_| Error::explain(InternalError, "invalid forward_auth port"))?;
-    let mut stream = TcpStream::connect((host, port))
+    // Bounded I/O (P1): a silent or hung auth server must fail the request
+    // instead of occupying the worker and socket indefinitely.
+    let mut stream = timeout(AUTH_CONNECT_TIMEOUT, TcpStream::connect((host, port)))
         .await
+        .map_err(|_| Error::explain(InternalError, "forward_auth connect timed out"))?
         .map_err(|e| Error::because(InternalError, "forward_auth connect failed", e))?;
     let auth = session
         .req_header()
@@ -697,17 +735,17 @@ async fn forward_auth_check(
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {auth}\r\nX-Forwarded-For: {xff}\r\nConnection: close\r\n\r\n"
     );
-    stream
-        .write_all(request.as_bytes())
+    timeout(AUTH_READ_TIMEOUT, stream.write_all(request.as_bytes()))
         .await
+        .map_err(|_| Error::explain(InternalError, "forward_auth write timed out"))?
         .map_err(|e| Error::because(InternalError, "forward_auth write failed", e))?;
-    // Read the response head through \r\n\r\n (bounded).
+    // Read the response head through \r\n\r\n (bounded, per-read timeout).
     let mut head = Vec::new();
     let mut buf = [0u8; 512];
     while head.len() < 16 * 1024 {
-        let n = stream
-            .read(&mut buf)
+        let n = timeout(AUTH_READ_TIMEOUT, stream.read(&mut buf))
             .await
+            .map_err(|_| Error::explain(InternalError, "forward_auth read timed out"))?
             .map_err(|e| Error::because(InternalError, "forward_auth read failed", e))?;
         if n == 0 {
             break;
@@ -727,18 +765,48 @@ async fn forward_auth_check(
         let reject = if status == 403 { 403 } else { 401 };
         return Ok(ForwardAuthOutcome::Reject(reject));
     }
-    // Parse response headers (skipping the status line) for copying back.
+    // Copy back only the identity headers — never framing, routing, or
+    // hop-by-hop headers (Content-Length, Transfer-Encoding, Connection, Host,
+    // …), which would corrupt the real request's message framing (P1).
     let mut headers = Vec::new();
     for line in head_str.lines().skip(1) {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_string();
             let value = value.trim().to_string();
-            if !name.is_empty() {
+            if is_safe_forward_auth_header(&name) {
                 headers.push((name, value));
             }
         }
     }
     Ok(ForwardAuthOutcome::Pass(headers))
+}
+
+/// Whether a `forward_auth` response header may be copied onto the real
+/// request. Only identity headers pass; framing, representation, routing, and
+/// hop-by-hop headers are dropped (P1).
+fn is_safe_forward_auth_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "content-type"
+            | "content-encoding"
+            | "content-range"
+            | "host"
+            | "x-forwarded-for"
+            | "x-forwarded-proto"
+            | "x-forwarded-host"
+            | "x-real-ip"
+    ) && !lower.starts_with("x-forwarded-")
 }
 
 /// Build a structured access-log entry from the session and context.

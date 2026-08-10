@@ -1217,6 +1217,30 @@ fn mtls_require_rejects_clients_without_certificate() {
 }
 
 #[test]
+fn mtls_require_fails_closed_on_unreadable_ca() {
+    // Deleting the CA file after startup must NOT open the mTLS gate: an
+    // unreadable CA falls back to an empty trust store, so `require` still
+    // rejects every client (P1).
+    let (up_port, _up) = EchoUpstream::spawn("mtls");
+    let ca = rcgen::generate_simple_self_signed(vec!["Test CA".to_string()]).unwrap();
+    let ca_path = std::env::temp_dir().join(format!("raddy-ca-del-{}.pem", std::process::id()));
+    std::fs::write(&ca_path, ca.cert.pem()).unwrap();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    tls client_auth require {}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            ca_path.display()
+        )
+    });
+    // Remove the CA before the first handshake (the TCP readiness probe never
+    // performs one), then verify the gate stays closed.
+    std::fs::remove_file(&ca_path).unwrap();
+    assert!(
+        tls_request(raddy.port(), "localhost", "/", &[]).is_err(),
+        "an unreadable CA must fail closed (reject), not open the gate"
+    );
+}
+
+#[test]
 fn mtls_optional_accepts_clients_without_certificate() {
     // `tls client_auth optional` requests but does not require a certificate.
     let (up_port, _up) = EchoUpstream::spawn("mtls-opt");

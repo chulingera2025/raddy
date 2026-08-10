@@ -59,9 +59,12 @@ struct BucketKey {
     /// The position of the `rate_limit` modifier within its effective scope, so
     /// several `rate_limit` directives on the same terminal stay independent.
     directive: usize,
-    /// The counter identity: the client IP string for a `remote_ip` key, or the
-    /// request header value for a `header <name>` key (spec §5.2).
-    key: String,
+    /// The counter identity as a fixed-length digest of the key material (the
+    /// client IP for `remote_ip`, the request header value for `header <name>`,
+    /// spec §5.2). Hashing bounds the per-bucket memory regardless of header
+    /// value size (P1), so the `MAX_BUCKETS` memory cap holds under a flood of
+    /// large distinct header values.
+    key: u64,
 }
 
 /// One token bucket.
@@ -134,7 +137,8 @@ impl RateLimiter {
     /// Returns `true` when a token was available (the request proceeds), `false`
     /// when the bucket was empty (the caller should answer 429). `key` is the
     /// counter identity derived from the spec's key (the client IP for
-    /// `remote_ip`, the header value for `header <name>`).
+    /// `remote_ip`, the header value for `header <name>`); it is hashed to a
+    /// fixed-length digest before storage (P1).
     pub fn allow(
         &self,
         site: &SiteKey,
@@ -147,7 +151,7 @@ impl RateLimiter {
             site: site.clone(),
             terminal,
             directive,
-            key: key.to_string(),
+            key: self.state.hash_one(key),
         };
         let mut shard = self.shards[self.shard_index(&key)]
             .lock()
@@ -379,7 +383,7 @@ mod tests {
                 site: key(),
                 terminal: 0,
                 directive: 0,
-                key: ip(i),
+                key: i as u64,
             };
             shard.map.insert(
                 bucket_key.clone(),
@@ -422,7 +426,7 @@ mod tests {
                 site: key(),
                 terminal: 0,
                 directive: 0,
-                key: ip(i),
+                key: i as u64,
             };
             shard.map.insert(
                 bucket_key.clone(),
@@ -464,7 +468,7 @@ mod tests {
                 site: key(),
                 terminal: 0,
                 directive: 0,
-                key: ip(i),
+                key: i as u64,
             };
             shard.map.insert(
                 bucket_key.clone(),
@@ -491,11 +495,11 @@ mod tests {
             site: key(),
             terminal: 0,
             directive: 0,
-            key: ip(EVICT_SCAN as u32),
+            key: EVICT_SCAN as u64,
         };
         assert!(!shard.map.contains_key(&evicted));
         // The reprieved buckets rotate to the back in their original order.
-        assert_eq!(shard.recency.front().map(|k| k.key.clone()), Some(ip(0)));
+        assert_eq!(shard.recency.front().map(|k| k.key), Some(0));
     }
 
     #[test]
