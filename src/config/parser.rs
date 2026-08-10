@@ -366,6 +366,8 @@ impl<'a> Parser<'a> {
             "rewrite" => self.parse_rewrite(words, block_open),
             "respond" => self.parse_respond(words, block_open),
             "error" => self.parse_error(words, block_open),
+            "basic_auth" => self.parse_basic_auth(words, block_open),
+            "forward_auth" => self.parse_forward_auth(words, block_open),
             "rate_limit" => self.parse_rate_limit(words, block_open),
             "trusted_proxies" => self.parse_trusted_proxies(words, block_open),
             "tls" => self.parse_tls(words, block_open),
@@ -894,6 +896,46 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(Directive::Error { status, message })
+    }
+
+    /// Parse `basic_auth <user> <bcrypt-hash>` (guard, spec §5.10).
+    fn parse_basic_auth(
+        &self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after basic_auth"));
+        }
+        if words.len() != 3 {
+            return Err(self.err("basic_auth expects: basic_auth <user> <bcrypt-hash>"));
+        }
+        Ok(Directive::BasicAuth {
+            user: words[1].clone(),
+            hash: words[2].clone(),
+        })
+    }
+
+    /// Parse `forward_auth <target>` (guard, spec §5.10). The target is an
+    /// upstream `host:port`.
+    fn parse_forward_auth(
+        &self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after forward_auth"));
+        }
+        if words.len() != 2 {
+            return Err(self.err("forward_auth expects: forward_auth <host:port>"));
+        }
+        let target = &words[1];
+        if !target.contains(':') {
+            return Err(self.err("forward_auth target must be <host:port>"));
+        }
+        Ok(Directive::ForwardAuth {
+            target: target.clone(),
+        })
     }
 
     /// Parse `trusted_proxies <cidr>...` (spec §4).
@@ -1824,5 +1866,21 @@ mod tests {
         assert!(err
             .to_string()
             .contains("matcher 'method' is missing arguments"));
+    }
+
+    #[test]
+    fn parses_basic_auth_and_forward_auth() {
+        let input = "example.com {\n    basic_auth admin $2b$12$abcdef\n    forward_auth 127.0.0.1:9999\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        let directives = &rf.sites[0].directives;
+        match &directives[0] {
+            Directive::BasicAuth { user, hash } => {
+                assert_eq!(user, "admin");
+                assert_eq!(hash, "$2b$12$abcdef");
+            }
+            other => panic!("expected basic_auth, got {other:?}"),
+        }
+        assert!(matches!(directives[1], Directive::ForwardAuth { .. }));
+        assert!(matches!(directives[2], Directive::ReverseProxy { .. }));
     }
 }

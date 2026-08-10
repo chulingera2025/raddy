@@ -85,6 +85,10 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
     let mut site_trusted: Option<Vec<Cidr>> = None;
     // Site-scoped `tls` configuration, merged across `tls` lines (spec §5.7).
     let mut site_tls: Option<TlsConfig> = None;
+    // Auth guard accumulation (spec §5.10): all `basic_auth` users form one
+    // table; `forward_auth` is a single delegation target (last wins).
+    let mut basic_users: Vec<(String, String)> = Vec::new();
+    let mut forward_auth: Option<String> = None;
 
     for directive in &site.directives {
         match directive {
@@ -175,7 +179,18 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
             }
             Directive::RateLimit { spec } => modifiers.push(Modifier::RateLimit { spec: *spec }),
             Directive::Tls { config } => merge_tls(&mut site_tls, config),
+            Directive::BasicAuth { user, hash } => basic_users.push((user.clone(), hash.clone())),
+            Directive::ForwardAuth { target } => forward_auth = Some(target.clone()),
         }
+    }
+
+    // Auth guards (spec §5.10) are emitted as single modifiers: all `basic_auth`
+    // lines form one user table, and `forward_auth` (last wins) delegates.
+    if !basic_users.is_empty() {
+        modifiers.push(Modifier::BasicAuth { users: basic_users });
+    }
+    if let Some(target) = forward_auth {
+        modifiers.push(Modifier::ForwardAuth { target });
     }
 
     // Validate the merged per-site TLS config (file existence, version range).
@@ -234,6 +249,9 @@ fn compile_handle_block(
     let mut scoped_modifiers: Vec<Modifier> = Vec::new();
     let mut roots: Vec<String> = Vec::new();
     let mut block_terminals: Vec<Terminal> = Vec::new();
+    // Auth guard accumulation within the handle scope (spec §5.10).
+    let mut basic_users: Vec<(String, String)> = Vec::new();
+    let mut forward_auth: Option<String> = None;
 
     for directive in directives {
         match directive {
@@ -337,7 +355,17 @@ fn compile_handle_block(
                     "nested handle blocks are not supported in v0.1",
                 ));
             }
+            Directive::BasicAuth { user, hash } => basic_users.push((user.clone(), hash.clone())),
+            Directive::ForwardAuth { target } => forward_auth = Some(target.clone()),
         }
+    }
+
+    // Handle-scoped auth guards (spec §5.10) apply only to this block's terminal.
+    if !basic_users.is_empty() {
+        scoped_modifiers.push(Modifier::BasicAuth { users: basic_users });
+    }
+    if let Some(target) = forward_auth {
+        scoped_modifiers.push(Modifier::ForwardAuth { target });
     }
 
     let root = roots.last().cloned();
@@ -1053,5 +1081,23 @@ mod tests {
         assert!(err
             .to_string()
             .contains("tls is only allowed at the site-block level"));
+    }
+
+    #[test]
+    fn compiles_basic_auth_into_user_table() {
+        // Several `basic_auth` lines compile into a single user-table modifier
+        // (spec §5.10).
+        let cfg = compile(
+            ":8080 {\n    basic_auth admin $2b$12$x\n    basic_auth bob $2b$12$y\n    reverse_proxy 127.0.0.1:9000\n}\n",
+        )
+        .unwrap();
+        let modifiers = &cfg.sites[0].modifiers;
+        match modifiers
+            .iter()
+            .find(|m| matches!(m, Modifier::BasicAuth { .. }))
+        {
+            Some(Modifier::BasicAuth { users }) => assert_eq!(users.len(), 2),
+            _ => panic!("expected a basic_auth modifier"),
+        }
     }
 }

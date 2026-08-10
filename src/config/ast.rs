@@ -381,6 +381,15 @@ pub enum Directive {
         status: Option<u16>,
         message: Option<String>,
     },
+    /// `basic_auth <user> <bcrypt-hash>` — HTTP Basic auth guard (spec §5.10).
+    BasicAuth {
+        user: String,
+        hash: String,
+    },
+    /// `forward_auth <target>` — delegate auth to an upstream (spec §5.10).
+    ForwardAuth {
+        target: String,
+    },
     /// Site-scoped `trusted_proxies`, overriding the global list for this site
     /// (spec §4). Compiled into [`CompiledSite::trusted_proxies`].
     TrustedProxies {
@@ -692,6 +701,15 @@ pub enum Modifier {
     /// Rewrite the request URI before forwarding (spec §5.9).
     Rewrite {
         to: ValueTemplate,
+    },
+    /// HTTP Basic authentication guard (spec §5.10): the request must match one
+    /// of the collected `(user, bcrypt-hash)` pairs.
+    BasicAuth {
+        users: Vec<(String, String)>,
+    },
+    /// Delegate authentication to an upstream (spec §5.10).
+    ForwardAuth {
+        target: String,
     },
 }
 

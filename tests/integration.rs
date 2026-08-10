@@ -355,6 +355,69 @@ impl Drop for PathEchoUpstream {
     }
 }
 
+/// A minimal auth upstream for `forward_auth` (spec §5.10): grants `/` with
+/// `X-Auth-User`, denies `/deny` with 401.
+struct AuthUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl AuthUpstream {
+    fn spawn() -> (u16, AuthUpstream) {
+        let (port, listener) = bind_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 8192];
+                    if stream.read(&mut buf).is_err() {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let granted = !path.starts_with("/deny");
+                    let (status, reason, extra) = if granted {
+                        (200, "OK", "X-Auth-User: alice\r\n")
+                    } else {
+                        (401, "Unauthorized", "")
+                    };
+                    let body = if granted { "granted" } else { "denied" };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (
+            port,
+            AuthUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for AuthUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// An upstream that keeps connections alive (no `Connection: close`) and counts
 /// *distinct* connections, so a client can assert connection reuse across
 /// requests and reloads.
@@ -1225,6 +1288,57 @@ fn rewrite_modifier_changes_path() {
     let resp = send_request(raddy.port(), Some("localhost"), "/x");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, "path=/v1/x");
+}
+
+#[test]
+fn basic_auth_requires_credentials() {
+    // `basic_auth` (spec §5.10): no/wrong credentials → 401 with
+    // WWW-Authenticate; correct credentials → proxied.
+    use base64::Engine;
+    let hash = bcrypt::hash("secret", 4).unwrap();
+    let (up_port, _up) = EchoUpstream::spawn("private");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    basic_auth admin {hash}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+        )
+    });
+    let no_auth = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(no_auth.status, 401);
+    assert!(
+        no_auth.headers.contains("www-authenticate"),
+        "a basic_auth 401 must carry WWW-Authenticate"
+    );
+    let bad = format!(
+        "Authorization: Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("admin:wrong")
+    );
+    let resp = send_request_hdr(raddy.port(), Some("localhost"), "/", &[bad.as_str()]);
+    assert_eq!(resp.status, 401);
+    let good = format!(
+        "Authorization: Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("admin:secret")
+    );
+    let resp = send_request_hdr(raddy.port(), Some("localhost"), "/", &[good.as_str()]);
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=private");
+}
+
+#[test]
+fn forward_auth_delegates_and_rejects() {
+    // `forward_auth` (spec §5.10): the auth upstream's 2xx lets the request
+    // through to the real upstream; its 401 rejects it.
+    let (auth_port, _auth) = AuthUpstream::spawn();
+    let (real_port, _real) = EchoUpstream::spawn("real");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    forward_auth 127.0.0.1:{auth_port}\n    reverse_proxy 127.0.0.1:{real_port}\n}}\n"
+        )
+    });
+    let ok = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.body, "label=real");
+    let denied = send_request(raddy.port(), Some("localhost"), "/deny");
+    assert_eq!(denied.status, 401);
 }
 
 #[test]

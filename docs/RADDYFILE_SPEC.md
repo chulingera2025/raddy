@@ -125,8 +125,8 @@ trusted, so the default must be pinned down:
 | `handle_path` | like `handle`, but strips the matched path prefix from the URI (see Section 5.9) | Available |
 | `respond` | `respond <status> [<body>]` — answer directly with a status/body (terminal; see Section 5.9) | Available |
 | `error` | `error [<status>] [<message>]` — trigger the internal error response (terminal; see Section 5.9) | Available |
-| `basic_auth` | `basic_auth <user> <bcrypt-hash>` — HTTP Basic auth guard (see Section 5.10) | Planned |
-| `forward_auth` | `forward_auth <target>` — delegate auth to an upstream (see Section 5.10) | Planned |
+| `basic_auth` | `basic_auth <user> <bcrypt-hash>` — HTTP Basic auth guard (see Section 5.10) | Available |
+| `forward_auth` | `forward_auth <target>` — delegate auth to an upstream (see Section 5.10) | Available |
 | `import` / `(name)` | `import <file|name>` multi-file includes / snippets (see Section 5.12) | Planned |
 | `access_log` | `access_log <path> [format=<json|common>]` or `off` (see Section 5.13) | Planned |
 
@@ -413,17 +413,19 @@ api.example.com {
 
 ### 5.10 `basic_auth` / `forward_auth`
 
+**Status: Available.**
+
 - `basic_auth <user> <bcrypt-hash>`: a **guard** requiring HTTP Basic
   authentication. Several `basic_auth` directives build the user table; a request
   must present credentials for one of them whose password verifies against the
   bcrypt hash, otherwise **401** with `WWW-Authenticate: Basic`. Generate hashes
-  with `htpasswd -B` (or raddy's own helper once shipped).
+  with `htpasswd -B`.
 - `forward_auth <target>`: a **guard** that delegates authentication to upstream
-  `target`: raddy forwards the request (carrying `X-Forwarded-For` and the auth
-  headers) and grants access only on a **2xx** response; a **401** is passed
-  through as 401 and a **403** as 403. Response headers from the auth upstream
-  (e.g. an identity header) are copied onto the request before the real upstream
-  sees it.
+  `target` (`host:port`): raddy forwards a request (carrying the original
+  `Authorization` and `X-Forwarded-For`) and grants access only on a **2xx**
+  response; a **403** is passed through and anything else yields **401**. Response
+  headers from the auth upstream (e.g. an identity header) are copied onto the
+  request before the real upstream sees it.
 
 Both are guards like `rate_limit`: they apply to whichever terminal serves the
 block, and inside a `handle` block only to that block's terminal.

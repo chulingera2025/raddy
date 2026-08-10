@@ -39,6 +39,8 @@ use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 /// The process-lifetime proxy handler.
 pub struct ProxyHandler {
@@ -70,6 +72,41 @@ impl ProxyHandler {
             access_log,
             rate_limiter,
         }
+    }
+
+    /// Evaluate the auth guards (spec §5.10) for the effective modifier
+    /// directives. Returns the rejection to answer with, or `None` when the
+    /// request passes. A passing `forward_auth` stores the auth upstream's
+    /// response headers in `ctx.forward_auth_headers`.
+    async fn check_auth_guards(
+        &self,
+        session: &mut Session,
+        modifiers: &[Modifier],
+        ctx: &mut ProxyCtx,
+    ) -> Result<Option<AuthReject>, Box<Error>> {
+        // `basic_auth`: the request must match one of the configured users.
+        let users: Vec<&(String, String)> = modifiers
+            .iter()
+            .filter_map(|m| match m {
+                Modifier::BasicAuth { users } => Some(users.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if !users.is_empty() && !basic_auth_matches(session, &users) {
+            return Ok(Some(AuthReject::BasicUnauthorized));
+        }
+        // `forward_auth`: last occurrence wins.
+        if let Some(target) = modifiers.iter().rev().find_map(|m| match m {
+            Modifier::ForwardAuth { target } => Some(target.as_str()),
+            _ => None,
+        }) {
+            match forward_auth_check(session, target).await? {
+                ForwardAuthOutcome::Pass(headers) => ctx.forward_auth_headers = headers,
+                ForwardAuthOutcome::Reject(status) => return Ok(Some(AuthReject::Status(status))),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -121,6 +158,9 @@ pub struct ProxyCtx {
     /// prefix strip and `rewrite` modifiers (spec §5.9). `None` until a
     /// reverse-proxy terminal is selected (only forwarding needs it).
     serve_path: Option<String>,
+    /// Response headers from a passing `forward_auth` upstream (spec §5.10),
+    /// copied onto the request before the real upstream sees it.
+    forward_auth_headers: Vec<(String, String)>,
 }
 
 #[async_trait]
@@ -198,6 +238,25 @@ impl ProxyHttp for ProxyHandler {
                                 }
                             }
                         }
+                    }
+                    // Auth guards (spec §5.10): `basic_auth` and `forward_auth`
+                    // gate whichever terminal serves the block.
+                    if let Some(reject) = self.check_auth_guards(session, &modifiers, ctx).await? {
+                        match reject {
+                            AuthReject::BasicUnauthorized => {
+                                let mut resp = ResponseHeader::build(401, None)?;
+                                resp.insert_header(
+                                    http::header::WWW_AUTHENTICATE,
+                                    "Basic realm=\"restricted\"",
+                                )?;
+                                resp.insert_header(http::header::CONTENT_LENGTH, "0")?;
+                                session.write_response_header(Box::new(resp), true).await?;
+                            }
+                            AuthReject::Status(status) => {
+                                session.respond_error(status).await?;
+                            }
+                        }
+                        return Ok(true);
                     }
                     // The effective request path the terminal serves: `handle_path`
                     // strips its matched prefix, then `rewrite` modifiers
@@ -376,6 +435,16 @@ impl ProxyHttp for ProxyHandler {
                 }
             }
         }
+        // Headers from a passing `forward_auth` upstream (spec §5.10), copied
+        // onto the request so the real upstream sees the identity headers.
+        for (name, value) in &ctx.forward_auth_headers {
+            if let (Ok(name), Ok(value)) = (
+                http::HeaderName::from_bytes(name.as_bytes()),
+                http::HeaderValue::from_str(value),
+            ) {
+                let _ = upstream_request.insert_header(name, value);
+            }
+        }
         let ops = header_ops(&ctx.modifiers, true, session);
         apply_header_ops(&ops, |name, value| {
             let _ = upstream_request.insert_header(name, value);
@@ -496,6 +565,134 @@ fn build_tls_peer(addr: SocketAddr, default_sni: &str, tls: &UpstreamTls) -> Htt
     peer.options.ca = tls.ca.clone();
     peer.client_cert_key = tls.client_cert.clone();
     peer
+}
+
+/// The rejection an auth guard produces (spec §5.10).
+enum AuthReject {
+    /// 401 with `WWW-Authenticate: Basic` (a failed `basic_auth`).
+    BasicUnauthorized,
+    /// A status to answer with (a failed `forward_auth`).
+    Status(u16),
+}
+
+/// The outcome of a `forward_auth` delegation (spec §5.10).
+enum ForwardAuthOutcome {
+    /// The auth upstream granted access; its response headers are copied back.
+    Pass(Vec<(String, String)>),
+    /// The auth upstream refused with this status.
+    Reject(u16),
+}
+
+/// Whether the request's Basic credentials match any configured user.
+fn basic_auth_matches(session: &Session, users: &[&(String, String)]) -> bool {
+    use base64::Engine;
+    let Some(auth) = session
+        .req_header()
+        .headers
+        .get(http::header::AUTHORIZATION)
+    else {
+        return false;
+    };
+    let Ok(auth) = auth.to_str() else {
+        return false;
+    };
+    let Some(encoded) = auth.strip_prefix("Basic ") else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return false;
+    };
+    let Some((user, password)) = decoded.split_once(':') else {
+        return false;
+    };
+    users.iter().any(|(configured, hash)| {
+        configured == user && bcrypt::verify(password, hash).unwrap_or(false)
+    })
+}
+
+/// Delegate authentication to the `host:port` target (spec §5.10): forward a
+/// GET carrying the original Authorization and X-Forwarded-For headers; a 2xx
+/// passes (copying response headers), a 403 is passed through, anything else
+/// rejects with 401.
+async fn forward_auth_check(
+    session: &Session,
+    target: &str,
+) -> Result<ForwardAuthOutcome, Box<Error>> {
+    let (host, port) = target
+        .rsplit_once(':')
+        .ok_or_else(|| Error::explain(InternalError, "invalid forward_auth target"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| Error::explain(InternalError, "invalid forward_auth port"))?;
+    let mut stream = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| Error::because(InternalError, "forward_auth connect failed", e))?;
+    let auth = session
+        .req_header()
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let xff = session
+        .req_header()
+        .headers
+        .get("x-forwarded-for")
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let path = session
+        .req_header()
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {auth}\r\nX-Forwarded-For: {xff}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| Error::because(InternalError, "forward_auth write failed", e))?;
+    // Read the response head through \r\n\r\n (bounded).
+    let mut head = Vec::new();
+    let mut buf = [0u8; 512];
+    while head.len() < 16 * 1024 {
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| Error::because(InternalError, "forward_auth read failed", e))?;
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&buf[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head_str = String::from_utf8_lossy(&head);
+    let status = head_str
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        let reject = if status == 403 { 403 } else { 401 };
+        return Ok(ForwardAuthOutcome::Reject(reject));
+    }
+    // Parse response headers (skipping the status line) for copying back.
+    let mut headers = Vec::new();
+    for line in head_str.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_string();
+            let value = value.trim().to_string();
+            if !name.is_empty() {
+                headers.push((name, value));
+            }
+        }
+    }
+    Ok(ForwardAuthOutcome::Pass(headers))
 }
 
 /// Build a structured access-log entry from the session and context.

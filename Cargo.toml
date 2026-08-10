@@ -12,6 +12,9 @@ categories = ["network-programming", "web-programming"]
 [dependencies]
 arc-swap = "1"
 async-trait = "0.1"
+base64 = "0.23"
+# bcrypt password verification for the `basic_auth` guard (spec §5.10).
+bcrypt = "0.19"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
