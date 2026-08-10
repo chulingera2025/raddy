@@ -1757,6 +1757,16 @@ fn reverse_proxy_streams_zstd_before_eos() {
 }
 
 #[test]
+fn reverse_proxy_streams_brotli_before_eos() {
+    streaming_compression_scenario("br", "br", |body| {
+        let mut decoder = brotli::Decompressor::new(body, 4096);
+        let mut decoded = Vec::new();
+        Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+        decoded
+    });
+}
+
+#[test]
 fn file_server_applies_header_down() {
     let dir = std::env::temp_dir().join(format!("raddy_fs_hd_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

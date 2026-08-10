@@ -439,6 +439,8 @@ api.example.com {
 
 ### 5.11 `encode` algorithms
 
+**Status: Available.**
+
 `encode` accepts `br` (Brotli) in addition to `gzip` and `zstd`; argument order
 is still the server preference — `encode br zstd gzip` prefers Brotli. An
 algorithm is used only when listed; it is negotiated against the client's

@@ -707,14 +707,19 @@ impl<'a> Parser<'a> {
             return Err(self.err("unexpected '{' after encode"));
         }
         if words.len() < 2 {
-            return Err(self.err("encode requires at least one algorithm (gzip, zstd)"));
+            return Err(self.err("encode requires at least one algorithm (gzip, zstd, br)"));
         }
         let mut algorithms = Vec::new();
         for alg in &words[1..] {
             match alg.as_str() {
                 "gzip" => algorithms.push(Encoding::Gzip),
                 "zstd" => algorithms.push(Encoding::Zstd),
-                other => return Err(self.err(format!("unknown encode algorithm '{other}'"))),
+                "br" => algorithms.push(Encoding::Brotli),
+                other => {
+                    return Err(self.err(format!(
+                        "unknown encode algorithm '{other}' (expected gzip, zstd, or br)"
+                    )))
+                }
             }
         }
         Ok(Directive::Encode { algorithms })

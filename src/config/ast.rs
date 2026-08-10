@@ -520,11 +520,13 @@ pub enum Matcher {
     Not(Box<Matcher>),
 }
 
-/// A compression algorithm for the `encode` directive (runtime in M5).
+/// A compression algorithm for the `encode` directive (spec §5.11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
     Gzip,
     Zstd,
+    /// Brotli (`br`).
+    Brotli,
 }
 
 /// The load-balancing policy of a `reverse_proxy` block (M9, §5.1).
