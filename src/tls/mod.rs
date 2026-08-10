@@ -22,11 +22,15 @@
 //! Each stored certificate also records its `notAfter` (M8) so the renewal
 //! scheduler can re-issue before expiry.
 
+use crate::config::ast::{ClientAuthMode, SiteKey, TlsConfig, TlsVersion};
+use crate::config::snapshot::ConfigStore;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use openssl::ssl::{SslVerifyMode, SslVersion};
+use openssl::x509::store::{X509Store, X509StoreBuilder};
 use pingora::listeners::TlsAccept;
 use pingora::protocols::tls::TlsRef;
 use pingora::tls::{ext, pkey::PKey, ssl::NameType, x509::X509};
@@ -129,15 +133,164 @@ fn leaf_not_after(cert: &CertKey) -> Option<SystemTime> {
 /// When the requested hostname has no certificate, `on_miss` is invoked (the
 /// ACME on-demand path) and the handshake proceeds without a certificate, so it
 /// fails; the client is expected to retry once issuance completes.
+///
+/// For a hostname that is a named site with a `tls` directive (spec §5.7), the
+/// callback also applies that site's per-SNI options on the handshake:
+/// `min_version` / `max_version`, `ciphers`, and `client_auth` (mTLS). The
+/// options are read from the current config snapshot, so a reload updates them
+/// without rebuilding the listener (ADR-010).
+///
+/// The callback is bound to one TLS listener's port, so `example.com:443` and
+/// `example.com:8443` can carry independent certificates and options (P2).
 pub struct SniCallback {
     store: Arc<CertStore>,
     on_miss: Arc<dyn Fn(&str) + Send + Sync>,
+    config: Arc<ConfigStore>,
+    /// The local port of the TLS listener this callback serves. Certificates
+    /// and per-site options are keyed by `(host, port)` so the same hostname on
+    /// two TLS ports stays independent (P2).
+    port: u16,
+    /// Cache of parsed mTLS CA certificates, keyed by CA file path. mTLS sites
+    /// are few, so this is bounded by the number of distinct CA files; caching
+    /// the parsed certs avoids re-reading and re-parsing the CA PEM on every
+    /// handshake. (The `X509Store` itself is built per handshake — it is not
+    /// `Clone`.)
+    ca_cache: Mutex<HashMap<String, Arc<Vec<X509>>>>,
 }
 
 impl SniCallback {
     /// Create a callback backed by `store`; `on_miss` fires for unknown SNI.
-    pub fn new(store: Arc<CertStore>, on_miss: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
-        Self { store, on_miss }
+    /// `config` supplies the per-site `tls` options applied on the handshake;
+    /// `port` is this TLS listener's local port (cert/options keying).
+    pub fn new(
+        store: Arc<CertStore>,
+        config: Arc<ConfigStore>,
+        port: u16,
+        on_miss: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        Self {
+            store,
+            on_miss,
+            config,
+            port,
+            ca_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The certificate-store key for `host` on this listener's port (P2): the
+    /// bare host on the default 443 (where ACME certs live), `host:port`
+    /// otherwise.
+    fn cert_key(&self, host: &str) -> String {
+        if self.port == 443 {
+            host.to_string()
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
+
+    /// Apply a site's per-SNI TLS options (spec §5.7) to an in-progress
+    /// handshake. Runs from within `certificate_callback`, before the version,
+    /// cipher, and client-certificate decisions are finalized. Best-effort:
+    /// an invalid cipher list or a missing CA file is logged, never fatal.
+    fn apply_site_tls_options(&self, ssl: &mut TlsRef, tls: &TlsConfig) {
+        if let Some(v) = tls.min_version {
+            if let Err(e) = ssl.set_min_proto_version(Some(tls_ssl_version(v))) {
+                tracing::warn!("failed to set min TLS version: {e}");
+            }
+        }
+        if let Some(v) = tls.max_version {
+            if let Err(e) = ssl.set_max_proto_version(Some(tls_ssl_version(v))) {
+                tracing::warn!("failed to set max TLS version: {e}");
+            }
+        }
+        if let Some(ciphers) = &tls.ciphers {
+            if let Err(e) = ssl.set_cipher_list(ciphers) {
+                tracing::warn!("invalid tls ciphers '{ciphers}': {e}");
+            }
+        }
+        if let Some(client_auth) = &tls.client_auth {
+            // `require` also rejects clients that present no certificate.
+            let mode = match client_auth.mode {
+                ClientAuthMode::Require => {
+                    SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
+                }
+                ClientAuthMode::Optional => SslVerifyMode::PEER,
+            };
+            ssl.set_verify(mode);
+            // Fail closed: the trust store is always set — an unreadable CA (or
+            // a store-build failure) falls back to an EMPTY store, so `require`
+            // rejects every client (no certificate chains, and absent
+            // certificates are refused by FAIL_IF_NO_PEER_CERT) instead of
+            // silently disabling client authentication.
+            let store = self.ca_store(&client_auth.ca_file);
+            if let Err(e) = ssl.set_verify_cert_store(store) {
+                tracing::warn!("failed to set mTLS CA store: {e}");
+            }
+        }
+    }
+
+    /// The named site's `tls` config for `host` on this listener's port, if any
+    /// (spec §5.7, P2).
+    fn site_tls(&self, host: &str) -> Option<TlsConfig> {
+        let config = self.config.load();
+        config
+            .sites
+            .iter()
+            .find(|site| {
+                matches!(&site.key, SiteKey::Named { host: h, port } if h == host && *port == self.port)
+            })
+            .and_then(|site| site.tls.clone())
+    }
+
+    /// Parse (and cache) an mTLS CA PEM file into its certificates. A missing or
+    /// unparsable CA is logged and yields `None` (the caller fails closed).
+    fn ca_certs(&self, path: &str) -> Option<Arc<Vec<X509>>> {
+        if let Ok(cache) = self.ca_cache.lock() {
+            if let Some(certs) = cache.get(path) {
+                return Some(certs.clone());
+            }
+        }
+        let pem = match std::fs::read_to_string(path) {
+            Ok(pem) => pem,
+            Err(e) => {
+                tracing::error!(
+                    "tls client_auth CA file {path} unreadable ({e}); rejecting mTLS clients"
+                );
+                return None;
+            }
+        };
+        let certs: Arc<Vec<X509>> = match X509::stack_from_pem(pem.as_bytes()) {
+            Ok(certs) => Arc::new(certs),
+            Err(e) => {
+                tracing::error!(
+                    "tls client_auth CA file {path} is not valid PEM ({e}); rejecting mTLS clients"
+                );
+                return None;
+            }
+        };
+        if let Ok(mut cache) = self.ca_cache.lock() {
+            cache.insert(path.to_string(), certs.clone());
+        }
+        Some(certs)
+    }
+
+    /// Build the mTLS trust store from the cached CA certificates. An unreadable
+    /// CA falls back to an empty store (fail closed), never an unset one.
+    fn ca_store(&self, path: &str) -> X509Store {
+        let certs = self.ca_certs(path).unwrap_or_default();
+        let mut builder = X509StoreBuilder::new().expect("X509StoreBuilder::new cannot fail");
+        for cert in certs.iter() {
+            let _ = builder.add_cert(cert.clone());
+        }
+        builder.build()
+    }
+}
+
+/// Map a config TLS version to the openssl `SslVersion`.
+fn tls_ssl_version(version: TlsVersion) -> SslVersion {
+    match version {
+        TlsVersion::Tls12 => SslVersion::TLS1_2,
+        TlsVersion::Tls13 => SslVersion::TLS1_3,
     }
 }
 
@@ -155,7 +308,8 @@ impl TlsAccept for SniCallback {
             // without a certificate.
             return;
         };
-        match self.store.get(&sni) {
+        let cert_key = self.cert_key(&sni);
+        match self.store.get(&cert_key) {
             Some(cert) => {
                 if let Err(e) = ext::ssl_use_certificate(ssl, cert.leaf()) {
                     tracing::warn!("failed to set certificate for {sni}: {e}");
@@ -172,6 +326,10 @@ impl TlsAccept for SniCallback {
                 tracing::warn!("no certificate for SNI '{sni}'; triggering on-demand issuance");
                 (self.on_miss)(&sni);
             }
+        }
+        // Per-site TLS options (spec §5.7): min/max version, ciphers, mTLS.
+        if let Some(tls) = self.site_tls(&sni) {
+            self.apply_site_tls_options(ssl, &tls);
         }
     }
 }
@@ -288,8 +446,13 @@ mod tests {
             "example.test",
             cert_key_from_pem(&cert_pem, &key_pem).unwrap(),
         );
+        let config = Arc::new(ConfigStore::new(crate::config::ast::CompiledConfig {
+            global: crate::config::ast::GlobalConfig::default(),
+            sites: vec![],
+        }));
 
-        let callbacks: TlsAcceptCallbacks = Box::new(SniCallback::new(store, Arc::new(|_| {})));
+        let callbacks: TlsAcceptCallbacks =
+            Box::new(SniCallback::new(store, config, 443, Arc::new(|_| {})));
         let acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
             .unwrap()
             .build();
@@ -324,5 +487,78 @@ mod tests {
             .await
             .unwrap()
             .expect("server handshake should succeed");
+    }
+
+    #[test]
+    fn cert_key_is_scoped_by_port() {
+        // ACME certs live under the bare host on 443; a non-default TLS port
+        // gets `host:port` so two TLS ports on the same host stay independent
+        // (P2).
+        let store = Arc::new(CertStore::new());
+        let config = Arc::new(ConfigStore::new(crate::config::ast::CompiledConfig {
+            global: crate::config::ast::GlobalConfig::default(),
+            sites: vec![],
+        }));
+        let cb443 = SniCallback::new(store.clone(), config.clone(), 443, Arc::new(|_| {}));
+        let cb8443 = SniCallback::new(store, config, 8443, Arc::new(|_| {}));
+        assert_eq!(cb443.cert_key("example.com"), "example.com");
+        assert_eq!(cb8443.cert_key("example.com"), "example.com:8443");
+    }
+
+    #[test]
+    fn site_tls_options_are_scoped_by_port() {
+        // `example.com:443` and `example.com:8443` carry independent `tls`
+        // configs; the callback for each port must see its own (P2).
+        use crate::config::ast::{CompiledSite, SiteKey, TlsConfig, TlsSource, TlsVersion};
+        let site_443 = CompiledSite {
+            key: SiteKey::Named {
+                host: "example.com".into(),
+                port: 443,
+            },
+            terminals: vec![],
+            modifiers: vec![],
+            trusted_proxies: None,
+            tls: Some(TlsConfig {
+                source: TlsSource::Acme,
+                min_version: Some(TlsVersion::Tls13),
+                ..Default::default()
+            }),
+            access_log_off: false,
+        };
+        let site_8443 = CompiledSite {
+            key: SiteKey::Named {
+                host: "example.com".into(),
+                port: 8443,
+            },
+            terminals: vec![],
+            modifiers: vec![],
+            trusted_proxies: None,
+            tls: Some(TlsConfig {
+                source: TlsSource::Internal,
+                ..Default::default()
+            }),
+            access_log_off: false,
+        };
+        let config = Arc::new(ConfigStore::new(crate::config::ast::CompiledConfig {
+            global: crate::config::ast::GlobalConfig::default(),
+            sites: vec![site_443, site_8443],
+        }));
+        let cb443 = SniCallback::new(
+            Arc::new(CertStore::new()),
+            config.clone(),
+            443,
+            Arc::new(|_| {}),
+        );
+        let cb8443 = SniCallback::new(Arc::new(CertStore::new()), config, 8443, Arc::new(|_| {}));
+        assert_eq!(
+            cb443.site_tls("example.com").and_then(|t| t.min_version),
+            Some(TlsVersion::Tls13),
+            "the 443 site has the TLS 1.3 floor"
+        );
+        assert_eq!(
+            cb8443.site_tls("example.com").map(|t| t.source),
+            Some(TlsSource::Internal),
+            "the 8443 site has its own internal source"
+        );
     }
 }

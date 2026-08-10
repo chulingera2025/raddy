@@ -15,10 +15,73 @@ hero:
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 Raddy is a reverse proxy gateway in Rust, built on
-[Cloudflare Pingora](https://github.com/cloudflare/pingora). You write a
-**Raddyfile** — a Caddyfile-style configuration — and raddy handles routing,
-automatic HTTPS, static files, compression, rate limiting, and access logs, with
-Pingora's performance and memory safety.
+[Cloudflare Pingora](https://github.com/cloudflare/pingora) — the same proxy
+framework that powers Cloudflare's edge. You write a **Raddyfile**, a
+Caddyfile-style configuration, and raddy handles routing, automatic HTTPS,
+static files, compression, rate limiting, and access logs with Pingora's
+performance and memory safety.
+
+The result is a single small binary that does what a reverse proxy should —
+with configuration you can read and predict.
+
+## Why Raddy?
+
+- **Fast by construction.** Raddy is built on Pingora: multi-threaded event
+  loops, shared connection pools, and no garbage collector. The proxy hot path
+  adds minimal overhead over bare Pingora.
+- **Configuration you can reason about.** Directives run **strictly in write
+  order**. What you write is what happens — there is no hidden directive-ordering
+  table. Every directive is a terminal ("who serves this request"), a modifier
+  ("how to serve it"), or a guard ("who may be served").
+- **Production TLS, out of the box.** Automatic HTTPS with ACME (HTTP-01 or
+  DNS-01), SNI certificate selection, per-site TLS options, mutual TLS, and
+  HTTP/2 downstream.
+- **Zero-downtime operations.** SIGHUP reloads swap the routing snapshot
+  atomically; `raddy upgrade` hands listening sockets to a new binary without
+  dropping a connection.
+- **Safe by default.** Nothing is trusted unless you say so: raddy ignores
+  `X-Forwarded-For` until you declare `trusted_proxies`, and unreadable
+  credentials fail closed.
+
+## Feature highlights
+
+- **Routing & matching** — route by `path`, `host`, `method`, `header`,
+  `query`, `remote_ip`, or `protocol`, with `!` negation and space-separated ANDed
+  terms; `handle`, `handle_path`, `rewrite`, `respond`, and `error` give you
+  precise control over what serves each request.
+- **Reverse proxying** — one or many upstreams with round-robin, random, or
+  IP-hash balancing, active health checks, **TLS to the backend** (`https://`
+  upstreams with SNI, custom CAs, and client certificates), and transparent
+  **WebSocket** upgrade forwarding.
+- **Automatic HTTPS** — ACME certificates via HTTP-01 or DNS-01, renewed
+  automatically, plus a `tls` directive for self-signed (`internal`), static
+  certificates, protocol-version and cipher limits, and **mTLS** client
+  authentication.
+- **Auth guards** — `basic_auth` with bcrypt hashes and `forward_auth` to a
+  dedicated auth upstream.
+- **Compression** — gzip, zstd, and **Brotli** (`encode br`), negotiated against
+  the client's `Accept-Encoding`.
+- **Rate limiting** — token-bucket limits keyed on the real client IP or on any
+  request header.
+- **Static files** — `file_server` with index files, traversal protection, and
+  compression.
+- **Configuration DX** — multi-file `import`, reusable `(name)` snippets, and
+  `{$ENV}` variable substitution.
+- **Observability** — Prometheus metrics, JSON or Common Log Format access logs,
+  configurable per site.
+
+## When to use raddy
+
+Raddy fits when you want a small, fast, predictable reverse proxy:
+
+- Putting one or more HTTP/HTTPS services on the internet behind automatic TLS.
+- Serving static content and proxying an API from a single process.
+- Controlling routing, rate limits, and auth in a configuration file you can
+  validate with `raddy check` and reload with SIGHUP.
+
+Raddy is **single-instance**: rate limits are counted per process, not shared
+across a cluster. If you need cluster-wide coordination, external shared
+services, or a plugin system, a larger proxy is a better fit.
 
 <CardGrid>
 	<Card title="Predictable configuration" icon="cursor-click">
@@ -28,16 +91,17 @@ Pingora's performance and memory safety.
 	<Card title="Automatic HTTPS" icon="lock">
 		Native ACME — HTTP-01 by default, or **DNS-01** via
 		[`dns_challenge cloudflare`](config/directives/#dns_challenge) — with SNI
-		certificates, out of the box.
+		certificates and HTTP/2, out of the box.
 	</Card>
 	<Card title="Hot reload" icon="refresh">
 		SIGHUP swaps the routing snapshot atomically; connections stay up.
 	</Card>
 	<Card title="Edge protection" icon="shield">
-		Rate limiting built on a trusted-proxy model for the real client IP.
+		Rate limiting and auth guards, with a trusted-proxy model for the real
+		client IP.
 	</Card>
 	<Card title="Observability" icon="chart">
-		Prometheus metrics and structured JSON access logs.
+		Prometheus metrics and structured JSON or Common Log Format access logs.
 	</Card>
 	<Card title="Zero-downtime upgrades" icon="rocket">
 		`raddy upgrade` hands listening sockets to a new binary without dropping
@@ -50,7 +114,8 @@ Pingora's performance and memory safety.
 <CardGrid>
 	<LinkCard title="Quick start" href="quickstart/" description="Write your first Raddyfile and serve traffic in five minutes." />
 	<LinkCard title="Configuration guide" href="config/" description="The mental model behind the Raddyfile: how a request flows through your config." />
-	<LinkCard title="Common configurations" href="guides/static-files/" description="Copy-pasteable setups: static files, HTTP→HTTPS redirect, API proxying." />
+	<LinkCard title="HTTPS & TLS" href="guides/https-tls/" description="Automatic HTTPS, the tls directive, upstream TLS, mTLS, and HTTP/2." />
+	<LinkCard title="Routing & matchers" href="guides/routing/" description="Route by path, host, method, header, query, client IP, or protocol." />
 	<LinkCard title="Directive reference" href="config/directives/" description="Every directive with syntax and examples." />
 	<LinkCard title="CLI reference" href="cli/" description="All `raddy` subcommands and options." />
 	<LinkCard title="Operations" href="operations/metrics/" description="Metrics, access logs, and the performance baseline." />

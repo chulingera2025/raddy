@@ -32,11 +32,10 @@
 //! O(EVICT_SCAN) worst case — a remote attacker cannot amplify a full-table
 //! sort the way the old single-map LRU sweep could.
 
-use crate::config::ast::{RateLimitKey, RateSpec, SiteKey};
+use crate::config::ast::{RateSpec, SiteKey};
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasher;
-use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -60,7 +59,12 @@ struct BucketKey {
     /// The position of the `rate_limit` modifier within its effective scope, so
     /// several `rate_limit` directives on the same terminal stay independent.
     directive: usize,
-    ip: IpAddr,
+    /// The counter identity as a fixed-length digest of the key material (the
+    /// client IP for `remote_ip`, the request header value for `header <name>`,
+    /// spec §5.2). Hashing bounds the per-bucket memory regardless of header
+    /// value size (P1), so the `MAX_BUCKETS` memory cap holds under a flood of
+    /// large distinct header values.
+    key: u64,
 }
 
 /// One token bucket.
@@ -131,21 +135,23 @@ impl RateLimiter {
     /// directives within the same effective scope.
     ///
     /// Returns `true` when a token was available (the request proceeds), `false`
-    /// when the bucket was empty (the caller should answer 429).
+    /// when the bucket was empty (the caller should answer 429). `key` is the
+    /// counter identity derived from the spec's key (the client IP for
+    /// `remote_ip`, the header value for `header <name>`); it is hashed to a
+    /// fixed-length digest before storage (P1).
     pub fn allow(
         &self,
         site: &SiteKey,
         terminal: usize,
         directive: usize,
-        ip: IpAddr,
+        key: &str,
         spec: &RateSpec,
     ) -> bool {
-        debug_assert_eq!(spec.key, RateLimitKey::RemoteIp);
         let key = BucketKey {
             site: site.clone(),
             terminal,
             directive,
-            ip,
+            key: self.state.hash_one(key),
         };
         let mut shard = self.shards[self.shard_index(&key)]
             .lock()
@@ -238,7 +244,8 @@ fn evict_one(shard: &mut Shard) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ast::{RateUnit, SiteKey};
+    use crate::config::ast::{RateLimitKey, RateUnit, SiteKey};
+    use std::net::IpAddr;
     use std::sync::Arc;
 
     fn spec(count: u64, burst: u64) -> RateSpec {
@@ -251,19 +258,20 @@ mod tests {
     }
 
     /// A distinct loopback IPv4 per `n` (supports > 256 distinct addresses).
-    fn ip(n: u32) -> IpAddr {
-        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, (n >> 8) as u8, n as u8))
+    fn ip(n: u32) -> String {
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, (n >> 8) as u8, n as u8)).to_string()
     }
 
     /// A distinct IPv4 in the 10/8 test range per `n` (2^24 distinct values),
     /// for capacity floods that must exceed the whole sharded capacity.
-    fn many_ip(n: u32) -> IpAddr {
+    fn many_ip(n: u32) -> String {
         IpAddr::V4(std::net::Ipv4Addr::new(
             10,
             (n >> 16) as u8,
             (n >> 8) as u8,
             n as u8,
         ))
+        .to_string()
     }
 
     fn key() -> SiteKey {
@@ -276,11 +284,11 @@ mod tests {
         let s = spec(3, 3);
         // The first `burst` requests pass instantly.
         for _ in 0..3 {
-            assert!(limiter.allow(&key(), 0, 0, ip(1), &s));
+            assert!(limiter.allow(&key(), 0, 0, &ip(1), &s));
         }
         // The next one is denied until a token refills.
-        assert!(!limiter.allow(&key(), 0, 0, ip(1), &s));
-        assert!(!limiter.allow(&key(), 0, 0, ip(1), &s));
+        assert!(!limiter.allow(&key(), 0, 0, &ip(1), &s));
+        assert!(!limiter.allow(&key(), 0, 0, &ip(1), &s));
     }
 
     #[test]
@@ -289,12 +297,12 @@ mod tests {
         // 100r/s, burst 100: one token refills every 10ms.
         let s = spec(100, 100);
         for _ in 0..100 {
-            assert!(limiter.allow(&key(), 0, 0, ip(1), &s));
+            assert!(limiter.allow(&key(), 0, 0, &ip(1), &s));
         }
-        assert!(!limiter.allow(&key(), 0, 0, ip(1), &s));
+        assert!(!limiter.allow(&key(), 0, 0, &ip(1), &s));
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(
-            limiter.allow(&key(), 0, 0, ip(1), &s),
+            limiter.allow(&key(), 0, 0, &ip(1), &s),
             "a token should have refilled after 30ms"
         );
     }
@@ -303,21 +311,21 @@ mod tests {
     fn buckets_are_independent_per_ip() {
         let limiter = RateLimiter::new();
         let s = spec(1, 1);
-        assert!(limiter.allow(&key(), 0, 0, ip(1), &s));
-        assert!(!limiter.allow(&key(), 0, 0, ip(1), &s));
+        assert!(limiter.allow(&key(), 0, 0, &ip(1), &s));
+        assert!(!limiter.allow(&key(), 0, 0, &ip(1), &s));
         // A different client IP gets a fresh bucket.
-        assert!(limiter.allow(&key(), 0, 0, ip(2), &s));
+        assert!(limiter.allow(&key(), 0, 0, &ip(2), &s));
     }
 
     #[test]
     fn buckets_are_independent_per_terminal_and_directive() {
         let limiter = RateLimiter::new();
         let s = spec(1, 1);
-        assert!(limiter.allow(&key(), 0, 0, ip(1), &s));
-        assert!(!limiter.allow(&key(), 0, 0, ip(1), &s));
+        assert!(limiter.allow(&key(), 0, 0, &ip(1), &s));
+        assert!(!limiter.allow(&key(), 0, 0, &ip(1), &s));
         // A different terminal or a second rate_limit directive is a new counter.
-        assert!(limiter.allow(&key(), 1, 0, ip(1), &s));
-        assert!(limiter.allow(&key(), 0, 1, ip(1), &s));
+        assert!(limiter.allow(&key(), 1, 0, &ip(1), &s));
+        assert!(limiter.allow(&key(), 0, 1, &ip(1), &s));
     }
 
     #[test]
@@ -326,9 +334,9 @@ mod tests {
         // A new client may spend its whole burst at once (spec §5.2).
         let s = spec(5, 5);
         for _ in 0..5 {
-            assert!(limiter.allow(&key(), 0, 0, ip(1), &s));
+            assert!(limiter.allow(&key(), 0, 0, &ip(1), &s));
         }
-        assert!(!limiter.allow(&key(), 0, 0, ip(1), &s));
+        assert!(!limiter.allow(&key(), 0, 0, &ip(1), &s));
     }
 
     #[test]
@@ -339,7 +347,7 @@ mod tests {
         // stay bounded per shard (structural invariant, no wall-clock timing).
         let flood = (SHARDS * PER_SHARD_CAP * 2) as u32;
         for i in 0..flood {
-            limiter.allow(&key(), 0, 0, many_ip(i), &s);
+            limiter.allow(&key(), 0, 0, &many_ip(i), &s);
         }
         let mut total = 0;
         for shard in &limiter.shards {
@@ -375,7 +383,7 @@ mod tests {
                 site: key(),
                 terminal: 0,
                 directive: 0,
-                ip: ip(i),
+                key: i as u64,
             };
             shard.map.insert(
                 bucket_key.clone(),
@@ -418,7 +426,7 @@ mod tests {
                 site: key(),
                 terminal: 0,
                 directive: 0,
-                ip: ip(i),
+                key: i as u64,
             };
             shard.map.insert(
                 bucket_key.clone(),
@@ -460,7 +468,7 @@ mod tests {
                 site: key(),
                 terminal: 0,
                 directive: 0,
-                ip: ip(i),
+                key: i as u64,
             };
             shard.map.insert(
                 bucket_key.clone(),
@@ -487,11 +495,11 @@ mod tests {
             site: key(),
             terminal: 0,
             directive: 0,
-            ip: ip(EVICT_SCAN as u32),
+            key: EVICT_SCAN as u64,
         };
         assert!(!shard.map.contains_key(&evicted));
         // The reprieved buckets rotate to the back in their original order.
-        assert_eq!(shard.recency.front().map(|k| k.ip), Some(ip(0)));
+        assert_eq!(shard.recency.front().map(|k| k.key), Some(0));
     }
 
     #[test]
@@ -501,10 +509,11 @@ mod tests {
         std::thread::scope(|scope| {
             for t in 0..8u32 {
                 let limiter = limiter.clone();
+                let s = s.clone();
                 scope.spawn(move || {
                     let base = t * 10_000;
                     for i in 0..10_000u32 {
-                        let _ = limiter.allow(&key(), 0, 0, many_ip(base + i), &s);
+                        let _ = limiter.allow(&key(), 0, 0, &many_ip(base + i), &s);
                     }
                 });
             }

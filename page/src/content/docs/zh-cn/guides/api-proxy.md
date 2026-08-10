@@ -69,6 +69,18 @@ raddy run -c Raddyfile
 **按 IP 粘性** —— 把 `round_robin` 换成 `ip_hash`,客户端会持续命中同一上游
 (对有状态后端有用)。
 
+**代理 WebSocket** —— 无需额外配置。`reverse_proxy` 透明转发 HTTP `Upgrade`
+请求,因此同一站点同时服务 WebSocket 与普通 HTTP 流量:
+
+```caddyfile
+chat.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+上游应答 `101 Switching Protocols` 后,raddy 便隧道该连接;后端本身必须能说
+升级后的协议。`encode` 绝不作用于升级响应。协议升级见[指令参考](../../config/directives/#websocket-and-protocol-upgrades)。
+
 **不同路径** —— 与 `handle` 组合,可在同一主机上为 API 限流、负载均衡,同时
 托管静态资源:
 

@@ -110,6 +110,8 @@ mod tests {
             terminals: Vec::<Terminal>::new(),
             modifiers: Vec::new(),
             trusted_proxies: None,
+            tls: None,
+            access_log_off: false,
         }
     }
 
@@ -122,6 +124,8 @@ mod tests {
             terminals: Vec::new(),
             modifiers: Vec::new(),
             trusted_proxies: None,
+            tls: None,
+            access_log_off: false,
         }
     }
 

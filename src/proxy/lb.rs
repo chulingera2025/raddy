@@ -23,13 +23,13 @@
 //! balancers can be created/replaced on reload without touching the server's
 //! fixed service set.
 
-use crate::config::ast::{HealthCheckSpec, LbPolicy, SiteKey, TerminalKind};
+use crate::config::ast::{HealthCheckSpec, LbPolicy, SiteKey, TerminalKind, UpstreamPeer};
 use async_trait::async_trait;
 use pingora::lb::health_check;
 use pingora::lb::selection::{BackendIter, BackendSelection, Consistent, Random, RoundRobin};
 use pingora::lb::LoadBalancer;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,8 +42,10 @@ const RUNNER_TICK: Duration = Duration::from_millis(100);
 #[async_trait]
 pub trait BackendSelector: Send + Sync {
     /// Pick a backend for `key` (the client IP for `ip_hash`; ignored by the
-    /// other policies). Returns `None` when every backend is unhealthy.
-    fn select(&self, key: &[u8]) -> Option<SocketAddr>;
+    /// other policies). Returns the index into the spec's `upstreams` so the
+    /// caller can recover the full peer (address + TLS scheme + host), or `None`
+    /// when every backend is unhealthy.
+    fn select(&self, key: &[u8]) -> Option<usize>;
     /// The health-check probe interval, if a health check is configured.
     fn probe_interval(&self) -> Option<Duration>;
     /// Run one round of health checks (no-op when none is configured).
@@ -51,9 +53,11 @@ pub trait BackendSelector: Send + Sync {
 }
 
 /// The specification that determines when a balancer must be rebuilt (ADR-011).
+/// Carries the resolved upstream peers (address + TLS scheme + original host),
+/// so changing any of them rebuilds the balancer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LbSpec {
-    pub upstreams: Vec<SocketAddr>,
+    pub upstreams: Vec<UpstreamPeer>,
     pub policy: LbPolicy,
     pub health_check: Option<HealthCheckSpec>,
 }
@@ -115,6 +119,7 @@ impl LoadBalancerPool {
                     upstreams,
                     lb_policy,
                     health_check,
+                    ..
                 } = &terminal.kind
                 else {
                     continue;
@@ -202,7 +207,7 @@ pub fn spawn_health_check_runner(pool: Arc<LoadBalancerPool>) {
 fn build_balancer(spec: &LbSpec) -> Arc<dyn BackendSelector> {
     // The upstreams were resolved by the validator, so they parse back as
     // `SocketAddr`; a failure here is a programming error.
-    let addrs: Vec<String> = spec.upstreams.iter().map(|a| a.to_string()).collect();
+    let addrs: Vec<String> = spec.upstreams.iter().map(|p| p.addr.to_string()).collect();
     match spec.policy {
         LbPolicy::RoundRobin => wrap(
             LoadBalancer::<RoundRobin>::try_from_iter(addrs).expect("resolved upstreams"),
@@ -236,6 +241,8 @@ where
     Arc::new(WrappedLb {
         inner: lb,
         interval,
+        upstreams: spec.upstreams.clone(),
+        rotation: AtomicUsize::new(0),
     })
 }
 
@@ -243,6 +250,12 @@ where
 struct WrappedLb<S: BackendSelection> {
     inner: LoadBalancer<S>,
     interval: Option<Duration>,
+    /// The resolved upstreams, so a selected address can be mapped back to a
+    /// peer (address + TLS scheme + host). Two peers may share an address but
+    /// differ in TLS identity (P2); the rotation counter round-robins among
+    /// them since pingora's `LoadBalancer` is keyed by address alone.
+    upstreams: Vec<UpstreamPeer>,
+    rotation: AtomicUsize,
 }
 
 #[async_trait]
@@ -251,12 +264,27 @@ where
     S: BackendSelection + Send + Sync + 'static,
     S::Iter: BackendIter,
 {
-    fn select(&self, key: &[u8]) -> Option<SocketAddr> {
+    fn select(&self, key: &[u8]) -> Option<usize> {
         // All configured upstreams are IP addresses; a non-inet backend is
         // treated as unavailable.
-        self.inner
-            .select(key, 256)
-            .and_then(|backend| backend.addr.as_inet().cloned())
+        let addr = self.inner.select(key, 256)?.addr.as_inet().cloned()?;
+        let indices: Vec<usize> = self
+            .upstreams
+            .iter()
+            .enumerate()
+            .filter(|(_, peer)| peer.addr == addr)
+            .map(|(index, _)| index)
+            .collect();
+        match indices.len() {
+            0 => None,
+            1 => Some(indices[0]),
+            // Several peers share the address with different TLS identities
+            // (P2): rotate among them so each virtual host gets traffic.
+            _ => {
+                let n = self.rotation.fetch_add(1, Ordering::Relaxed);
+                Some(indices[n % indices.len()])
+            }
+        }
     }
 
     fn probe_interval(&self) -> Option<Duration> {
@@ -275,7 +303,11 @@ mod tests {
     fn spec(policy: LbPolicy, upstreams: &[&str]) -> LbSpec {
         let upstreams = upstreams
             .iter()
-            .map(|s| s.parse().expect("test upstream"))
+            .map(|s| UpstreamPeer {
+                addr: s.parse().expect("test upstream"),
+                tls: false,
+                host: String::new(),
+            })
             .collect();
         LbSpec {
             upstreams,
@@ -361,5 +393,33 @@ mod tests {
         assert_eq!(balancer.select(b"").unwrap(), a, "third pick wraps back");
         // No health check configured → no probing.
         assert_eq!(balancer.probe_interval(), None);
+    }
+
+    #[test]
+    fn same_addr_peers_with_distinct_tls_rotate() {
+        let pool = LoadBalancerPool::new();
+        let key = SiteKey::CatchAll { port: 8080 };
+        // Two TLS peers sharing an address but carrying different hostnames must
+        // both be reachable (P2): selection alternates between their indices so
+        // the caller builds the correct SNI for each.
+        let mut spec = spec(LbPolicy::RoundRobin, &["10.0.0.1:443"]);
+        spec.upstreams[0].tls = true;
+        spec.upstreams[0].host = "a.example.com".into();
+        spec.upstreams.push(UpstreamPeer {
+            addr: "10.0.0.1:443".parse().unwrap(),
+            tls: true,
+            host: "b.example.com".into(),
+        });
+        let balancer = pool.balancer_for(&key, 0, spec);
+        let a = balancer.select(b"").unwrap();
+        let b = balancer.select(b"").unwrap();
+        assert_ne!(
+            a, b,
+            "same-address peers with distinct TLS identity must alternate"
+        );
+        assert!(
+            a < 2 && b < 2,
+            "selection must be an index into the two upstreams (got {a}, {b})"
+        );
     }
 }

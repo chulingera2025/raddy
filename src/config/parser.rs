@@ -20,8 +20,22 @@
 
 use crate::config::ast::*;
 use crate::config::lexer::{lex, Token, TokenKind};
+use std::collections::HashMap;
+
+/// The maximum size of a file pulled in by `import` (spec §5.12), so a config
+/// can never read unbounded input (e.g. `/dev/zero`). An oversized file is an
+/// error, never a silent truncation.
+const MAX_IMPORT_BYTES: u64 = 1 << 20;
+/// The maximum `import` nesting depth (spec §5.12).
+const MAX_IMPORT_DEPTH: usize = 32;
 
 /// Parse a Raddyfile into its source AST.
+///
+/// The input is preprocessed before the grammar parse (spec §5.12): `{$ENV}`
+/// placeholders are expanded from the environment (at the token level, so a
+/// value cannot change the configuration structure), `(name)` snippet
+/// definitions are captured, and `import` statements are spliced in
+/// (recursively).
 pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
     let tokens = lex(input).map_err(|message| ConfigError::Parse {
         file: file.to_string(),
@@ -29,6 +43,23 @@ pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
         col: 1,
         message,
     })?;
+    let tokens = expand_env_tokens(tokens).map_err(|message| ConfigError::Parse {
+        file: file.to_string(),
+        line: 1,
+        col: 1,
+        message,
+    })?;
+    let mut snippets = HashMap::new();
+    let mut stack = Vec::new();
+    let tokens =
+        expand_imports(file, tokens, &mut snippets, &mut stack, true).map_err(|message| {
+            ConfigError::Parse {
+                file: file.to_string(),
+                line: 1,
+                col: 1,
+                message,
+            }
+        })?;
     Parser {
         file,
         tokens,
@@ -36,6 +67,207 @@ pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
         stmt_pos: (1, 1),
     }
     .parse_raddyfile()
+}
+
+/// Expand `{$ENV}` placeholders at the token level (spec §5.12): a word token
+/// that is exactly `{$NAME}` is replaced by the value of `NAME` as a single
+/// argument token, so a value containing spaces, `#`, braces, or newlines
+/// cannot change the configuration structure (P2). A missing variable is an
+/// error.
+fn expand_env_tokens(tokens: Vec<Token>) -> Result<Vec<Token>, String> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match &token.kind {
+            TokenKind::Word(word) if is_env_token(word) => {
+                let name = &word[2..word.len() - 1];
+                let value = std::env::var(name)
+                    .map_err(|_| format!("environment variable '{name}' is not set"))?;
+                out.push(Token {
+                    kind: TokenKind::Word(value),
+                    ..token
+                });
+            }
+            _ => out.push(token),
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a word token is an `{$NAME}` environment placeholder.
+fn is_env_token(word: &str) -> bool {
+    word.starts_with("{$") && word.ends_with('}') && word.len() >= 4
+}
+
+/// Expand environment variables in a config's raw text (spec §5.12): every
+/// Expand `import` statements and collect `(name)` snippets in a token stream
+/// (spec §5.12). Snippet definitions at the top level are captured and removed;
+/// an `import <target>` at any nesting level is replaced by the snippet's tokens
+/// (when `<target>` names a snippet) or by the recursively-expanded tokens of
+/// the named file (resolved relative to `file`).
+fn expand_imports(
+    file: &str,
+    tokens: Vec<Token>,
+    snippets: &mut HashMap<String, Vec<Token>>,
+    stack: &mut Vec<String>,
+    top_level: bool,
+) -> Result<Vec<Token>, String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        match &token.kind {
+            TokenKind::Newline | TokenKind::RBrace => {
+                out.push(token.clone());
+                i += 1;
+            }
+            TokenKind::LBrace => {
+                let (content, end) = capture_block(&tokens, i);
+                if end == i {
+                    // Unclosed block; leave it for the parser to reject.
+                    out.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                out.push(token.clone());
+                out.extend(expand_imports(file, content, snippets, stack, false)?);
+                out.push(tokens[end].clone());
+                i = end + 1;
+            }
+            TokenKind::Word(_) => {
+                // Read the statement's words (up to a newline, `{`, or `}`).
+                let mut words: Vec<Token> = Vec::new();
+                let mut j = i;
+                let mut opens_block = false;
+                while j < tokens.len() {
+                    match &tokens[j].kind {
+                        TokenKind::Word(_) => {
+                            words.push(tokens[j].clone());
+                            j += 1;
+                        }
+                        TokenKind::LBrace => {
+                            opens_block = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                // A top-level `(name) { ... }` is a snippet definition.
+                if top_level && opens_block && words.len() == 1 {
+                    if let Some(snippet_name) = strip_snippet_name(word_str(&words[0])) {
+                        let (content, end) = capture_block(&tokens, j);
+                        snippets.insert(snippet_name.to_string(), content);
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                // `import <target>` splices a snippet or an imported file.
+                if words.len() == 2 && word_str(&words[0]) == "import" {
+                    let target = word_str(&words[1]);
+                    if let Some(snippet) = snippets.get(target).cloned() {
+                        out.extend(snippet);
+                    } else {
+                        if stack.len() >= MAX_IMPORT_DEPTH {
+                            return Err(format!(
+                                "import nesting exceeds {MAX_IMPORT_DEPTH} levels"
+                            ));
+                        }
+                        let (imported_path, imported_text) = read_imported(file, target)?;
+                        if stack.contains(&imported_path) {
+                            return Err(format!("import cycle involving {imported_path}"));
+                        }
+                        stack.push(imported_path.clone());
+                        let imported_tokens = lex(&imported_text)
+                            .map_err(|message| format!("{imported_path}: {message}"))?;
+                        let imported_tokens = expand_env_tokens(imported_tokens)
+                            .map_err(|message| format!("{imported_path}: {message}"))?;
+                        out.extend(expand_imports(
+                            &imported_path,
+                            imported_tokens,
+                            snippets,
+                            stack,
+                            true,
+                        )?);
+                        stack.pop();
+                    }
+                    i = j;
+                    continue;
+                }
+                out.extend(words);
+                i = j;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read an imported file (spec §5.12), resolving `target` relative to `file`'s
+/// directory. The path is canonicalized (so `./a` and `././a` are the same file
+/// for cycle detection) and the read is bounded to [`MAX_IMPORT_BYTES`]; an
+/// oversized file is an error, never a silent truncation (P2).
+fn read_imported(file: &str, target: &str) -> Result<(String, String), String> {
+    use std::io::Read;
+    let path = std::path::Path::new(file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(target);
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("failed to read imported file {}: {e}", path.display()))?;
+    let mut content = String::new();
+    let f = std::fs::File::open(&canonical)
+        .map_err(|e| format!("failed to read imported file {}: {e}", canonical.display()))?;
+    let bytes = f
+        .take(MAX_IMPORT_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| format!("failed to read imported file {}: {e}", canonical.display()))?;
+    if bytes as u64 > MAX_IMPORT_BYTES {
+        return Err(format!(
+            "imported file {} exceeds the {} byte limit",
+            canonical.display(),
+            MAX_IMPORT_BYTES
+        ));
+    }
+    Ok((canonical.display().to_string(), content))
+}
+
+/// The word content of a token (assumed to be a `Word`).
+fn word_str(token: &Token) -> &str {
+    match &token.kind {
+        TokenKind::Word(w) => w.as_str(),
+        _ => unreachable!("word_str called on a non-word token"),
+    }
+}
+
+/// The snippet name of a `(name)` token, or `None`.
+fn strip_snippet_name(token: &str) -> Option<&str> {
+    token
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .filter(|name| !name.is_empty())
+}
+
+/// Given tokens starting at an `{`, return the tokens between the braces and
+/// the index of the matching `}` (or the opening index when unclosed).
+fn capture_block(tokens: &[Token], lb: usize) -> (Vec<Token>, usize) {
+    let mut depth = 0usize;
+    let mut end = lb;
+    for (k, token) in tokens.iter().enumerate().skip(lb) {
+        match token.kind {
+            TokenKind::LBrace => depth += 1,
+            TokenKind::RBrace => {
+                depth -= 1;
+                if depth == 0 {
+                    end = k;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end == lb {
+        // Unclosed block (no matching `}`); leave it for the parser to reject.
+        return (Vec::new(), lb);
+    }
+    (tokens[lb + 1..end].to_vec(), end)
 }
 
 /// The default port for a named site without an explicit port (M4 binds TLS).
@@ -355,15 +587,23 @@ impl<'a> Parser<'a> {
         let name = words.first().expect("dispatch called with empty words");
         match name.as_str() {
             "reverse_proxy" => self.parse_reverse_proxy(words, block_open),
-            "handle" => self.parse_handle(words, block_open),
+            "handle" => self.parse_handle(words, block_open, false),
+            "handle_path" => self.parse_handle(words, block_open, true),
             "header_up" => self.parse_header(words, block_open, true),
             "header_down" => self.parse_header(words, block_open, false),
             "file_server" => self.parse_file_server(words, block_open),
             "root" => self.parse_root(words, block_open),
             "encode" => self.parse_encode(words, block_open),
             "redir" => self.parse_redir(words, block_open),
+            "rewrite" => self.parse_rewrite(words, block_open),
+            "respond" => self.parse_respond(words, block_open),
+            "error" => self.parse_error(words, block_open),
+            "basic_auth" => self.parse_basic_auth(words, block_open),
+            "forward_auth" => self.parse_forward_auth(words, block_open),
+            "access_log" => self.parse_access_log(words, block_open),
             "rate_limit" => self.parse_rate_limit(words, block_open),
             "trusted_proxies" => self.parse_trusted_proxies(words, block_open),
+            "tls" => self.parse_tls(words, block_open),
             other => Err(self.err(format!("unknown directive '{other}'"))),
         }
     }
@@ -373,20 +613,17 @@ impl<'a> Parser<'a> {
         words: &[String],
         block_open: bool,
     ) -> Result<Directive, ConfigError> {
-        let mut rest = &words[1..];
-        let mut matcher = None;
-        if let Some(first) = rest.first() {
-            if first.starts_with('/') {
-                matcher = Some(self.parse_path_matcher(first)?);
-                rest = &rest[1..];
-            }
-        }
+        // Optional inline matcher (spec §5.9): a bare `/path`, or matcher terms
+        // (`method GET`, `host api.example.com`, …). The remaining tokens are
+        // the upstream targets (non-block form).
+        let (matcher, rest) = self.parse_matchers(&words[1..])?;
 
         let mut targets: Vec<String> = Vec::new();
         let mut lb_policy = None;
         let mut health_check = None;
+        let mut tls = ProxyTlsConfig::default();
         if block_open {
-            // Block form: `{ to <upstream>... [lb_policy <p>] [health_check { ... }] }`.
+            // Block form: `{ to <upstream>... [lb_policy <p>] [health_check { ... }] [tls_* ...] }`.
             loop {
                 match self.peek() {
                     Some(Token {
@@ -426,6 +663,46 @@ impl<'a> Parser<'a> {
                         }
                         health_check = Some(self.parse_health_check(nested)?);
                     }
+                    "tls_servername" => {
+                        if nested {
+                            return Err(self.err("unexpected '{' after tls_servername"));
+                        }
+                        if tls.servername.is_some() {
+                            return Err(self.err("duplicate tls_servername"));
+                        }
+                        if line.len() != 2 {
+                            return Err(self.err("tls_servername requires exactly one argument"));
+                        }
+                        tls.servername = Some(line[1].clone());
+                    }
+                    "tls_skip_verify" => {
+                        if nested {
+                            return Err(self.err("unexpected '{' after tls_skip_verify"));
+                        }
+                        if line.len() != 1 {
+                            return Err(self.err("tls_skip_verify takes no arguments"));
+                        }
+                        tls.skip_verify = true;
+                    }
+                    "tls_ca" => {
+                        if nested {
+                            return Err(self.err("unexpected '{' after tls_ca"));
+                        }
+                        if line.len() != 2 {
+                            return Err(self.err("tls_ca requires exactly one argument"));
+                        }
+                        tls.ca_files.push(line[1].clone());
+                    }
+                    "tls_cert" => {
+                        if nested {
+                            return Err(self.err("unexpected '{' after tls_cert"));
+                        }
+                        if line.len() != 3 {
+                            return Err(self.err("tls_cert requires a certificate and a key file"));
+                        }
+                        tls.cert_file = Some(line[1].clone());
+                        tls.key_file = Some(line[2].clone());
+                    }
                     other => {
                         return Err(self.err(format!(
                             "unexpected directive '{other}' in reverse_proxy block"
@@ -452,6 +729,7 @@ impl<'a> Parser<'a> {
             to,
             lb_policy: lb_policy.unwrap_or(LbPolicy::RoundRobin),
             health_check,
+            tls,
         })
     }
 
@@ -547,10 +825,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_upstream(&self, s: &str) -> Result<Upstream, ConfigError> {
-        if s.starts_with('[') {
+        // Optional scheme prefix decides whether the upstream connection is TLS
+        // (spec §5.4); a bare `host:port` stays plain HTTP.
+        let (tls, rest) = if let Some(r) = s.strip_prefix("https://") {
+            (true, r)
+        } else if let Some(r) = s.strip_prefix("http://") {
+            (false, r)
+        } else {
+            (false, s)
+        };
+        if rest.starts_with('[') {
             return Err(self.err("IPv6 upstream addresses are not supported in v0.1"));
         }
-        let (host, port_str) = s
+        let (host, port_str) = rest
             .rsplit_once(':')
             .ok_or_else(|| self.err(format!("upstream '{s}' must be host:port")))?;
         if host.is_empty() {
@@ -560,30 +847,41 @@ impl<'a> Parser<'a> {
         Ok(Upstream {
             host: host.to_string(),
             port,
+            tls,
             resolved: None,
         })
     }
 
+    /// Parse a `handle` (or, with `strip`, `handle_path`) block: a matcher plus
+    /// a directive block (spec §5.9).
     fn parse_handle(
         &mut self,
         words: &[String],
         block_open: bool,
+        strip: bool,
     ) -> Result<Directive, ConfigError> {
-        if words.len() != 2 {
-            return Err(self.err("handle requires exactly one path argument"));
+        let (matcher, rest) = self.parse_matchers(&words[1..])?;
+        if matcher.is_empty() {
+            return Err(self.err("handle requires a matcher"));
         }
-        let path = &words[1];
-        if !path.starts_with('/') {
-            return Err(self.err("handle path must start with '/'"));
+        if let Some(extra) = rest.first() {
+            return Err(self.err(format!("unexpected '{extra}' after the handle matcher")));
         }
         if !block_open {
             return Err(self.err("handle requires a block"));
         }
         let directives = self.parse_directive_block()?;
-        Ok(Directive::Handle {
-            path: path.clone(),
-            directives,
-        })
+        if strip {
+            Ok(Directive::HandlePath {
+                matcher,
+                directives,
+            })
+        } else {
+            Ok(Directive::Handle {
+                matcher,
+                directives,
+            })
+        }
     }
 
     fn parse_header(
@@ -642,14 +940,19 @@ impl<'a> Parser<'a> {
             return Err(self.err("unexpected '{' after encode"));
         }
         if words.len() < 2 {
-            return Err(self.err("encode requires at least one algorithm (gzip, zstd)"));
+            return Err(self.err("encode requires at least one algorithm (gzip, zstd, br)"));
         }
         let mut algorithms = Vec::new();
         for alg in &words[1..] {
             match alg.as_str() {
                 "gzip" => algorithms.push(Encoding::Gzip),
                 "zstd" => algorithms.push(Encoding::Zstd),
-                other => return Err(self.err(format!("unknown encode algorithm '{other}'"))),
+                "br" => algorithms.push(Encoding::Brotli),
+                other => {
+                    return Err(self.err(format!(
+                        "unknown encode algorithm '{other}' (expected gzip, zstd, or br)"
+                    )))
+                }
             }
         }
         Ok(Directive::Encode { algorithms })
@@ -678,16 +981,230 @@ impl<'a> Parser<'a> {
         Ok(Directive::Redir { to: target, code })
     }
 
-    fn parse_path_matcher(&self, s: &str) -> Result<PathMatcher, ConfigError> {
-        let prefix = strip_matcher_wildcard(s);
-        if prefix.is_empty() {
-            return Err(self.err("path matcher must not be empty"));
+    /// Parse matcher terms (spec §5.9) from the head of `tokens`, stopping at
+    /// the first token that is not a matcher keyword / bare `/path` / `!`.
+    /// Returns the matchers and the unconsumed remainder (upstream targets, a
+    /// rewrite target, …).
+    fn parse_matchers<'t>(
+        &self,
+        tokens: &'t [String],
+    ) -> Result<(Vec<Matcher>, &'t [String]), ConfigError> {
+        let mut matchers = Vec::new();
+        let mut rest = tokens;
+        while let Some((matcher, consumed)) = self.parse_one_matcher(rest)? {
+            matchers.push(matcher);
+            rest = &rest[consumed..];
         }
-        if !prefix.starts_with('/') {
-            return Err(self.err("path matcher must start with '/'"));
+        Ok((matchers, rest))
+    }
+
+    /// Parse a single matcher term if `tokens` starts with one. Returns the
+    /// matcher and the number of tokens it consumed.
+    fn parse_one_matcher(
+        &self,
+        tokens: &[String],
+    ) -> Result<Option<(Matcher, usize)>, ConfigError> {
+        let Some(first) = tokens.first() else {
+            return Ok(None);
+        };
+        if first.starts_with('/') {
+            // Bare `/path` shorthand for `path /path`.
+            if first.len() < 2 {
+                return Err(self.err("path matcher must not be empty"));
+            }
+            return Ok(Some((
+                Matcher::Path(strip_matcher_wildcard(first).to_string()),
+                1,
+            )));
         }
-        Ok(PathMatcher {
-            prefix: prefix.to_string(),
+        // Negation: `!kind ...`.
+        let (negated, kind) = match first.strip_prefix('!') {
+            Some(kind) => (true, kind),
+            None => (false, first.as_str()),
+        };
+        if !matches!(
+            kind,
+            "path" | "host" | "method" | "header" | "query" | "remote_ip" | "protocol"
+        ) {
+            return Ok(None);
+        }
+        // `remote_ip` consumes one or more CIDRs (spec §5.9), so it is parsed
+        // before the fixed-arity path.
+        if kind == "remote_ip" {
+            if tokens.len() < 2 {
+                return Err(self.err("matcher 'remote_ip' is missing arguments"));
+            }
+            let mut cidrs = Vec::new();
+            let mut k = 1;
+            while k < tokens.len() {
+                match Cidr::parse(&tokens[k]) {
+                    Ok(cidr) => {
+                        cidrs.push(cidr);
+                        k += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if cidrs.is_empty() {
+                return Err(self.err("matcher 'remote_ip' requires at least one CIDR"));
+            }
+            let matcher = Matcher::RemoteIp(cidrs);
+            let matcher = if negated {
+                Matcher::Not(Box::new(matcher))
+            } else {
+                matcher
+            };
+            return Ok(Some((matcher, k)));
+        }
+        // Validate arity before indexing `tokens` below.
+        let arity = match kind {
+            "path" | "host" | "method" | "protocol" => 1,
+            "header" | "query" => 2,
+            _ => unreachable!("matcher keyword checked above"),
+        };
+        if tokens.len() <= arity {
+            return Err(self.err(format!("matcher '{kind}' is missing arguments")));
+        }
+        let matcher = match kind {
+            "path" => Matcher::Path(strip_matcher_wildcard(&tokens[1]).to_string()),
+            "host" => Matcher::Host(tokens[1].clone()),
+            "method" => Matcher::Method(tokens[1].clone()),
+            "header" => Matcher::Header {
+                name: tokens[1].clone(),
+                value: tokens[2].clone(),
+            },
+            "query" => Matcher::Query {
+                key: tokens[1].clone(),
+                value: tokens[2].clone(),
+            },
+            "protocol" => Matcher::Protocol(match tokens[1].as_str() {
+                "http" => Protocol::Http,
+                "https" => Protocol::Https,
+                other => {
+                    return Err(self.err(format!(
+                        "invalid protocol '{other}' (expected http or https)"
+                    )))
+                }
+            }),
+            _ => unreachable!("matcher keyword checked above"),
+        };
+        let matcher = if negated {
+            Matcher::Not(Box::new(matcher))
+        } else {
+            matcher
+        };
+        Ok(Some((matcher, arity + 1)))
+    }
+
+    /// Parse `rewrite <to>` — rewrite the request URI before the terminal
+    /// serves (modifier, spec §5.9). Conditional rewrites belong in a `handle`
+    /// block. Placeholder fragments (`{uri}`) are separate tokens, so they are
+    /// concatenated like `redir`'s target.
+    fn parse_rewrite(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after rewrite"));
+        }
+        if words.len() < 2 {
+            return Err(self.err("rewrite requires a target"));
+        }
+        let target = concat_tokens(&words[1..]);
+        if target.is_empty() {
+            return Err(self.err("rewrite target must not be empty"));
+        }
+        let to = ValueTemplate::parse(&target).map_err(|message| self.err(message))?;
+        Ok(Directive::Rewrite { to })
+    }
+
+    /// Parse `respond <matcher> <status> [<body>]` (terminal, spec §5.9).
+    fn parse_respond(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after respond"));
+        }
+        let (matcher, rest) = self.parse_matchers(&words[1..])?;
+        if !(1..=2).contains(&rest.len()) {
+            return Err(self.err("respond expects: respond <matcher> <status> [<body>]"));
+        }
+        let status = rest[0]
+            .parse::<u16>()
+            .map_err(|_| self.err(format!("invalid respond status '{}'", rest[0])))?;
+        if !(100..=599).contains(&status) {
+            return Err(self.err("respond status must be between 100 and 599"));
+        }
+        Ok(Directive::Respond {
+            matcher,
+            status,
+            body: rest.get(1).cloned(),
+        })
+    }
+
+    /// Parse `error <matcher> [<status>] [<message>]` (terminal, spec §5.9).
+    fn parse_error(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after error"));
+        }
+        let (matcher, rest) = self.parse_matchers(&words[1..])?;
+        let mut status = None;
+        let mut message = None;
+        for arg in rest {
+            if let Ok(code) = arg.parse::<u16>() {
+                if status.is_some() {
+                    return Err(self.err("duplicate error status"));
+                }
+                if !(100..=599).contains(&code) {
+                    return Err(self.err("error status must be between 100 and 599"));
+                }
+                status = Some(code);
+            } else {
+                if message.is_some() {
+                    return Err(self.err("duplicate error message"));
+                }
+                message = Some(arg.clone());
+            }
+        }
+        Ok(Directive::Error {
+            matcher,
+            status,
+            message,
+        })
+    }
+
+    /// Parse `basic_auth <user> <bcrypt-hash>` (guard, spec §5.10).
+    fn parse_basic_auth(
+        &self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after basic_auth"));
+        }
+        if words.len() != 3 {
+            return Err(self.err("basic_auth expects: basic_auth <user> <bcrypt-hash>"));
+        }
+        Ok(Directive::BasicAuth {
+            user: words[1].clone(),
+            hash: words[2].clone(),
+        })
+    }
+
+    /// Parse `forward_auth <target>` (guard, spec §5.10). The target is an
+    /// upstream `host:port`.
+    fn parse_forward_auth(
+        &self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after forward_auth"));
+        }
+        if words.len() != 2 {
+            return Err(self.err("forward_auth expects: forward_auth <host:port>"));
+        }
+        let target = &words[1];
+        if !target.contains(':') {
+            return Err(self.err("forward_auth target must be <host:port>"));
+        }
+        Ok(Directive::ForwardAuth {
+            target: target.clone(),
         })
     }
 
@@ -710,6 +1227,90 @@ impl<'a> Parser<'a> {
         Ok(Directive::TrustedProxies { networks })
     }
 
+    /// Parse `tls` — the per-site TLS directive (spec §5.7). Forms:
+    /// `tls` (ACME default), `tls internal`, `tls <cert> <key>`,
+    /// `tls min_version|max_version <1.2|1.3>`, `tls ciphers <list>`,
+    /// `tls client_auth <optional|require> <ca-file>`. Options are merged
+    /// across separate `tls` lines by the compiler.
+    fn parse_tls(&self, words: &[String], block_open: bool) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after tls"));
+        }
+        let mut config = TlsConfig::default();
+        let args = &words[1..];
+        match args.first() {
+            None => {}
+            Some(first) => match first.as_str() {
+                "internal" => {
+                    if args.len() != 1 {
+                        return Err(self.err("tls internal takes no arguments"));
+                    }
+                    config.source = TlsSource::Internal;
+                }
+                "min_version" | "max_version" => {
+                    if args.len() != 2 {
+                        return Err(self.err(format!("tls {first} requires exactly one version")));
+                    }
+                    let version = match args[1].as_str() {
+                        "1.2" => TlsVersion::Tls12,
+                        "1.3" => TlsVersion::Tls13,
+                        other => {
+                            return Err(self.err(format!(
+                                "invalid TLS version '{other}' (expected 1.2 or 1.3)"
+                            )))
+                        }
+                    };
+                    if first == "min_version" {
+                        config.min_version = Some(version);
+                    } else {
+                        config.max_version = Some(version);
+                    }
+                }
+                "ciphers" => {
+                    if args.len() < 2 {
+                        return Err(self.err("tls ciphers requires a cipher list"));
+                    }
+                    // Space-separated cipher names are joined with `:` (OpenSSL's
+                    // cipher-list separator).
+                    config.ciphers = Some(args[1..].join(":"));
+                }
+                "client_auth" => {
+                    if args.len() != 3 {
+                        return Err(self.err(
+                            "tls client_auth expects: client_auth <optional|require> <ca-file>",
+                        ));
+                    }
+                    let mode = match args[1].as_str() {
+                        "optional" => ClientAuthMode::Optional,
+                        "require" => ClientAuthMode::Require,
+                        other => {
+                            return Err(self.err(format!(
+                                "invalid client_auth mode '{other}' (expected optional or require)"
+                            )))
+                        }
+                    };
+                    config.client_auth = Some(ClientAuth {
+                        mode,
+                        ca_file: args[2].clone(),
+                    });
+                }
+                _ => {
+                    // Static certificate pair: `tls <cert-file> <key-file>`.
+                    if args.len() != 2 {
+                        return Err(self.err(
+                            "tls expects: internal | <cert-file> <key-file> | min_version/max_version/ciphers/client_auth",
+                        ));
+                    }
+                    config.source = TlsSource::Static {
+                        cert_file: args[0].clone(),
+                        key_file: args[1].clone(),
+                    };
+                }
+            },
+        }
+        Ok(Directive::Tls { config })
+    }
+
     /// Parse `rate_limit <key> <rate> [burst=<n>]` (spec §5.2).
     fn parse_rate_limit(
         &self,
@@ -719,21 +1320,31 @@ impl<'a> Parser<'a> {
         if block_open {
             return Err(self.err("unexpected '{' after rate_limit"));
         }
-        if !(3..=4).contains(&words.len()) {
-            return Err(self.err("rate_limit expects: rate_limit <remote_ip> <rate> [burst=<n>]"));
+        if words.len() < 3 {
+            return Err(self.err("rate_limit expects: rate_limit <key> <rate> [burst=<n>]"));
         }
-        // Only `remote_ip` is supported in v0.1.2 (spec §5.2).
-        let key = match words[1].as_str() {
-            "remote_ip" => RateLimitKey::RemoteIp,
+        // The key selects what is counted (spec §5.2): `remote_ip` or
+        // `header <name>`.
+        let (key, rate_idx) = match words[1].as_str() {
+            "remote_ip" => (RateLimitKey::RemoteIp, 2),
+            "header" => {
+                if words.len() < 4 {
+                    return Err(self.err("rate_limit header expects: header <name> <rate>"));
+                }
+                (RateLimitKey::Header(words[2].clone()), 3)
+            }
             other => {
                 return Err(self.err(format!(
-                    "unknown rate_limit key '{other}' (only 'remote_ip' is supported)"
+                    "unknown rate_limit key '{other}' (expected 'remote_ip' or 'header <name>')"
                 )))
             }
         };
-        let (count, unit) = parse_rate(&words[2]).map_err(|message| self.err(message))?;
+        let rate = words
+            .get(rate_idx)
+            .ok_or_else(|| self.err("rate_limit requires a rate after the key"))?;
+        let (count, unit) = parse_rate(rate).map_err(|message| self.err(message))?;
         let mut burst = count;
-        if let Some(arg) = words.get(3) {
+        if let Some(arg) = words.get(rate_idx + 1) {
             match arg.strip_prefix("burst=") {
                 Some(value) => {
                     burst = value
@@ -804,11 +1415,11 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 let provider = match words[1].as_str() {
-                    "cloudflare" => DnsProvider::Cloudflare,
+                    "cloudflare" => DnsProviderKind::Cloudflare,
                     other => {
                         return Err(self.err(format!(
                             "invalid dns_challenge provider '{other}' (expected {})",
-                            DnsProvider::ALL.join(", ")
+                            DnsProviderKind::ALL.join(", ")
                         )));
                     }
                 };
@@ -820,9 +1431,64 @@ impl<'a> Parser<'a> {
                     api_token: words[2].clone(),
                 });
             }
+            "access_log" => {
+                global.access_log = Some(self.parse_access_log_directive(words)?);
+            }
             other => return Err(self.err(format!("unknown global directive '{other}'"))),
         }
         Ok(())
+    }
+
+    /// Parse the global `access_log` value: `off`, or a path plus an optional
+    /// `format=<json|common>` (spec §5.13).
+    fn parse_access_log_directive(
+        &self,
+        words: &[String],
+    ) -> Result<AccessLogDirective, ConfigError> {
+        if words.len() == 2 && words[1] == "off" {
+            return Ok(AccessLogDirective::Off);
+        }
+        if !(2..=3).contains(&words.len()) {
+            return Err(self.err(
+                "access_log expects: access_log <path> [format=<json|common>] | access_log off",
+            ));
+        }
+        let mut format = AccessLogFormat::Json;
+        if let Some(arg) = words.get(2) {
+            format = match arg.strip_prefix("format=") {
+                Some("json") => AccessLogFormat::Json,
+                Some("common") => AccessLogFormat::Common,
+                Some(other) => {
+                    return Err(self.err(format!(
+                        "invalid access_log format '{other}' (expected json or common)"
+                    )))
+                }
+                None => {
+                    return Err(self.err(format!(
+                        "unexpected argument '{arg}' (expected 'format=<json|common>')"
+                    )))
+                }
+            };
+        }
+        Ok(AccessLogDirective::File {
+            path: words[1].clone(),
+            format,
+        })
+    }
+
+    /// Parse a site-block `access_log off` (spec §5.13).
+    fn parse_access_log(
+        &self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Directive, ConfigError> {
+        if block_open {
+            return Err(self.err("unexpected '{' after access_log"));
+        }
+        if words.len() != 2 || words[1] != "off" {
+            return Err(self.err("site-block access_log only supports 'off'"));
+        }
+        Ok(Directive::AccessLogOff)
     }
 }
 
@@ -924,7 +1590,7 @@ mod tests {
         let input = "{ dns_challenge cloudflare abc123 }\napi.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
         let rf = parse("test", input).unwrap();
         let challenge = rf.global.dns_challenge.expect("dns_challenge parsed");
-        assert_eq!(challenge.provider, DnsProvider::Cloudflare);
+        assert_eq!(challenge.provider, DnsProviderKind::Cloudflare);
         assert_eq!(challenge.api_token, "abc123");
     }
 
@@ -964,8 +1630,14 @@ mod tests {
         let site = &rf.sites[0];
         assert_eq!(site.directives.len(), 3);
         match &site.directives[0] {
-            Directive::Handle { path, directives } => {
-                assert_eq!(path, "/static/*");
+            Directive::Handle {
+                matcher,
+                directives,
+            } => {
+                assert!(matches!(
+                    matcher.as_slice(),
+                    [Matcher::Path(prefix)] if prefix == "/static"
+                ));
                 assert_eq!(directives.len(), 3);
             }
             other => panic!("expected handle, got {other:?}"),
@@ -978,7 +1650,7 @@ mod tests {
         let rf = parse("test", input).unwrap();
         match &rf.sites[0].directives[0] {
             Directive::ReverseProxy { matcher, to, .. } => {
-                assert!(matcher.is_some());
+                assert!(!matcher.is_empty());
                 assert_eq!(to.len(), 2);
                 assert_eq!(to[0].host, "127.0.0.1");
                 assert_eq!(to[0].port, 8081);
@@ -998,8 +1670,9 @@ mod tests {
                 to,
                 lb_policy,
                 health_check,
+                ..
             } => {
-                assert!(matcher.is_none());
+                assert!(matcher.is_empty());
                 assert_eq!(to.len(), 2);
                 assert_eq!(*lb_policy, LbPolicy::Random);
                 let hc = health_check.as_ref().expect("health check");
@@ -1425,5 +2098,256 @@ mod tests {
             }
             let _ = parse("fuzz", &input);
         }
+    }
+
+    #[test]
+    fn parses_general_matchers() {
+        // `handle <matcher>` accepts matcher terms beyond the bare path
+        // (spec §5.9), ANDed together.
+        let input = "example.com {\n    handle method GET host api.example.com {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Handle {
+                matcher,
+                directives,
+            } => {
+                assert_eq!(matcher.len(), 2);
+                assert!(matches!(matcher[0], Matcher::Method(ref m) if m == "GET"));
+                assert!(matches!(matcher[1], Matcher::Host(ref h) if h == "api.example.com"));
+                assert_eq!(directives.len(), 1);
+            }
+            other => panic!("expected handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_header_query_remote_ip_and_protocol_matchers() {
+        let input = "example.com {\n    handle header Content-Type application/json query page 1 remote_ip 10.0.0.0/8 protocol https {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Handle { matcher, .. } => {
+                assert!(matches!(
+                    matcher[0],
+                    Matcher::Header { ref name, ref value }
+                        if name == "Content-Type" && value == "application/json"
+                ));
+                assert!(matches!(
+                    matcher[1],
+                    Matcher::Query { ref key, ref value } if key == "page" && value == "1"
+                ));
+                assert!(matches!(matcher[2], Matcher::RemoteIp(_)));
+                assert!(matches!(matcher[3], Matcher::Protocol(Protocol::Https)));
+            }
+            other => panic!("expected handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_negated_matcher() {
+        let input = "example.com {\n    handle !path /admin/* {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Handle { matcher, .. } => {
+                assert!(matches!(
+                    matcher[0],
+                    Matcher::Not(ref inner) if matches!(**inner, Matcher::Path(ref p) if p == "/admin")
+                ));
+            }
+            other => panic!("expected handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reverse_proxy_inline_matcher_is_general() {
+        let input =
+            ":8080 {\n    reverse_proxy method POST {\n        to 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::ReverseProxy { matcher, to, .. } => {
+                assert!(matches!(matcher.as_slice(), [Matcher::Method(ref m)] if m == "POST"));
+                assert_eq!(to.len(), 1);
+            }
+            other => panic!("expected reverse_proxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_handle_path_and_rewrite_and_respond_and_error() {
+        let input = "example.com {\n    handle_path /api/* {\n        reverse_proxy 127.0.0.1:9000\n    }\n    rewrite /v1\n    respond 200 ok\n    error 503\n}\n";
+        let rf = parse("test", input).unwrap();
+        let directives = &rf.sites[0].directives;
+        assert!(matches!(directives[0], Directive::HandlePath { .. }));
+        assert!(matches!(directives[1], Directive::Rewrite { .. }));
+        match &directives[2] {
+            Directive::Respond {
+                matcher,
+                status,
+                body,
+            } => {
+                assert!(matcher.is_empty());
+                assert_eq!(*status, 200);
+                assert_eq!(body.as_deref(), Some("ok"));
+            }
+            other => panic!("expected respond, got {other:?}"),
+        }
+        match &directives[3] {
+            Directive::Error { status, .. } => assert_eq!(*status, Some(503)),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_matcher_with_missing_arguments() {
+        let err = parse(
+            "test",
+            "example.com {\n    handle method {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("matcher 'method' is missing arguments"));
+    }
+
+    #[test]
+    fn parses_basic_auth_and_forward_auth() {
+        let input = "example.com {\n    basic_auth admin $2b$12$abcdef\n    forward_auth 127.0.0.1:9999\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        let directives = &rf.sites[0].directives;
+        match &directives[0] {
+            Directive::BasicAuth { user, hash } => {
+                assert_eq!(user, "admin");
+                assert_eq!(hash, "$2b$12$abcdef");
+            }
+            other => panic!("expected basic_auth, got {other:?}"),
+        }
+        assert!(matches!(directives[1], Directive::ForwardAuth { .. }));
+        assert!(matches!(directives[2], Directive::ReverseProxy { .. }));
+    }
+
+    #[test]
+    fn parses_rate_limit_header_key() {
+        let input =
+            ":8080 {\n    rate_limit header X-API-Key 10r/s\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::RateLimit { spec } => {
+                assert_eq!(spec.key, RateLimitKey::Header("X-API-Key".to_string()));
+                assert_eq!(spec.count, 10);
+            }
+            other => panic!("expected rate_limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snippet_import_is_spliced() {
+        // A `(name)` definition is captured and `import name` splices it
+        // (spec §5.12), including inside a site block.
+        let input = "(base) {\n    header_up X-Raddy yes\n}\n:8080 {\n    import base\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert_eq!(rf.sites.len(), 1);
+        let directives = &rf.sites[0].directives;
+        assert_eq!(directives.len(), 2);
+        assert!(matches!(directives[0], Directive::HeaderUp { .. }));
+        assert!(matches!(directives[1], Directive::ReverseProxy { .. }));
+    }
+
+    #[test]
+    fn file_import_is_spliced() {
+        let dir = std::env::temp_dir();
+        let imported = dir.join(format!("raddy_import_{}.Raddyfile", std::process::id()));
+        std::fs::write(&imported, "reverse_proxy 127.0.0.1:9000\n").unwrap();
+        let input = format!(":8080 {{\n    import {}\n}}\n", imported.display());
+        let rf = parse("test", &input).unwrap();
+        assert_eq!(rf.sites[0].directives.len(), 1);
+        assert!(matches!(
+            rf.sites[0].directives[0],
+            Directive::ReverseProxy { .. }
+        ));
+        let _ = std::fs::remove_file(&imported);
+    }
+
+    #[test]
+    fn missing_import_file_is_an_error() {
+        let err = parse(
+            "test",
+            ":8080 {\n    import /nonexistent/raddy_import_file\n}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to read imported file"));
+    }
+
+    #[test]
+    fn parses_global_access_log_directive() {
+        let input = "{\n    access_log /tmp/raddy.log format=common\n}\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert!(matches!(
+            rf.global.access_log,
+            Some(AccessLogDirective::File {
+                format: AccessLogFormat::Common,
+                ..
+            })
+        ));
+        // `access_log off` disables it.
+        let input = "{\n    access_log off\n}\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert_eq!(rf.global.access_log, Some(AccessLogDirective::Off));
+    }
+
+    #[test]
+    fn parses_site_access_log_off() {
+        let input = ":8080 {\n    access_log off\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert!(matches!(rf.sites[0].directives[0], Directive::AccessLogOff));
+    }
+
+    #[test]
+    fn remote_ip_matcher_accepts_multiple_cidrs() {
+        let input = ":8080 {\n    handle remote_ip 10.0.0.0/8 192.168.0.0/16 {\n        reverse_proxy 127.0.0.1:9000\n    }\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Handle { matcher, .. } => {
+                assert!(matches!(
+                    matcher.as_slice(),
+                    [Matcher::RemoteIp(cidrs)] if cidrs.len() == 2
+                ));
+            }
+            other => panic!("expected handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn respond_accepts_inline_matcher() {
+        let input = ":8080 {\n    respond path /health 200 ok\n}\n";
+        let rf = parse("test", input).unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Respond {
+                matcher,
+                status,
+                body,
+            } => {
+                assert_eq!(matcher.len(), 1);
+                assert_eq!(*status, 200);
+                assert_eq!(body.as_deref(), Some("ok"));
+            }
+            other => panic!("expected respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_cycle_is_detected_via_canonical_path() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("raddy_cycle_a_{}.Raddyfile", std::process::id()));
+        let b = dir.join(format!("raddy_cycle_b_{}.Raddyfile", std::process::id()));
+        let a_name = a.file_name().unwrap().to_str().unwrap().to_string();
+        let b_name = b.file_name().unwrap().to_str().unwrap().to_string();
+        // Textually different `./` prefixes still canonicalize to the same file,
+        // so the cycle must be caught (P2).
+        std::fs::write(&a, format!("import ./{b_name}\n")).unwrap();
+        std::fs::write(&b, format!("import ././{a_name}\n")).unwrap();
+        let input = format!(":8080 {{\n    import {}\n}}\n", a.display());
+        let err = parse("test", &input).unwrap_err();
+        assert!(err.to_string().contains("import cycle"), "err: {err}");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 }

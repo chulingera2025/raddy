@@ -13,15 +13,15 @@
 
 //! Response compression for the `encode` directive (M5).
 //!
-//! Implements gzip and zstd compression honoring the `encode` parameter order
-//! (priority) and the client's `Accept-Encoding` (RADDYFILE_SPEC §5): the first
-//! configured algorithm the client accepts is used.
+//! Implements gzip, zstd, and brotli compression honoring the `encode` parameter
+//! order (priority) and the client's `Accept-Encoding` (RADDYFILE_SPEC §5): the
+//! first configured algorithm the client accepts is used.
 //!
 //! B3b1: the reverse-proxy path compresses incrementally through [`Encoder`] —
-//! one continuous gzip member / zstd frame per response — instead of buffering
-//! the whole body. B3b2: the `file_server` terminal streams through the same
-//! [`Encoder`] for full (200) responses; the whole-buffer [`compress`] helper
-//! is retained only as a one-shot convenience for tests.
+//! one continuous gzip member / zstd frame / brotli stream per response — instead
+//! of buffering the whole body. B3b2: the `file_server` terminal streams through
+//! the same [`Encoder`] for full (200) responses; the whole-buffer [`compress`]
+//! helper is retained only as a one-shot convenience for tests.
 
 use crate::config::ast::Encoding;
 use http::HeaderValue;
@@ -32,6 +32,7 @@ use std::io::{self, Write};
 pub enum Algo {
     Gzip,
     Zstd,
+    Brotli,
 }
 
 impl Algo {
@@ -40,6 +41,7 @@ impl Algo {
         match self {
             Algo::Gzip => "gzip",
             Algo::Zstd => "zstd",
+            Algo::Brotli => "br",
         }
     }
 }
@@ -62,6 +64,7 @@ pub fn choose(encode: &[Encoding], accept_encoding: Option<&HeaderValue>) -> Opt
         let algo = match enc {
             Encoding::Gzip => Algo::Gzip,
             Encoding::Zstd => Algo::Zstd,
+            Encoding::Brotli => Algo::Brotli,
         };
         if accepted(&entries, algo.token()) {
             return Some(algo);
@@ -138,6 +141,8 @@ fn parse_q(rest: &str) -> f32 {
 pub enum Encoder {
     Gzip(flate2::write::GzEncoder<Vec<u8>>),
     Zstd(zstd::stream::write::Encoder<'static, Vec<u8>>),
+    // Boxed: the brotli state is far larger than the gzip/zstd codecs.
+    Brotli(Box<brotli::CompressorWriter<Vec<u8>>>),
 }
 
 impl Encoder {
@@ -153,6 +158,12 @@ impl Encoder {
                 Vec::new(),
                 3,
             )?)),
+            Algo::Brotli => Ok(Encoder::Brotli(Box::new(brotli::CompressorWriter::new(
+                Vec::new(),
+                4096,
+                5,
+                22,
+            )))),
         }
     }
 
@@ -171,12 +182,17 @@ impl Encoder {
                 enc.flush()?;
                 Ok(std::mem::take(enc.get_mut()))
             }
+            Encoder::Brotli(enc) => {
+                enc.write_all(chunk)?;
+                enc.flush()?;
+                Ok(std::mem::take(enc.get_mut()))
+            }
         }
     }
 
     /// Finalize the stream, returning the remaining compressed bytes (the gzip
-    /// trailer / zstd frame epilogue). Call once after the last body chunk; the
-    /// encoder must not be written again afterwards.
+    /// trailer / zstd frame / brotli stream footer). Call once after the last
+    /// body chunk; the encoder must not be written again afterwards.
     pub fn finish(&mut self) -> io::Result<Vec<u8>> {
         match self {
             Encoder::Gzip(enc) => {
@@ -186,6 +202,16 @@ impl Encoder {
             Encoder::Zstd(enc) => {
                 enc.do_finish()?;
                 Ok(std::mem::take(enc.get_mut()))
+            }
+            Encoder::Brotli(enc) => {
+                // `into_inner` consumes the encoder, so swap in a throwaway
+                // placeholder to move the real one out, then finalize it.
+                let mut enc = std::mem::replace(
+                    enc,
+                    Box::new(brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22)),
+                );
+                enc.flush()?;
+                Ok(enc.into_inner())
             }
         }
     }
@@ -200,6 +226,7 @@ pub fn compress(algo: Algo, body: &[u8]) -> Vec<u8> {
     match algo {
         Algo::Gzip => gzip(body),
         Algo::Zstd => zstd(body),
+        Algo::Brotli => brotli(body),
     }
 }
 
@@ -214,6 +241,13 @@ fn gzip(body: &[u8]) -> Vec<u8> {
 
 fn zstd(body: &[u8]) -> Vec<u8> {
     zstd::encode_all(body, 3).unwrap_or_else(|_| body.to_vec())
+}
+
+fn brotli(body: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+    let _ = encoder.write_all(body);
+    encoder.into_inner()
 }
 
 #[cfg(test)]
@@ -281,7 +315,7 @@ mod tests {
     #[test]
     fn compress_roundtrips() {
         let body = b"hello world hello world".to_vec();
-        for algo in [Algo::Gzip, Algo::Zstd] {
+        for algo in [Algo::Gzip, Algo::Zstd, Algo::Brotli] {
             let compressed = compress(algo, &body);
             assert!(!compressed.is_empty());
             assert_ne!(compressed, body, "{algo:?} output should differ");
@@ -300,6 +334,12 @@ mod tests {
             }
             Algo::Zstd => {
                 let mut decoder = zstd::stream::read::Decoder::new(compressed).unwrap();
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded).unwrap();
+                decoded
+            }
+            Algo::Brotli => {
+                let mut decoder = brotli::Decompressor::new(compressed, 4096);
                 let mut decoded = Vec::new();
                 decoder.read_to_end(&mut decoded).unwrap();
                 decoded
@@ -343,8 +383,17 @@ mod tests {
     }
 
     #[test]
+    fn multi_chunk_brotli_is_one_continuous_stream() {
+        let expected: Vec<u8> = (0..60_000u32).map(|i| (i % 257) as u8).collect();
+        let chunks: Vec<&[u8]> = expected.chunks(8191).collect();
+        assert!(chunks.len() > 1, "test needs multiple chunks");
+        let decoded = stream_roundtrip(Algo::Brotli, &chunks);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
     fn empty_body_is_a_valid_empty_member() {
-        for algo in [Algo::Gzip, Algo::Zstd] {
+        for algo in [Algo::Gzip, Algo::Zstd, Algo::Brotli] {
             let mut encoder = Encoder::new(algo).unwrap();
             let mut compressed = encoder.write(&[]).unwrap();
             compressed.extend_from_slice(&encoder.finish().unwrap());

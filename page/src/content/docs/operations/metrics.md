@@ -49,4 +49,4 @@ histogram_quantile(0.99, sum by (le) (rate(raddy_request_duration_seconds_bucket
 
 The metrics set is deliberately minimal. There are no per-site or per-upstream
 breakdowns, and no backend connection-pool gauges yet. OpenTelemetry tracing is
-planned for a future release.
+on the roadmap.

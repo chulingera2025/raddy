@@ -16,11 +16,14 @@
 //! The crate is organized as a library (modules consumed by the integration
 //! tests) plus a thin binary entry point:
 //!
-//! * [`config`] — Raddyfile parsing, validation, and the atomic config snapshot.
-//! * [`proxy`] — the Pingora request plane: site selection and forwarding.
-//! * [`server`] — startup, SIGHUP reload, and the `run`/`check` CLI.
-//! * [`tls`] — certificate store and the SNI dynamic-certificate callback (M4).
-//! * [`observ`] — observability placeholders (access log and metrics land in M5).
+//! * [`config`] — Raddyfile parsing (incl. `import`/snippets/`{$ENV}`), validation,
+//!   and the atomic config snapshot.
+//! * [`proxy`] — the Pingora request plane: site selection, matchers, guards,
+//!   load balancing, compression, and forwarding.
+//! * [`server`] — startup, SIGHUP reload, the `run`/`check`/`import` CLI, ACME.
+//! * [`tls`] — certificate store, the SNI dynamic-certificate callback, and the
+//!   per-site `tls` options.
+//! * [`observ`] — Prometheus metrics.
 //! * [`migrate`] — Caddyfile/nginx.conf → Raddyfile converter (ARCHITECTURE §7).
 
 pub mod config;

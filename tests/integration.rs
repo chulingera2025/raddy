@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
 const BIN: &str = env!("CARGO_BIN_EXE_raddy");
 
 // ---------------------------------------------------------------------------
@@ -133,6 +135,289 @@ impl Drop for EchoUpstream {
     }
 }
 
+/// A minimal HTTPS upstream (spec §5.4): accepts TCP connections, wraps them in
+/// TLS with a self-signed certificate for `localhost`, and answers
+/// `label=secure`. The certificate is deliberately untrusted by system roots,
+/// so a proxy that verifies upstream certs must be configured with
+/// `tls_skip_verify` (or the operator must trust the test CA).
+struct TlsEchoUpstream {
+    port: u16,
+    hits: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TlsEchoUpstream {
+    fn spawn() -> (u16, TlsEchoUpstream) {
+        use openssl::ssl::{SslAcceptor, SslMethod};
+        let (port, listener) = bind_listener();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        let x509 = openssl::x509::X509::from_pem(cert_pem.as_bytes()).unwrap();
+        let pkey = openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).unwrap();
+        builder.set_certificate(&x509).unwrap();
+        builder.set_private_key(&pkey).unwrap();
+        let acceptor = builder.build();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits_thread = hits.clone();
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(stream) = stream else { continue };
+                hits_thread.fetch_add(1, Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let Ok(mut tls) = acceptor.accept(stream) else {
+                        return;
+                    };
+                    let mut buf = [0u8; 4096];
+                    let _ = tls.read(&mut buf);
+                    let body = "label=secure";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (
+            port,
+            TlsEchoUpstream {
+                port,
+                hits,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+
+    fn hit_count(&self) -> usize {
+        self.hits.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TlsEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A minimal protocol-upgrade upstream (spec §5.5): answers any request that
+/// asks for an upgrade with `101 Switching Protocols`, then echoes raw bytes
+/// back so the tunnel can be verified end to end.
+struct UpgradeEchoUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl UpgradeEchoUpstream {
+    fn spawn() -> (u16, UpgradeEchoUpstream) {
+        let (port, listener) = bind_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    // Read the request head (single read suffices for a GET).
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while head.len() < 8192 {
+                        match stream.read(&mut byte) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                head.push(byte[0]);
+                                if head.ends_with(b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !head
+                        .windows(b"Upgrade".len())
+                        .any(|w| w.eq_ignore_ascii_case(b"Upgrade"))
+                    {
+                        return;
+                    }
+                    let resp = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+                    if stream.write_all(resp.as_bytes()).is_err() {
+                        return;
+                    }
+                    // Echo raw bytes until either side closes the tunnel.
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (
+            port,
+            UpgradeEchoUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for UpgradeEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// An upstream that answers `path=<request path>`, so tests can assert what
+/// path a `handle_path` strip or `rewrite` produced (spec §5.9).
+struct PathEchoUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PathEchoUpstream {
+    fn spawn() -> (u16, PathEchoUpstream) {
+        let (port, listener) = bind_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 8192];
+                    if stream.read(&mut buf).is_err() {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let body = format!("path={path}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (
+            port,
+            PathEchoUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for PathEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A minimal auth upstream for `forward_auth` (spec §5.10): grants `/` with
+/// `X-Auth-User`, denies `/deny` with 401.
+struct AuthUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl AuthUpstream {
+    fn spawn() -> (u16, AuthUpstream) {
+        let (port, listener) = bind_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 8192];
+                    if stream.read(&mut buf).is_err() {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let granted = !path.starts_with("/deny");
+                    let (status, reason, extra) = if granted {
+                        (200, "OK", "X-Auth-User: alice\r\n")
+                    } else {
+                        (401, "Unauthorized", "")
+                    };
+                    let body = if granted { "granted" } else { "denied" };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (
+            port,
+            AuthUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for AuthUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// An upstream that keeps connections alive (no `Connection: close`) and counts
 /// *distinct* connections, so a client can assert connection reuse across
 /// requests and reloads.
@@ -214,6 +499,16 @@ impl Drop for KeepAliveUpstream {
     }
 }
 
+/// How a spawned server's readiness is probed. TLS sites (spec §5.7) cannot be
+/// reached with a plain-HTTP probe, and an mTLS `require` site rejects every
+/// handshake — those need a TLS or TCP-only probe respectively.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadyProbe {
+    Plain,
+    Tls,
+    Tcp,
+}
+
 /// A running `raddy run` subprocess plus the config file it reads.
 struct RadRaddy {
     child: Child,
@@ -228,8 +523,75 @@ impl RadRaddy {
         Self::spawn_with_args(config_for, &[])
     }
 
+    /// Spawn with a config plus extra environment variables for the child
+    /// (used for `{$ENV}` expansion, spec §5.12).
+    fn spawn_with_env(config_for: impl Fn(u16) -> String, env: &[(&str, &str)]) -> RadRaddy {
+        Self::spawn_with_env_probe(config_for, env, ReadyProbe::Plain)
+    }
+
     /// Spawn with extra CLI arguments (e.g. `--metrics-addr`, `--access-log`).
     fn spawn_with_args(config_for: impl Fn(u16) -> String, extra: &[String]) -> RadRaddy {
+        Self::spawn_with_probe(config_for, extra, ReadyProbe::Plain)
+    }
+
+    /// Spawn a server whose site's port is served over TLS (a named site with a
+    /// `tls` directive, spec §5.7); the readiness probe performs a TLS
+    /// handshake.
+    fn spawn_tls(config_for: impl Fn(u16) -> String) -> RadRaddy {
+        Self::spawn_with_probe(config_for, &[], ReadyProbe::Tls)
+    }
+
+    /// Spawn a server whose listener rejects normal probes (e.g. mTLS `require`);
+    /// readiness is a TCP accept only.
+    fn spawn_tcp(config_for: impl Fn(u16) -> String) -> RadRaddy {
+        Self::spawn_with_probe(config_for, &[], ReadyProbe::Tcp)
+    }
+
+    fn spawn_with_env_probe(
+        config_for: impl Fn(u16) -> String,
+        env: &[(&str, &str)],
+        probe: ReadyProbe,
+    ) -> RadRaddy {
+        loop {
+            let port = free_port();
+            let config = config_for(port);
+            let config_path = std::env::temp_dir().join(format!(
+                "raddy_integration_{}_{}.Raddyfile",
+                std::process::id(),
+                port
+            ));
+            std::fs::write(&config_path, &config).unwrap();
+            let mut cmd = Command::new(BIN);
+            cmd.args(["run", "-c"]).arg(&config_path);
+            cmd.env("RUST_LOG", "error").stderr(Stdio::inherit());
+            for (name, value) in env {
+                cmd.env(name, value);
+            }
+            let child = cmd.spawn().expect("failed to spawn the raddy binary");
+            let mut raddy = RadRaddy {
+                child,
+                port,
+                config_path,
+            };
+            let ready = match probe {
+                ReadyProbe::Plain => raddy.wait_for_ready(),
+                ReadyProbe::Tls => raddy.wait_for_ready_tls(),
+                ReadyProbe::Tcp => raddy.wait_for_ready_tcp(),
+            };
+            if ready {
+                return raddy;
+            }
+            // The child exited (bind failure) or never listened; retry.
+            let _ = raddy.child.kill();
+            let _ = raddy.child.wait();
+        }
+    }
+
+    fn spawn_with_probe(
+        config_for: impl Fn(u16) -> String,
+        extra: &[String],
+        probe: ReadyProbe,
+    ) -> RadRaddy {
         loop {
             let port = free_port();
             let config = config_for(port);
@@ -249,7 +611,12 @@ impl RadRaddy {
                 port,
                 config_path,
             };
-            if raddy.wait_for_ready() {
+            let ready = match probe {
+                ReadyProbe::Plain => raddy.wait_for_ready(),
+                ReadyProbe::Tls => raddy.wait_for_ready_tls(),
+                ReadyProbe::Tcp => raddy.wait_for_ready_tcp(),
+            };
+            if ready {
                 return raddy;
             }
             // The child exited (bind failure) or never listened; retry.
@@ -278,6 +645,39 @@ impl RadRaddy {
             // flake a test. The probe omits Host so raddy answers 400 without
             // touching any upstream (which would pollute connection counts).
             if try_request(self.port, None, "/").is_some() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Poll until the TLS listener serves a handshake (spec §5.7); the plain
+    /// `wait_for_ready` probe cannot reach a TLS listener.
+    fn wait_for_ready_tls(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.child.try_wait().expect("try_wait failed").is_some() {
+                return false;
+            }
+            if tls_request(self.port, "localhost", "/", &[]).is_ok() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Poll until the child is alive and its listener accepts TCP. For sites
+    /// that reject every probe request (e.g. mTLS `require`, spec §5.7), a
+    /// successful TCP accept is the strongest readiness signal available.
+    fn wait_for_ready_tcp(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.child.try_wait().expect("try_wait failed").is_some() {
+                return false;
+            }
+            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
                 return true;
             }
             thread::sleep(Duration::from_millis(50));
@@ -350,6 +750,68 @@ fn try_request_hdr(
 
 fn send_request(port: u16, host: Option<&str>, path: &str) -> Response {
     try_request(port, host, path).expect("request failed")
+}
+
+/// Send a GET over TLS (spec §5.7) and return the parsed response. The server
+/// certificate is not verified (test sites use self-signed certs). `Err` on
+/// connect/handshake failure — callers use this to assert mTLS rejections.
+fn tls_request(port: u16, host: &str, path: &str, headers: &[&str]) -> Result<Response, String> {
+    let connector = tls_connector(None);
+    let stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let mut tls = connector
+        .connect(host, stream)
+        .map_err(|e| format!("TLS handshake failed: {e}"))?;
+    let extra = headers
+        .iter()
+        .map(|h| format!("{h}\r\n"))
+        .collect::<String>();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf);
+    let head_end = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+    let head = &text[..head_end];
+    Ok(Response {
+        status: parse_status(head),
+        headers: head.to_lowercase(),
+        body: text[head_end..].to_string(),
+    })
+}
+
+/// A TLS client connector with verification off and optional ALPN protocols
+/// (each `&[u8]` is the wire-format ALPN list, e.g. `b"\x02h2\x08http/1.1"`).
+fn tls_connector(alpn: Option<&[u8]>) -> SslConnector {
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    if let Some(alpn) = alpn {
+        builder.set_alpn_protos(alpn).unwrap();
+    }
+    builder.build()
+}
+
+/// The ALPN protocol a TLS client negotiates (spec §5.6), if any.
+fn tls_negotiated_alpn(port: u16, host: &str) -> Option<String> {
+    let connector = tls_connector(Some(b"\x02h2\x08http/1.1"));
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let tls = connector.connect(host, stream).unwrap();
+    tls.ssl()
+        .selected_alpn_protocol()
+        .map(|proto| String::from_utf8_lossy(proto).into_owned())
+}
+
+/// The PEM of the leaf certificate a TLS server presents (spec §5.7).
+fn tls_peer_cert_pem(port: u16, host: &str) -> Option<String> {
+    let connector = tls_connector(None);
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let tls = connector.connect(host, stream).ok()?;
+    let cert = tls.ssl().peer_certificate()?;
+    String::from_utf8(cert.to_pem().ok()?).ok()
 }
 
 /// Send a request with extra header lines (e.g. `Accept-Encoding`).
@@ -594,6 +1056,521 @@ fn round_robin_across_upstreams() {
         a.hit_count(),
         b.hit_count()
     );
+}
+
+#[test]
+fn https_upstream_is_proxied_with_skip_verify() {
+    // An `https://` upstream (spec §5.4) with `tls_skip_verify`: raddy talks TLS
+    // to the self-signed test upstream and returns its body unchanged.
+    let (up_port, up) = TlsEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    reverse_proxy {{\n        to https://127.0.0.1:{up_port}\n        tls_skip_verify\n    }}\n}}\n"
+        )
+    });
+    wait_until(
+        || try_request(raddy.port(), Some("localhost"), "/").is_some(),
+        "server to accept requests",
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=secure");
+    assert!(
+        up.hit_count() >= 1,
+        "the TLS upstream must have served the request"
+    );
+}
+
+#[test]
+fn https_upstream_untrusted_cert_yields_502() {
+    // The same self-signed upstream without `tls_skip_verify`: certificate
+    // verification fails and raddy answers 502 rather than forwarding.
+    let (up_port, _up) = TlsEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(":{port} {{\n    reverse_proxy https://127.0.0.1:{up_port}\n}}\n")
+    });
+    wait_until(
+        || try_request(raddy.port(), Some("localhost"), "/").is_some(),
+        "server to accept requests",
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 502);
+    // The upstream is reached only to the TLS handshake, never to its HTTP
+    // response — its body must not leak through a failed verification.
+    assert_ne!(resp.body, "label=secure");
+}
+
+#[test]
+fn websocket_upgrade_is_proxied() {
+    // A WebSocket-style upgrade (spec §5.5): raddy forwards the `Connection:
+    // upgrade` request, the upstream answers 101, and raddy tunnels bytes
+    // bidirectionally.
+    let (up_port, _up) = UpgradeEchoUpstream::spawn();
+    let raddy =
+        RadRaddy::spawn(|port| format!(":{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"));
+    let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let req = "GET /chat HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    stream.write_all(req.as_bytes()).unwrap();
+    // Read the 101 response head.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match stream.read(&mut byte) {
+            Ok(0) => panic!("upstream closed before the 101 response"),
+            Ok(_) => {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => panic!("read error waiting for the 101 response"),
+        }
+    }
+    let head_str = String::from_utf8_lossy(&head).to_lowercase();
+    assert!(
+        head_str.starts_with("http/1.1 101"),
+        "expected 101 Switching Protocols, got: {head_str}"
+    );
+    // The tunnel is live: bytes written by the client are echoed by the upstream.
+    stream.write_all(b"ping").unwrap();
+    let mut echo = [0u8; 4];
+    stream.read_exact(&mut echo).unwrap();
+    assert_eq!(&echo, b"ping");
+}
+
+/// Write a cert + key PEM pair to temp files (spec §5.7 test helper).
+fn write_pem_pair(cert_pem: &str, key_pem: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir();
+    let stem = format!("raddy-site-cert-{}", std::process::id());
+    let cert_path = dir.join(format!("{stem}.pem"));
+    let key_path = dir.join(format!("{stem}.key"));
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+    (cert_path, key_path)
+}
+
+#[test]
+fn static_tls_site_serves_configured_certificate_and_proxies() {
+    // A named site with a `tls <cert> <key>` source (spec §5.7) is served over
+    // TLS with exactly that certificate, and requests proxy to the upstream.
+    let (up_port, _up) = EchoUpstream::spawn("secure");
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let (cert_path, key_path) = write_pem_pair(&cert_pem, &key_pem);
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "localhost:{port} {{\n    tls {} {}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            cert_path.display(),
+            key_path.display()
+        )
+    });
+    let resp = tls_request(raddy.port(), "localhost", "/", &[]).expect("tls request");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=secure");
+    // The served leaf is the certificate we configured.
+    let served = tls_peer_cert_pem(raddy.port(), "localhost").expect("peer cert");
+    assert_eq!(served.trim(), cert_pem.trim());
+}
+
+#[test]
+fn tls_internal_serves_a_self_signed_certificate() {
+    let (up_port, _up) = EchoUpstream::spawn("internal");
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+        )
+    });
+    let resp = tls_request(raddy.port(), "localhost", "/", &[]).expect("tls request");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=internal");
+    assert!(
+        tls_peer_cert_pem(raddy.port(), "localhost").is_some(),
+        "an internal site must serve a certificate"
+    );
+}
+
+#[test]
+fn mtls_require_rejects_clients_without_certificate() {
+    // `tls client_auth require` (spec §5.7): a client presenting no certificate
+    // cannot complete the handshake.
+    let (up_port, _up) = EchoUpstream::spawn("mtls");
+    let ca = rcgen::generate_simple_self_signed(vec!["Test CA".to_string()]).unwrap();
+    let ca_path = std::env::temp_dir().join(format!("raddy-ca-{}.pem", std::process::id()));
+    std::fs::write(&ca_path, ca.cert.pem()).unwrap();
+    // The listener rejects every TLS client without a certificate, so a TCP
+    // accept is the only usable readiness probe.
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    tls client_auth require {}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            ca_path.display()
+        )
+    });
+    assert!(
+        tls_request(raddy.port(), "localhost", "/", &[]).is_err(),
+        "a client without a certificate must be rejected"
+    );
+}
+
+#[test]
+fn mtls_require_fails_closed_on_unreadable_ca() {
+    // Deleting the CA file after startup must NOT open the mTLS gate: an
+    // unreadable CA falls back to an empty trust store, so `require` still
+    // rejects every client (P1).
+    let (up_port, _up) = EchoUpstream::spawn("mtls");
+    let ca = rcgen::generate_simple_self_signed(vec!["Test CA".to_string()]).unwrap();
+    let ca_path = std::env::temp_dir().join(format!("raddy-ca-del-{}.pem", std::process::id()));
+    std::fs::write(&ca_path, ca.cert.pem()).unwrap();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    tls client_auth require {}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            ca_path.display()
+        )
+    });
+    // Remove the CA before the first handshake (the TCP readiness probe never
+    // performs one), then verify the gate stays closed.
+    std::fs::remove_file(&ca_path).unwrap();
+    assert!(
+        tls_request(raddy.port(), "localhost", "/", &[]).is_err(),
+        "an unreadable CA must fail closed (reject), not open the gate"
+    );
+}
+
+#[test]
+fn mtls_optional_accepts_clients_without_certificate() {
+    // `tls client_auth optional` requests but does not require a certificate.
+    let (up_port, _up) = EchoUpstream::spawn("mtls-opt");
+    let ca = rcgen::generate_simple_self_signed(vec!["Test CA".to_string()]).unwrap();
+    let ca_path = std::env::temp_dir().join(format!("raddy-ca-opt-{}.pem", std::process::id()));
+    std::fs::write(&ca_path, ca.cert.pem()).unwrap();
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    tls client_auth optional {}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            ca_path.display()
+        )
+    });
+    let resp = tls_request(raddy.port(), "localhost", "/", &[]).expect("tls request");
+    assert_eq!(resp.status, 200);
+}
+
+#[test]
+fn h2_negotiated_on_tls_listener() {
+    // TLS listeners advertise h2 over ALPN (spec §5.6); a client offering h2
+    // and http/1.1 negotiates h2.
+    let (up_port, _up) = EchoUpstream::spawn("h2");
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "localhost:{port} {{\n    tls internal\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+        )
+    });
+    assert_eq!(
+        tls_negotiated_alpn(raddy.port(), "localhost").as_deref(),
+        Some("h2")
+    );
+}
+
+#[test]
+fn method_matcher_routes_requests() {
+    // A `method` matcher (spec §5.9) routes by request method within one site.
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, _b) = EchoUpstream::spawn("B");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle method GET {{\n        reverse_proxy 127.0.0.1:{a_port}\n    }}\n    handle method POST {{\n        reverse_proxy 127.0.0.1:{b_port}\n    }}\n}}\n"
+        )
+    });
+    let get = send_request_method("GET", raddy.port(), Some("localhost"), "/", &[]);
+    assert_eq!(get.status, 200);
+    assert_eq!(get.body, "label=A");
+    let post = send_request_method("POST", raddy.port(), Some("localhost"), "/", &[]);
+    assert_eq!(post.status, 200);
+    assert_eq!(post.body, "label=B");
+}
+
+#[test]
+fn host_matcher_selects_within_catch_all() {
+    // A `host` matcher routes by the normalized Host header inside a catch-all.
+    let (a_port, _a) = EchoUpstream::spawn("A");
+    let (b_port, _b) = EchoUpstream::spawn("B");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle host api.example.com {{\n        reverse_proxy 127.0.0.1:{a_port}\n    }}\n    handle host www.example.com {{\n        reverse_proxy 127.0.0.1:{b_port}\n    }}\n}}\n"
+        )
+    });
+    let api = send_request(raddy.port(), Some("api.example.com"), "/");
+    assert_eq!(api.body, "label=A");
+    let www = send_request(raddy.port(), Some("www.example.com"), "/");
+    assert_eq!(www.body, "label=B");
+}
+
+#[test]
+fn respond_terminal_answers_directly() {
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle path /health {{\n        respond 200 ok\n    }}\n    reverse_proxy 127.0.0.1:1\n}}\n"
+        )
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/health");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "ok");
+    // A path outside the handle falls through to the reverse proxy (dead
+    // upstream → 502), proving the handle is mutually exclusive.
+    let resp = send_request(raddy.port(), Some("localhost"), "/other");
+    assert_eq!(resp.status, 502);
+}
+
+#[test]
+fn error_terminal_returns_status() {
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle path /boom {{\n        error 503\n    }}\n    reverse_proxy 127.0.0.1:1\n}}\n"
+        )
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/boom");
+    assert_eq!(resp.status, 503);
+}
+
+#[test]
+fn handle_path_strips_prefix() {
+    // `handle_path /api/*` strips the prefix before the upstream sees it.
+    let (up_port, _up) = PathEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    handle_path /api/* {{\n        reverse_proxy 127.0.0.1:{up_port}\n    }}\n    reverse_proxy 127.0.0.1:1\n}}\n"
+        )
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/api/users/1");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "path=/users/1");
+}
+
+#[test]
+fn rewrite_modifier_changes_path() {
+    // A `rewrite` modifier (spec §5.9) transforms the path the upstream sees.
+    let (up_port, _up) = PathEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(":{port} {{\n    rewrite /v1{{uri}}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n")
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/x");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "path=/v1/x");
+}
+
+#[test]
+fn basic_auth_requires_credentials() {
+    // `basic_auth` (spec §5.10): no/wrong credentials → 401 with
+    // WWW-Authenticate; correct credentials → proxied.
+    use base64::Engine;
+    let hash = bcrypt::hash("secret", 4).unwrap();
+    let (up_port, _up) = EchoUpstream::spawn("private");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    basic_auth admin {hash}\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+        )
+    });
+    let no_auth = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(no_auth.status, 401);
+    assert!(
+        no_auth.headers.contains("www-authenticate"),
+        "a basic_auth 401 must carry WWW-Authenticate"
+    );
+    let bad = format!(
+        "Authorization: Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("admin:wrong")
+    );
+    let resp = send_request_hdr(raddy.port(), Some("localhost"), "/", &[bad.as_str()]);
+    assert_eq!(resp.status, 401);
+    let good = format!(
+        "Authorization: Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("admin:secret")
+    );
+    let resp = send_request_hdr(raddy.port(), Some("localhost"), "/", &[good.as_str()]);
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=private");
+}
+
+#[test]
+fn forward_auth_delegates_and_rejects() {
+    // `forward_auth` (spec §5.10): the auth upstream's 2xx lets the request
+    // through to the real upstream; its 401 rejects it.
+    let (auth_port, _auth) = AuthUpstream::spawn();
+    let (real_port, _real) = EchoUpstream::spawn("real");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    forward_auth 127.0.0.1:{auth_port}\n    reverse_proxy 127.0.0.1:{real_port}\n}}\n"
+        )
+    });
+    let ok = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.body, "label=real");
+    let denied = send_request(raddy.port(), Some("localhost"), "/deny");
+    assert_eq!(denied.status, 401);
+}
+
+#[test]
+fn rate_limit_keys_on_header_value() {
+    // `rate_limit header <name>` (spec §5.2) buckets per header value.
+    let (up_port, _up) = EchoUpstream::spawn("limited");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    rate_limit header X-API-Key 2r/s\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n"
+        )
+    });
+    let key1 = "X-API-Key: key1";
+    assert_eq!(
+        send_request_hdr(raddy.port(), Some("localhost"), "/", &[key1]).status,
+        200
+    );
+    assert_eq!(
+        send_request_hdr(raddy.port(), Some("localhost"), "/", &[key1]).status,
+        200
+    );
+    // The third request with the same key is rate limited.
+    assert_eq!(
+        send_request_hdr(raddy.port(), Some("localhost"), "/", &[key1]).status,
+        429
+    );
+    // A different key has its own bucket.
+    assert_eq!(
+        send_request_hdr(raddy.port(), Some("localhost"), "/", &["X-API-Key: key2"]).status,
+        200
+    );
+}
+
+#[test]
+fn env_vars_expand_in_config() {
+    // `{$ENV}` (spec §5.12) is expanded from the process environment at parse
+    // time, so an upstream target can come from an env var.
+    let (up_port, _up) = EchoUpstream::spawn("env");
+    let upstream = format!("127.0.0.1:{up_port}");
+    let raddy = RadRaddy::spawn_with_env(
+        |port| format!(":{port} {{\n    reverse_proxy {{$UPSTREAM}}\n}}\n"),
+        &[("UPSTREAM", upstream.as_str())],
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=env");
+}
+
+#[test]
+fn env_var_with_special_chars_is_a_single_argument() {
+    // Token-level {$ENV} expansion (spec §5.12, P2): a value containing spaces
+    // and `#` is one directive argument — it cannot turn into a comment or
+    // split into multiple arguments.
+    let raddy = RadRaddy::spawn_with_env(
+        |port| format!(":{port} {{\n    respond 200 {{$BODY}}\n}}\n"),
+        &[("BODY", "hello # world")],
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "hello # world");
+}
+
+#[test]
+fn file_import_splices_site_directives() {
+    let (up_port, _up) = EchoUpstream::spawn("imported");
+    let imported = std::env::temp_dir().join(format!(
+        "raddy_site_import_{}.Raddyfile",
+        std::process::id()
+    ));
+    std::fs::write(&imported, format!("reverse_proxy 127.0.0.1:{up_port}\n")).unwrap();
+    let imported_c = imported.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(":{port} {{\n    import {}\n}}\n", imported_c.display())
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "label=imported");
+    let _ = std::fs::remove_file(&imported);
+}
+
+#[test]
+fn access_log_common_format_is_written() {
+    // The global `access_log <path> format=common` directive (spec §5.13)
+    // writes classic combined log lines.
+    let log_path =
+        std::env::temp_dir().join(format!("raddy_access_common_{}.log", std::process::id()));
+    let (up_port, _up) = EchoUpstream::spawn("logged");
+    let log_c = log_path.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            "{{\n    access_log {} format=common\n}}\n:{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n",
+            log_c.display()
+        )
+    });
+    let resp = send_request(raddy.port(), Some("localhost"), "/x");
+    assert_eq!(resp.status, 200);
+    wait_until(
+        || {
+            std::fs::read_to_string(&log_path)
+                .map(|s| s.contains("GET /x HTTP/1.1"))
+                .unwrap_or(false)
+        },
+        "the common access-log line to appear",
+    );
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        content.contains("GET /x HTTP/1.1"),
+        "common log line missing: {content}"
+    );
+    assert!(content.contains(" 200 "), "status missing: {content}");
+    let _ = std::fs::remove_file(&log_path);
+}
+
+#[test]
+fn access_log_off_skips_a_site() {
+    // A site with `access_log off` (spec §5.13) produces no access-log line even
+    // when logging is enabled by the `--access-log` flag.
+    let log_path =
+        std::env::temp_dir().join(format!("raddy_access_off_{}.log", std::process::id()));
+    let (up_port, _up) = EchoUpstream::spawn("off");
+    let args = vec![String::from("--access-log"), log_path.display().to_string()];
+    let raddy = RadRaddy::spawn_with_args(
+        |port| {
+            format!(":{port} {{\n    access_log off\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n")
+        },
+        &args,
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    // The logging hook runs after the response is written; give it a moment,
+    // then assert no 200 line (the probe's 400s may still appear).
+    thread::sleep(Duration::from_millis(300));
+    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !content.contains("\"status\":200"),
+        "access_log off must skip the site: {content}"
+    );
+    let _ = std::fs::remove_file(&log_path);
+}
+
+#[test]
+fn access_log_off_excludes_respond_terminal() {
+    // `access_log off` also excludes non-proxy terminals (respond/error/redir/
+    // file_server) from the log (P2), and their bodies are counted.
+    let log_path = std::env::temp_dir().join(format!(
+        "raddy_access_off_respond_{}.log",
+        std::process::id()
+    ));
+    let args = vec![String::from("--access-log"), log_path.display().to_string()];
+    let raddy = RadRaddy::spawn_with_args(
+        |port| format!(":{port} {{\n    access_log off\n    respond 200 hello-world\n}}\n"),
+        &args,
+    );
+    let resp = send_request(raddy.port(), Some("localhost"), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "hello-world");
+    thread::sleep(Duration::from_millis(300));
+    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !content.contains("\"status\":200"),
+        "an off respond site must not be logged: {content}"
+    );
+    let _ = std::fs::remove_file(&log_path);
 }
 
 #[test]
@@ -1005,6 +1982,16 @@ fn reverse_proxy_streams_gzip_before_eos() {
 fn reverse_proxy_streams_zstd_before_eos() {
     streaming_compression_scenario("zstd", "zstd", |body| {
         let mut decoder = zstd::stream::read::Decoder::new(body).unwrap();
+        let mut decoded = Vec::new();
+        Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+        decoded
+    });
+}
+
+#[test]
+fn reverse_proxy_streams_brotli_before_eos() {
+    streaming_compression_scenario("br", "br", |body| {
+        let mut decoder = brotli::Decompressor::new(body, 4096);
         let mut decoded = Vec::new();
         Read::read_to_end(&mut decoder, &mut decoded).unwrap();
         decoded

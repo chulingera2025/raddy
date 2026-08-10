@@ -21,8 +21,11 @@
 //! applied to whichever terminal serves), so the request plane never interprets
 //! the file line by line.
 
+use pingora::tls::x509::X509;
+use pingora::utils::tls::CertKey;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -95,11 +98,14 @@ impl Cidr {
     }
 }
 
-/// The key a `rate_limit` directive counts on. `remote_ip` is the only key in
-/// v0.1.2 (spec §5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The key a `rate_limit` directive counts on (spec §5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RateLimitKey {
+    /// The real client IP per the Section 4 trust model.
     RemoteIp,
+    /// The value of the request header `name`. Requests without that header
+    /// share a single bucket.
+    Header(String),
 }
 
 /// The time unit of a rate.
@@ -125,9 +131,9 @@ impl RateUnit {
 
 /// A compiled `rate_limit` spec: what to count on, plus a token bucket with a
 /// refill rate and capacity (spec §5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateSpec {
-    /// What the limit counts (`remote_ip` in v0.1.2).
+    /// What the limit counts.
     pub key: RateLimitKey,
     /// Tokens refilled per `unit`.
     pub count: u64,
@@ -248,25 +254,53 @@ pub struct GlobalConfig {
     /// DNS-01 challenge credentials (spec §5.3); when set, certificate
     /// issuance uses DNS-01 instead of HTTP-01.
     pub dns_challenge: Option<DnsChallenge>,
+    /// Access-log configuration (spec §5.13); `None` = disabled unless the
+    /// `--access-log` CLI flag is given.
+    pub access_log: Option<AccessLogDirective>,
+}
+
+/// The format of access-log lines (spec §5.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessLogFormat {
+    /// One JSON object per request (the `--access-log` default).
+    Json,
+    /// The classic combined log line.
+    Common,
+}
+
+/// The `access_log` directive's configuration (spec §5.13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessLogDirective {
+    /// `access_log off` — disable access logging for the instance.
+    Off,
+    /// `access_log <path> [format=<json|common>]`.
+    File {
+        path: String,
+        format: AccessLogFormat,
+    },
 }
 
 /// DNS-01 challenge configuration (spec §5.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsChallenge {
-    /// The DNS provider used to publish the challenge TXT record.
-    pub provider: DnsProvider,
+    /// The DNS provider kind used to publish the challenge TXT record. The
+    /// runtime client is built from this via `server::dns::build`.
+    pub provider: DnsProviderKind,
     /// The provider's API token (a secret; e.g. a Cloudflare token with
     /// `Zone: DNS: Edit` permission).
     pub api_token: String,
 }
 
-/// Supported DNS-01 providers.
+/// The configured DNS-01 provider kinds (spec §5.3). Each kind is backed by a
+/// runtime [`DnsProvider`](crate::server::dns::DnsProvider) implementation;
+/// adding one here plus a `server::dns::build` arm is the whole surface for a
+/// new provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DnsProvider {
+pub enum DnsProviderKind {
     Cloudflare,
 }
 
-impl DnsProvider {
+impl DnsProviderKind {
     /// The accepted keyword spellings, for error messages.
     pub const ALL: [&'static str; 1] = ["cloudflare"];
 }
@@ -323,15 +357,24 @@ impl SiteKey {
 #[derive(Debug, Clone)]
 pub enum Directive {
     ReverseProxy {
-        matcher: Option<PathMatcher>,
+        /// Inline matcher (spec §5.9); empty = always matches.
+        matcher: Vec<Matcher>,
         to: Vec<Upstream>,
         /// `lb_policy` inside the block (defaults to round-robin).
         lb_policy: LbPolicy,
         /// `health_check` inside the block (none = no active health check).
         health_check: Option<HealthCheckSpec>,
+        /// TLS sub-directives for `https://` upstreams (spec §5.4).
+        tls: ProxyTlsConfig,
     },
     Handle {
-        path: String,
+        matcher: Vec<Matcher>,
+        directives: Vec<Directive>,
+    },
+    /// Like `handle`, but the matched path prefix is stripped from the URI
+    /// before the block's terminal runs (spec §5.9).
+    HandlePath {
+        matcher: Vec<Matcher>,
         directives: Vec<Directive>,
     },
     HeaderUp {
@@ -353,6 +396,36 @@ pub enum Directive {
         to: String,
         code: u16,
     },
+    /// `rewrite <to>` — rewrite the request URI before forwarding (modifier,
+    /// spec §5.9). Conditional rewrites belong inside a `handle` block.
+    Rewrite {
+        to: ValueTemplate,
+    },
+    /// `respond <matcher> <status> [<body>]` — answer directly (terminal, §5.9).
+    Respond {
+        matcher: Vec<Matcher>,
+        status: u16,
+        body: Option<String>,
+    },
+    /// `error <matcher> [<status>] [<message>]` — trigger the internal error
+    /// response (terminal, §5.9).
+    Error {
+        matcher: Vec<Matcher>,
+        status: Option<u16>,
+        message: Option<String>,
+    },
+    /// `basic_auth <user> <bcrypt-hash>` — HTTP Basic auth guard (spec §5.10).
+    BasicAuth {
+        user: String,
+        hash: String,
+    },
+    /// `forward_auth <target>` — delegate auth to an upstream (spec §5.10).
+    ForwardAuth {
+        target: String,
+    },
+    /// Site-block `access_log off` — disable access logging for this site
+    /// (spec §5.13).
+    AccessLogOff,
     /// Site-scoped `trusted_proxies`, overriding the global list for this site
     /// (spec §4). Compiled into [`CompiledSite::trusted_proxies`].
     TrustedProxies {
@@ -362,6 +435,10 @@ pub enum Directive {
     RateLimit {
         spec: RateSpec,
     },
+    /// Per-site TLS configuration (spec §5.7): certificate source and options.
+    Tls {
+        config: TlsConfig,
+    },
 }
 
 /// An upstream target. The host is resolved to an address during validation;
@@ -370,21 +447,123 @@ pub enum Directive {
 pub struct Upstream {
     pub host: String,
     pub port: u16,
+    /// `https://` scheme prefix → the upstream connection is TLS (spec §5.4).
+    pub tls: bool,
     pub resolved: Option<SocketAddr>,
 }
 
-/// A path matcher: a request path matches if it falls under the prefix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathMatcher {
-    /// The prefix path (with or without a trailing `*`), e.g. `/api/*`.
-    pub prefix: String,
+/// TLS sub-directives of a `reverse_proxy` block (spec §5.4), in parse form.
+/// They apply to every `https://` upstream in the block.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyTlsConfig {
+    /// `tls_servername <host>`: SNI/hostname sent to the upstream (default: the
+    /// upstream host). Required when the address is an IP but the cert is for a
+    /// name.
+    pub servername: Option<String>,
+    /// `tls_skip_verify`: disable upstream certificate and hostname verification.
+    pub skip_verify: bool,
+    /// `tls_ca <pem-file>`: extra root CA(s), repeatable.
+    pub ca_files: Vec<String>,
+    /// `tls_cert <cert-file> <key-file>`: a client certificate for upstream mTLS.
+    pub cert_file: Option<String>,
+    pub key_file: Option<String>,
 }
 
-/// A compression algorithm for the `encode` directive (runtime in M5).
+/// The certificate source of a site's `tls` directive (spec §5.7).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TlsSource {
+    /// Automatic ACME issuance (the default).
+    #[default]
+    Acme,
+    /// `tls internal` — a self-signed certificate generated at startup.
+    Internal,
+    /// `tls <cert-file> <key-file>` — a static PEM certificate chain + key.
+    Static { cert_file: String, key_file: String },
+}
+
+/// A TLS protocol version for `tls min_version` / `tls max_version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsVersion {
+    Tls12,
+    Tls13,
+}
+
+/// The mTLS client-certificate verification mode (`tls client_auth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAuthMode {
+    /// Ask for a client certificate but accept clients without one.
+    Optional,
+    /// Reject clients without a valid client certificate.
+    Require,
+}
+
+/// Client-certificate authentication (spec §5.7): verify against `ca_file`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuth {
+    pub mode: ClientAuthMode,
+    pub ca_file: String,
+}
+
+/// Per-site TLS configuration from the `tls` directive (spec §5.7).
+///
+/// Options are independent and each may appear on its own `tls` line; the
+/// compiler merges them. `source` defaults to ACME when no source is given.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Certificate source (ACME by default).
+    pub source: TlsSource,
+    /// `tls min_version` (None = no floor).
+    pub min_version: Option<TlsVersion>,
+    /// `tls max_version` (None = no ceiling).
+    pub max_version: Option<TlsVersion>,
+    /// `tls ciphers <list>` (OpenSSL cipher list).
+    pub ciphers: Option<String>,
+    /// `tls client_auth` — mutual TLS.
+    pub client_auth: Option<ClientAuth>,
+}
+
+/// The transport of the listener that received a request (`protocol` matcher).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Http,
+    Https,
+}
+
+/// One matcher term (spec §5.9). A directive or `handle` block may carry
+/// several terms; all must match (AND). A term prefixed with `!` negates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Matcher {
+    /// `path <prefix>` — the request path equals the prefix or falls under it
+    /// (`/api` matches `/api` and `/api/...`, not `/apix`). A bare `/path`
+    /// value is shorthand for this. `*` at the end is stripped (`/api/*`).
+    Path(String),
+    /// `host <host>` — the normalized Host header (port stripped,
+    /// ASCII-lowercased) equals the value.
+    Host(String),
+    /// `method <method>` — the request method equals the value (case-sensitive;
+    /// write `GET`, `POST`, …).
+    Method(String),
+    /// `header <name> <value>` — the request header `name` equals `value`
+    /// (header name case-insensitive; value exact).
+    Header { name: String, value: String },
+    /// `query <key> <value>` — a query parameter `key` equals `value`.
+    Query { key: String, value: String },
+    /// `remote_ip <cidr>...` — the real client IP (spec §4) is within any of
+    /// the listed networks.
+    RemoteIp(Vec<Cidr>),
+    /// `protocol <http|https>` — the transport of the receiving listener.
+    Protocol(Protocol),
+    /// `!<term>` — negates a matcher term.
+    Not(Box<Matcher>),
+}
+
+/// A compression algorithm for the `encode` directive (spec §5.11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
     Gzip,
     Zstd,
+    /// Brotli (`br`).
+    Brotli,
 }
 
 /// The load-balancing policy of a `reverse_proxy` block (M9, §5.1).
@@ -453,33 +632,94 @@ pub struct CompiledSite {
     pub modifiers: Vec<Modifier>,
     /// Site-scoped `trusted_proxies` (None = inherit the global list, §4).
     pub trusted_proxies: Option<Vec<Cidr>>,
+    /// Per-site TLS configuration (spec §5.7): certificate source and the TLS
+    /// options applied per SNI. `None` = ACME default, no overrides.
+    pub tls: Option<TlsConfig>,
+    /// Site-block `access_log off` (spec §5.13): this site is excluded from the
+    /// access log.
+    pub access_log_off: bool,
 }
 
 /// A compiled terminal directive.
 #[derive(Debug, Clone)]
 pub struct Terminal {
-    /// Matchers (e.g. a `handle` path and/or an inline matcher); empty means
-    /// always matches. All matchers must match for the terminal to serve.
-    pub matchers: Vec<PathMatcher>,
+    /// Matchers (spec §5.9); empty means always matches. All matchers must
+    /// match for the terminal to serve.
+    pub matchers: Vec<Matcher>,
     pub kind: TerminalKind,
     /// Modifiers scoped to this terminal (from an enclosing `handle` block).
     pub modifiers: Vec<Modifier>,
+    /// A path prefix stripped from the request before the terminal serves
+    /// (the `handle_path` prefix, spec §5.9). `None` = serve the full path.
+    pub strip_prefix: Option<String>,
+}
+
+/// A compiled upstream: the resolved address plus the peer metadata needed to
+/// build the pingora `HttpPeer` (the original host for the default SNI, and the
+/// `https://` scheme).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamPeer {
+    pub addr: SocketAddr,
+    /// `https://` scheme → TLS to this upstream (spec §5.4).
+    pub tls: bool,
+    /// The original upstream host — the default SNI for TLS (empty for plain
+    /// HTTP, or when the operator overrides it with `tls_servername`).
+    pub host: String,
+}
+
+/// Compiled TLS options for a `reverse_proxy` block that has at least one
+/// `https://` upstream (spec §5.4). Immutable config data, carried in the
+/// snapshot (ADR-011); the parsed certificates are built once at compile time.
+#[derive(Clone)]
+pub struct UpstreamTls {
+    /// Verify the upstream certificate and hostname (default true;
+    /// `tls_skip_verify` clears it).
+    pub verify_cert: bool,
+    /// SNI/hostname override (`tls_servername`); empty = per-upstream host.
+    pub servername: String,
+    /// Root CAs parsed from `tls_ca` PEM files. When set, the pingora openssl
+    /// connector REPLACES the default trust store with these CAs — the system
+    /// roots are not consulted.
+    pub ca: Option<Arc<Box<[X509]>>>,
+    /// Client certificate for upstream mTLS (`tls_cert`).
+    pub client_cert: Option<Arc<CertKey>>,
+}
+
+impl std::fmt::Debug for UpstreamTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamTls")
+            .field("verify_cert", &self.verify_cert)
+            .field("servername", &self.servername)
+            .field("ca", &self.ca.as_ref().map(|ca| ca.len()))
+            .field("client_cert", &self.client_cert.is_some())
+            .finish()
+    }
 }
 
 /// The runtime behavior of a terminal directive.
 #[derive(Debug, Clone)]
 pub enum TerminalKind {
     ReverseProxy {
-        upstreams: Vec<SocketAddr>,
+        upstreams: Vec<UpstreamPeer>,
         /// The selection policy (round-robin unless `lb_policy` is set).
         lb_policy: LbPolicy,
         /// The active health-check spec, if configured.
         health_check: Option<HealthCheckSpec>,
+        /// Block-level TLS options for `https://` upstreams (None when the
+        /// block has no TLS upstream).
+        tls: Option<UpstreamTls>,
     },
     /// Static file serving; runtime lands in M5.
     FileServer { root: String },
     /// A redirect; the target is a template expanded at request time.
     Redir { to: ValueTemplate, code: u16 },
+    /// Answer directly with a status and optional body (spec §5.9).
+    Respond { status: u16, body: Option<String> },
+    /// Trigger the internal error response with a status/message (spec §5.9).
+    Error {
+        status: u16,
+        message: Option<String>,
+    },
 }
 
 /// A declarative transform or guard, applied regardless of position (ADR-012).
@@ -500,6 +740,19 @@ pub enum Modifier {
     /// A rate-limit guard (spec §5.2).
     RateLimit {
         spec: RateSpec,
+    },
+    /// Rewrite the request URI before forwarding (spec §5.9).
+    Rewrite {
+        to: ValueTemplate,
+    },
+    /// HTTP Basic authentication guard (spec §5.10): the request must match one
+    /// of the collected `(user, bcrypt-hash)` pairs.
+    BasicAuth {
+        users: Vec<(String, String)>,
+    },
+    /// Delegate authentication to an upstream (spec §5.10).
+    ForwardAuth {
+        target: String,
     },
 }
 

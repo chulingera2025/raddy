@@ -47,4 +47,4 @@ histogram_quantile(0.99, sum by (le) (rate(raddy_request_duration_seconds_bucket
 ## 尚未覆盖的测量
 
 指标集合刻意保持精简。目前没有按站点或按上游的细分,也没有后端连接池的
-gauge。OpenTelemetry 追踪计划在未来的版本中引入。
+gauge。OpenTelemetry 追踪已在路线图上。

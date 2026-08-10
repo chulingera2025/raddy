@@ -26,7 +26,7 @@ const caddyfileLang = {
 			name: 'constant.other.placeholder.caddyfile',
 		},
 		directive: {
-			match: /\b(?:reverse_proxy|file_server|redir|handle|root|encode|header_up|header_down|rate_limit|trusted_proxies|lb_policy|health_check|to|interval|timeout|consecutive_failures|consecutive_successes|log_level|acme_email|admin|snippet|import)\b/,
+			match: /\b(?:reverse_proxy|file_server|redir|handle|handle_path|rewrite|respond|error|root|encode|header_up|header_down|rate_limit|basic_auth|forward_auth|trusted_proxies|tls|access_log|import|snippet|lb_policy|health_check|to|interval|timeout|consecutive_failures|consecutive_successes|log_level|acme_email|dns_challenge|min_version|max_version|ciphers|client_auth|tls_servername|tls_skip_verify|tls_ca|tls_cert|admin)\b/,
 			name: 'keyword.control.caddyfile',
 		},
 		braces: { match: /[{}]/, name: 'punctuation.section.block.caddyfile' },
@@ -83,6 +83,11 @@ export default defineConfig({
 					label: 'Guides',
 					translations: { 'zh-CN': '指南' },
 					items: [
+						{ label: 'HTTPS & TLS', translations: { 'zh-CN': 'HTTPS 与 TLS' }, slug: 'guides/https-tls' },
+						{ label: 'Routing & matchers', translations: { 'zh-CN': '路由与匹配器' }, slug: 'guides/routing' },
+						{ label: 'Authentication', translations: { 'zh-CN': '认证' }, slug: 'guides/auth' },
+						{ label: 'Compression', translations: { 'zh-CN': '压缩' }, slug: 'guides/compression' },
+						{ label: 'Configuration reuse', translations: { 'zh-CN': '配置复用' }, slug: 'guides/config-dx' },
 						{ label: 'Serve static files', translations: { 'zh-CN': '静态托管' }, slug: 'guides/static-files' },
 						{ label: 'Redirect HTTP → HTTPS', translations: { 'zh-CN': 'HTTP → HTTPS 重定向' }, slug: 'guides/http-to-https' },
 						{ label: 'Proxy an API', translations: { 'zh-CN': '代理 API' }, slug: 'guides/api-proxy' },

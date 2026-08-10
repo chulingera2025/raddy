@@ -36,23 +36,44 @@ static.example.com {
 ## Two kinds of directive
 
 Once a request is matched to a site, raddy executes the site's lines **strictly
-in write order**. Every line is one of two kinds:
+in write order**. Every line is one of three kinds:
 
 - **Terminal directives** decide *who serves* the request: `reverse_proxy`,
-  `file_server`, `redir`. The first terminal that matches **ends the site** —
-  later lines never run.
+  `file_server`, `redir`, `respond`, `error`. The first terminal that matches
+  **ends the site** — later lines never run. A terminal may carry an inline
+  [matcher](../guides/routing/); one that does not match is a no-op and execution
+  continues.
 - **Modifier directives** describe *how* to serve, regardless of position:
-  `header_up`, `header_down`, `encode`, `rate_limit`. They apply to whichever
+  `header_up`, `header_down`, `encode`, `rewrite`. They apply to whichever
   terminal serves the block, even if written after it.
+- **Guard directives** decide *who may be served*: `rate_limit`, `basic_auth`,
+  `forward_auth`. They act like modifiers — applying to whichever terminal serves
+  the block — and reject the request (`429`, `401`) when the guard fails.
 
 > **Caddy users:** Caddy reorders directives behind the scenes; raddy does not.
 > You control the order, and the first match wins.
 
-### `handle` groups a path with a terminal
+### Matchers select which requests a directive serves
 
-`handle /path/* { ... }` is a scoped block: if the path matches, its lines run
-and matching stops; otherwise execution continues past it. Think of it as
-"for this path, use this terminal."
+A [matcher](../guides/routing/) is a set of terms — `path`, `host`, `method`,
+`header`, `query`, `remote_ip`, `protocol` — all of which must match. Matchers
+attach to `handle` blocks and, inline, to terminals:
+
+```caddyfile
+handle path /status method GET {
+    respond 200 ok
+}
+```
+
+Terms are space-separated and ANDed; there are no parentheses or `&&`.
+`handle /static/*` is shorthand for `handle path /static/*`.
+
+### `handle` groups a matcher with a terminal
+
+`handle <matcher> { ... }` is a scoped block: if the matcher matches, its lines
+run and matching stops; otherwise execution continues past it. Think of it as
+"for these requests, use this terminal." `handle_path` is the same, except it
+strips the matched path prefix before the block's terminal runs.
 
 ## A request, traced
 
@@ -102,5 +123,6 @@ api.example.com {
 ## The full language
 
 - [Directive reference](directives/) — every directive, syntax, and example
+- [Routing & matchers](../guides/routing/) — matchers, `rewrite`, `handle_path`, `respond`, `error`
 - [Sites, ports & HTTPS](sites/) — matching, catch-alls, certificates
 - [Trusted proxies](trusted-proxies/) — where the "real" client IP comes from

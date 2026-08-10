@@ -36,6 +36,9 @@ api.example.com:8081 { ... }     # explicit port, plain HTTP
   local multi-port deployments and testing.
 - A **catch-all** (`:80`, `:8443`, …) serves every request on that listener that
   matches no named site.
+- A named site with a [`tls` directive](../directives/#tls) serves its port over
+  **TLS even when it is not 443** — `intranet.example.com:8443 { tls internal }`
+  is a TLS listener on 8443.
 
 ## How a request matches a site
 
@@ -73,6 +76,11 @@ A named site on port 443 gets a certificate automatically:
    without re-issuing.
 4. **Renewal** — certificates are renewed automatically within 30 days of
    expiry; a renewal failure keeps the existing certificate serving.
+
+TLS listeners advertise HTTP/2 (`h2`) via ALPN and serve HTTP/2 to clients that
+support it, falling back to HTTP/1.1 otherwise. A site with a static or internal
+`tls` source (see the [`tls` directive](../directives/#tls)) is excluded from
+ACME issuance for that hostname.
 
 Set your contact email in the [global block](#the-global-block):
 
@@ -118,4 +126,7 @@ static.example.com {
 
 - IPv6 literal addresses in site names or upstreams (`[::1]:8080`).
 - Shared multi-domain site blocks.
-- Configurable error pages (the 400 / 404 responses are fixed).
+- Configurable responses for the site-selection fallbacks (missing or unmatched
+  Host → 400 / 404) — those two are fixed. Inside a site, the [`respond`](../directives/#respond)
+  and [`error`](../directives/#error) terminals give you full control over
+  custom responses.

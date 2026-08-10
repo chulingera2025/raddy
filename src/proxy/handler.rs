@@ -20,8 +20,8 @@
 //! so the upstream Connector's connection pools survive (ADR-011).
 
 use crate::config::ast::{
-    Cidr, Encoding, LbPolicy, Modifier, SiteKey, TemplatePart, TerminalKind, ValueTemplate,
-    Variable,
+    AccessLogFormat, Cidr, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec, SiteKey,
+    TemplatePart, TerminalKind, UpstreamTls, ValueTemplate, Variable,
 };
 use crate::config::snapshot::ConfigStore;
 use crate::proxy::compress;
@@ -36,9 +36,28 @@ use pingora::proxy::Session;
 use serde::Serialize;
 use std::fs::File;
 use std::io::{self, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+/// `forward_auth` connect timeout (P1): a hung auth server must fail the
+/// request instead of occupying the worker and socket indefinitely.
+const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// `forward_auth` per-read/write timeout.
+const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The access-log destination and format (spec §5.13).
+pub struct AccessLog {
+    pub file: Mutex<File>,
+    pub format: AccessLogFormat,
+}
+
+/// Bounds concurrent bcrypt verifications (P1): bcrypt is deliberately slow, so
+/// an attacker flooding valid usernames must not saturate the blocking pool.
+const BCRYPT_MAX_CONCURRENCY: usize = 4;
 
 /// The process-lifetime proxy handler.
 pub struct ProxyHandler {
@@ -50,8 +69,11 @@ pub struct ProxyHandler {
     challenges: Arc<ChallengeStore>,
     /// Single-node rate limiter (M10, ADR-011: state survives reloads).
     rate_limiter: Arc<RateLimiter>,
-    /// Optional structured access-log destination (M5).
-    access_log: Option<Mutex<File>>,
+    /// Optional access-log destination and format (spec §5.13).
+    access_log: Option<AccessLog>,
+    /// Caps concurrent `bcrypt::verify` calls (P1): bcrypt is deliberately
+    /// expensive, so it runs on a bounded blocking pool behind this semaphore.
+    bcrypt_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ProxyHandler {
@@ -59,7 +81,7 @@ impl ProxyHandler {
     pub fn new(
         store: Arc<ConfigStore>,
         challenges: Arc<ChallengeStore>,
-        access_log: Option<Mutex<File>>,
+        access_log: Option<AccessLog>,
         pool: Arc<LoadBalancerPool>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
@@ -69,7 +91,88 @@ impl ProxyHandler {
             challenges,
             access_log,
             rate_limiter,
+            bcrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(BCRYPT_MAX_CONCURRENCY)),
         }
+    }
+
+    /// Evaluate the auth guards (spec §5.10) for the effective modifier
+    /// directives. Returns the rejection to answer with, or `None` when the
+    /// request passes. A passing `forward_auth` stores the auth upstream's
+    /// response headers in `ctx.forward_auth_headers`.
+    async fn check_auth_guards(
+        &self,
+        session: &mut Session,
+        modifiers: &[Modifier],
+        ctx: &mut ProxyCtx,
+    ) -> Result<Option<AuthReject>, Box<Error>> {
+        // `basic_auth`: the request must match one of the configured users.
+        let users: Vec<&(String, String)> = modifiers
+            .iter()
+            .filter_map(|m| match m {
+                Modifier::BasicAuth { users } => Some(users.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if !users.is_empty() && !self.basic_auth_matches(session, &users).await? {
+            return Ok(Some(AuthReject::BasicUnauthorized));
+        }
+        // `forward_auth`: last occurrence wins.
+        if let Some(target) = modifiers.iter().rev().find_map(|m| match m {
+            Modifier::ForwardAuth { target } => Some(target.as_str()),
+            _ => None,
+        }) {
+            match forward_auth_check(session, target).await? {
+                ForwardAuthOutcome::Pass(headers) => ctx.forward_auth_headers = headers,
+                ForwardAuthOutcome::Reject(status) => return Ok(Some(AuthReject::Status(status))),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the request's Basic credentials match any configured user.
+    ///
+    /// `bcrypt::verify` is deliberately slow, so it runs off the async worker on
+    /// a bounded blocking pool behind [`BCRYPT_MAX_CONCURRENCY`] (P1) — an
+    /// attacker flooding valid usernames cannot pin the Pingora/Tokio workers.
+    async fn basic_auth_matches(
+        &self,
+        session: &Session,
+        users: &[&(String, String)],
+    ) -> Result<bool, Box<Error>> {
+        let Some((user, password)) = basic_credentials(session) else {
+            return Ok(false);
+        };
+        // Owned copies move into the blocking task (users are few).
+        let users: Vec<(String, String)> =
+            users.iter().map(|(u, h)| (u.clone(), h.clone())).collect();
+        let permit = self
+            .bcrypt_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::explain(InternalError, "bcrypt semaphore closed"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            users.iter().any(|(configured, hash)| {
+                configured == &user && bcrypt::verify(&password, hash).unwrap_or(false)
+            })
+        })
+        .await
+        .map_err(|e| Error::because(InternalError, "bcrypt verify task failed", e))
+    }
+
+    /// Whether the selected site disabled access logging with `access_log off`
+    /// (spec §5.13).
+    fn site_access_log_off(&self, ctx: &ProxyCtx) -> bool {
+        let Some(key) = ctx.site_key.as_ref() else {
+            return false;
+        };
+        self.store
+            .load()
+            .sites
+            .iter()
+            .any(|site| &site.key == key && site.access_log_off)
     }
 }
 
@@ -83,6 +186,8 @@ struct AccessLogEntry {
     path: String,
     status: u16,
     duration_ms: u128,
+    /// Response body bytes written to the client.
+    bytes: usize,
 }
 
 /// Per-request state carried across the `ProxyHttp` hook chain.
@@ -94,6 +199,9 @@ pub struct ProxyCtx {
     terminal_index: usize,
     /// The load-balancing spec of the selected terminal.
     lb_spec: Option<LbSpec>,
+    /// Compiled TLS options for a `https://` reverse-proxy block (spec §5.4);
+    /// `None` for plain-HTTP terminals.
+    tls: Option<UpstreamTls>,
     /// The effective modifier directives (block-level + terminal-scoped).
     modifiers: Vec<Modifier>,
     /// The site's `encode` priorities (empty = no compression).
@@ -114,6 +222,17 @@ pub struct ProxyCtx {
     /// fail before a site is selected (ACME/400/404) or when the peer address is
     /// unavailable — callers then fall back to the TCP peer.
     effective_client_ip: Option<IpAddr>,
+    /// The request path the selected terminal serves, after any `handle_path`
+    /// prefix strip and `rewrite` modifiers (spec §5.9). `None` until a
+    /// reverse-proxy terminal is selected (only forwarding needs it).
+    serve_path: Option<String>,
+    /// Response headers from a passing `forward_auth` upstream (spec §5.10),
+    /// copied onto the request before the real upstream sees it.
+    forward_auth_headers: Vec<(String, String)>,
+    /// Response body bytes written to the client (spec §5.13), counted in
+    /// `response_body_filter` for the proxied path and by the direct-respond
+    /// terminals.
+    response_bytes: usize,
 }
 
 #[async_trait]
@@ -159,18 +278,24 @@ impl ProxyHttp for ProxyHandler {
             site::Selection::Site(site) => {
                 // Owned so a mutable session borrow can coexist while matching.
                 let path = request_path(session).to_string();
+                let is_tls = session_is_tls(session);
                 // Site-scoped `trusted_proxies` override the global list (§4).
                 let trusted: Vec<Cidr> = match &site.trusted_proxies {
                     Some(networks) => networks.clone(),
                     None => config.global.trusted_proxies.clone(),
                 };
                 // Resolve the effective client IP once per site (§4). rate_limit,
-                // `ip_hash`, and the access log all consume this same value;
-                // requests that fail before a site is selected (ACME/400/404)
-                // fall back to the TCP peer.
+                // `ip_hash`, matchers, and the access log all consume this same
+                // value; requests that fail before a site is selected
+                // (ACME/400/404) fall back to the TCP peer.
                 ctx.effective_client_ip = client_ip(session, &trusted);
+                // The site is recorded for every terminal (and the within-site
+                // 404), so `access_log off` (spec §5.13) excludes redir,
+                // file_server, respond, and error requests too (P2).
+                ctx.site_key = Some(site.key.clone());
                 for (index, terminal) in site.terminals.iter().enumerate() {
-                    if !matchers_match(&terminal.matchers, &path) {
+                    if !matchers_match(&terminal.matchers, session, ctx.effective_client_ip, is_tls)
+                    {
                         continue;
                     }
                     // Effective modifiers: block-level then terminal-scoped
@@ -178,18 +303,45 @@ impl ProxyHttp for ProxyHandler {
                     let mut modifiers = site.modifiers.clone();
                     modifiers.extend(terminal.modifiers.iter().cloned());
                     // Rate limiting (spec §5.2): each `rate_limit` directive has
-                    // its own per-(terminal, client IP) token bucket; an empty
-                    // bucket rejects the request with 429.
-                    if let Some(ip) = ctx.effective_client_ip {
-                        for (offset, modifier) in modifiers.iter().enumerate() {
-                            if let Modifier::RateLimit { spec } = modifier {
-                                if !self.rate_limiter.allow(&site.key, index, offset, ip, spec) {
+                    // its own token bucket, keyed by `remote_ip` or a request
+                    // header value; an empty bucket rejects the request with 429.
+                    for (offset, modifier) in modifiers.iter().enumerate() {
+                        if let Modifier::RateLimit { spec } = modifier {
+                            if let Some(key) = rate_limit_key(session, ctx, spec) {
+                                if !self
+                                    .rate_limiter
+                                    .allow(&site.key, index, offset, &key, spec)
+                                {
                                     session.respond_error(429).await?;
                                     return Ok(true);
                                 }
                             }
                         }
                     }
+                    // Auth guards (spec §5.10): `basic_auth` and `forward_auth`
+                    // gate whichever terminal serves the block.
+                    if let Some(reject) = self.check_auth_guards(session, &modifiers, ctx).await? {
+                        match reject {
+                            AuthReject::BasicUnauthorized => {
+                                let mut resp = ResponseHeader::build(401, None)?;
+                                resp.insert_header(
+                                    http::header::WWW_AUTHENTICATE,
+                                    "Basic realm=\"restricted\"",
+                                )?;
+                                resp.insert_header(http::header::CONTENT_LENGTH, "0")?;
+                                session.write_response_header(Box::new(resp), true).await?;
+                            }
+                            AuthReject::Status(status) => {
+                                session.respond_error(status).await?;
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    // The effective request path the terminal serves: `handle_path`
+                    // strips its matched prefix, then `rewrite` modifiers
+                    // transform the path (spec §5.9).
+                    let serve_path =
+                        serving_path(terminal.strip_prefix.as_deref(), &modifiers, &path, session);
                     match &terminal.kind {
                         TerminalKind::Redir { to, code } => {
                             let location = expand_template(to, session);
@@ -207,23 +359,75 @@ impl ProxyHttp for ProxyHandler {
                             upstreams,
                             lb_policy,
                             health_check,
+                            tls,
                         } => {
-                            ctx.site_key = Some(site.key.clone());
                             ctx.terminal_index = index;
                             ctx.lb_spec = Some(LbSpec {
                                 upstreams: upstreams.clone(),
                                 policy: *lb_policy,
                                 health_check: *health_check,
                             });
+                            ctx.tls = tls.clone();
                             ctx.modifiers = modifiers;
                             ctx.encode_algos = encode_algos(&ctx.modifiers);
+                            ctx.serve_path = Some(serve_path);
                             // Continue to upstream_peer for forwarding.
                             return Ok(false);
                         }
                         TerminalKind::FileServer { root } => {
                             let encode = encode_algos(&modifiers);
-                            crate::proxy::fs::serve(session, root, &path, &encode, &modifiers)
-                                .await?;
+                            crate::proxy::fs::serve(
+                                session,
+                                root,
+                                &serve_path,
+                                &encode,
+                                &modifiers,
+                                &mut ctx.response_bytes,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                        TerminalKind::Respond { status, body } => {
+                            let mut resp = ResponseHeader::build(*status, None)?;
+                            match body {
+                                Some(body) => {
+                                    resp.insert_header(
+                                        http::header::CONTENT_LENGTH,
+                                        body.len().to_string(),
+                                    )?;
+                                    apply_header_down(&modifiers, session, &mut resp);
+                                    session.write_response_header(Box::new(resp), false).await?;
+                                    ctx.response_bytes += body.len();
+                                    session
+                                        .write_response_body(Some(Bytes::from(body.clone())), true)
+                                        .await?;
+                                }
+                                None => {
+                                    resp.insert_header(http::header::CONTENT_LENGTH, "0")?;
+                                    apply_header_down(&modifiers, session, &mut resp);
+                                    session.write_response_header(Box::new(resp), true).await?;
+                                }
+                            }
+                            return Ok(true);
+                        }
+                        TerminalKind::Error { status, message } => {
+                            match message {
+                                Some(message) => {
+                                    let body = Bytes::from(message.clone());
+                                    let mut resp = ResponseHeader::build(*status, None)?;
+                                    resp.insert_header(
+                                        http::header::CONTENT_LENGTH,
+                                        body.len().to_string(),
+                                    )?;
+                                    apply_header_down(&modifiers, session, &mut resp);
+                                    session.write_response_header(Box::new(resp), false).await?;
+                                    ctx.response_bytes += body.len();
+                                    session.write_response_body(Some(body), true).await?;
+                                }
+                                None => {
+                                    session.respond_error(*status).await?;
+                                }
+                            }
                             return Ok(true);
                         }
                     }
@@ -268,11 +472,27 @@ impl ProxyHttp for ProxyHandler {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        let addr = balancer
+        let index = balancer
             .select(&key)
             .ok_or_else(|| Error::explain(HTTPStatus(502), "no healthy upstreams available"))?;
-        // v0.1: plain-HTTP upstreams only (Q8) — no TLS, empty SNI.
-        Ok(Box::new(HttpPeer::new(addr, false, String::new())))
+        // Recover the selected peer by index so its TLS scheme and original host
+        // (the default SNI) are correct even when two peers share an address
+        // (P2). The balancer only ever returns configured indices.
+        let addr = lb_spec.upstreams[index].addr;
+        let is_tls = lb_spec.upstreams[index].tls;
+        let default_sni = lb_spec.upstreams[index].host.as_str();
+        let peer = if is_tls {
+            // A `https://` upstream (spec §5.4): TLS with the compiled options.
+            // `UpstreamTls` is always present when any upstream is TLS (the
+            // validator guarantees it), so fall back to plain HTTP defensively.
+            match ctx.tls.as_ref() {
+                Some(tls) => build_tls_peer(addr, default_sni, tls),
+                None => HttpPeer::new(addr, false, String::new()),
+            }
+        } else {
+            HttpPeer::new(addr, false, String::new())
+        };
+        Ok(Box::new(peer))
     }
 
     async fn upstream_request_filter(
@@ -281,6 +501,32 @@ impl ProxyHttp for ProxyHandler {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Path rewrite (spec §5.9): the request may have been transformed by a
+        // `handle_path` prefix strip or a `rewrite` modifier; rebuild the
+        // upstream URI so the backend sees the effective path.
+        if let Some(serve_path) = &ctx.serve_path {
+            if serve_path != session.req_header().uri.path() {
+                let path_and_query = match session.req_header().uri.query() {
+                    Some(query) if !query.is_empty() && !serve_path.contains('?') => {
+                        format!("{serve_path}?{query}")
+                    }
+                    _ => serve_path.clone(),
+                };
+                if let Ok(uri) = http::Uri::from_maybe_shared(path_and_query) {
+                    upstream_request.uri = uri;
+                }
+            }
+        }
+        // Headers from a passing `forward_auth` upstream (spec §5.10), copied
+        // onto the request so the real upstream sees the identity headers.
+        for (name, value) in &ctx.forward_auth_headers {
+            if let (Ok(name), Ok(value)) = (
+                http::HeaderName::from_bytes(name.as_bytes()),
+                http::HeaderValue::from_str(value),
+            ) {
+                let _ = upstream_request.insert_header(name, value);
+            }
+        }
         let ops = header_ops(&ctx.modifiers, true, session);
         apply_header_ops(&ops, |name, value| {
             let _ = upstream_request.insert_header(name, value);
@@ -345,6 +591,10 @@ impl ProxyHttp for ProxyHandler {
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
         let Some(encoder) = ctx.encoder.as_mut() else {
+            // Uncompressed chunk: count the bytes written downstream.
+            if let Some(chunk) = body {
+                ctx.response_bytes += chunk.len();
+            }
             return Ok(None);
         };
         let chunk = body.take().unwrap_or_default();
@@ -364,6 +614,9 @@ impl ProxyHttp for ProxyHandler {
         if !out.is_empty() {
             *body = Some(Bytes::from(out));
         }
+        if let Some(chunk) = body {
+            ctx.response_bytes += chunk.len();
+        }
         Ok(None)
     }
 
@@ -372,18 +625,195 @@ impl ProxyHttp for ProxyHandler {
         if let Some(start) = ctx.start {
             crate::observ::metrics::record_request(start.elapsed().as_secs_f64());
         }
-        // Structured JSON access log (if configured).
+        // Access log (spec §5.13), if configured.
         let Some(log) = &self.access_log else {
             return;
         };
+        // A site that set `access_log off` is excluded.
+        if self.site_access_log_off(ctx) {
+            return;
+        }
         if let Some(entry) = access_log_entry(session, ctx) {
-            if let Ok(mut guard) = log.lock() {
-                let _ = serde_json::to_writer(&mut *guard, &entry);
-                let _ = writeln!(guard);
+            if let Ok(mut guard) = log.file.lock() {
+                match log.format {
+                    AccessLogFormat::Json => {
+                        let _ = serde_json::to_writer(&mut *guard, &entry);
+                        let _ = writeln!(guard);
+                    }
+                    AccessLogFormat::Common => {
+                        let _ = writeln!(guard, "{}", common_log_line(&entry, session));
+                    }
+                }
                 let _ = guard.flush();
             }
         }
     }
+}
+
+/// Build a TLS `HttpPeer` to a `https://` upstream (spec §5.4): SNI from the
+/// compiled options (falling back to the upstream host), certificate
+/// verification unless `tls_skip_verify`, plus any custom CA and client cert.
+fn build_tls_peer(addr: SocketAddr, default_sni: &str, tls: &UpstreamTls) -> HttpPeer {
+    let sni = if tls.servername.is_empty() {
+        default_sni.to_string()
+    } else {
+        tls.servername.clone()
+    };
+    let mut peer = HttpPeer::new(addr, true, sni);
+    peer.options.verify_cert = tls.verify_cert;
+    peer.options.verify_hostname = tls.verify_cert;
+    peer.options.ca = tls.ca.clone();
+    peer.client_cert_key = tls.client_cert.clone();
+    peer
+}
+
+/// The rejection an auth guard produces (spec §5.10).
+enum AuthReject {
+    /// 401 with `WWW-Authenticate: Basic` (a failed `basic_auth`).
+    BasicUnauthorized,
+    /// A status to answer with (a failed `forward_auth`).
+    Status(u16),
+}
+
+/// The outcome of a `forward_auth` delegation (spec §5.10).
+enum ForwardAuthOutcome {
+    /// The auth upstream granted access; its response headers are copied back.
+    Pass(Vec<(String, String)>),
+    /// The auth upstream refused with this status.
+    Reject(u16),
+}
+
+/// Decode the request's HTTP Basic credentials as `(user, password)`, or `None`
+/// when the header is absent or malformed.
+fn basic_credentials(session: &Session) -> Option<(String, String)> {
+    use base64::Engine;
+    let auth = session
+        .req_header()
+        .headers
+        .get(http::header::AUTHORIZATION)?;
+    let auth = auth.to_str().ok()?;
+    let encoded = auth.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (user, password) = decoded.split_once(':')?;
+    Some((user.to_string(), password.to_string()))
+}
+
+/// Delegate authentication to the `host:port` target (spec §5.10): forward a
+/// GET carrying the original Authorization and X-Forwarded-For headers; a 2xx
+/// passes (copying response headers), a 403 is passed through, anything else
+/// rejects with 401.
+async fn forward_auth_check(
+    session: &Session,
+    target: &str,
+) -> Result<ForwardAuthOutcome, Box<Error>> {
+    let (host, port) = target
+        .rsplit_once(':')
+        .ok_or_else(|| Error::explain(InternalError, "invalid forward_auth target"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| Error::explain(InternalError, "invalid forward_auth port"))?;
+    // Bounded I/O (P1): a silent or hung auth server must fail the request
+    // instead of occupying the worker and socket indefinitely.
+    let mut stream = timeout(AUTH_CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| Error::explain(InternalError, "forward_auth connect timed out"))?
+        .map_err(|e| Error::because(InternalError, "forward_auth connect failed", e))?;
+    let auth = session
+        .req_header()
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let xff = session
+        .req_header()
+        .headers
+        .get("x-forwarded-for")
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let path = session
+        .req_header()
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {auth}\r\nX-Forwarded-For: {xff}\r\nConnection: close\r\n\r\n"
+    );
+    timeout(AUTH_READ_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| Error::explain(InternalError, "forward_auth write timed out"))?
+        .map_err(|e| Error::because(InternalError, "forward_auth write failed", e))?;
+    // Read the response head through \r\n\r\n (bounded, per-read timeout).
+    let mut head = Vec::new();
+    let mut buf = [0u8; 512];
+    while head.len() < 16 * 1024 {
+        let n = timeout(AUTH_READ_TIMEOUT, stream.read(&mut buf))
+            .await
+            .map_err(|_| Error::explain(InternalError, "forward_auth read timed out"))?
+            .map_err(|e| Error::because(InternalError, "forward_auth read failed", e))?;
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&buf[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head_str = String::from_utf8_lossy(&head);
+    let status = head_str
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        let reject = if status == 403 { 403 } else { 401 };
+        return Ok(ForwardAuthOutcome::Reject(reject));
+    }
+    // Copy back only the identity headers — never framing, routing, or
+    // hop-by-hop headers (Content-Length, Transfer-Encoding, Connection, Host,
+    // …), which would corrupt the real request's message framing (P1).
+    let mut headers = Vec::new();
+    for line in head_str.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_string();
+            let value = value.trim().to_string();
+            if is_safe_forward_auth_header(&name) {
+                headers.push((name, value));
+            }
+        }
+    }
+    Ok(ForwardAuthOutcome::Pass(headers))
+}
+
+/// Whether a `forward_auth` response header may be copied onto the real
+/// request. Only identity headers pass; framing, representation, routing, and
+/// hop-by-hop headers are dropped (P1).
+fn is_safe_forward_auth_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "content-type"
+            | "content-encoding"
+            | "content-range"
+            | "host"
+            | "x-forwarded-for"
+            | "x-forwarded-proto"
+            | "x-forwarded-host"
+            | "x-real-ip"
+    ) && !lower.starts_with("x-forwarded-")
 }
 
 /// Build a structured access-log entry from the session and context.
@@ -422,7 +852,69 @@ fn access_log_entry(session: &Session, ctx: &ProxyCtx) -> Option<AccessLogEntry>
         path,
         status,
         duration_ms,
+        bytes: ctx.response_bytes,
     })
+}
+
+/// The classic combined log line for the `common` format (spec §5.13):
+/// `%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"`.
+fn common_log_line(entry: &AccessLogEntry, session: &Session) -> String {
+    let referer = header_or_dash(session, http::header::REFERER);
+    let user_agent = header_or_dash(session, http::header::USER_AGENT);
+    let ts = common_log_time(entry.ts);
+    format!(
+        "{} - - [{}] \"{} {} HTTP/1.1\" {} {} \"{}\" \"{}\"",
+        entry.client, ts, entry.method, entry.path, entry.status, entry.bytes, referer, user_agent
+    )
+}
+
+/// A request header value or `-` for the common log format.
+fn header_or_dash(session: &Session, name: http::header::HeaderName) -> String {
+    session
+        .req_header()
+        .headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// Format an epoch-millis timestamp as `[10/Aug/2026:06:00:00 +0000]`.
+fn common_log_time(epoch_ms: u64) -> String {
+    // A tiny hand-rolled formatter keeps the combined log line dependency-free.
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = epoch_ms / 1000;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Days since epoch → (year, month, day) via the civil-from-days algorithm.
+    let (year, month, day) = civil_from_days(days as i64);
+    format!(
+        "{:02}/{}/{:04}:{:02}:{:02}:{:02} +0000",
+        day,
+        MONTHS[month as usize - 1],
+        year,
+        hour,
+        min,
+        sec
+    )
+}
+
+/// Convert days since the Unix epoch to a (year, month, day) date
+/// (Howard Hinnant's civil-from-days algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
 }
 
 /// The current wall clock in epoch milliseconds (the access-log `ts`).
@@ -496,11 +988,142 @@ fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[Cidr]) -> IpAdd
     peer
 }
 
-/// All matchers must match for a terminal to serve (ADR-012).
-fn matchers_match(matchers: &[crate::config::ast::PathMatcher], path: &str) -> bool {
+/// All matchers must match for a terminal to serve (spec §5.9, ADR-012).
+fn matchers_match(
+    matchers: &[crate::config::ast::Matcher],
+    session: &Session,
+    ip: Option<IpAddr>,
+    is_tls: bool,
+) -> bool {
     matchers
         .iter()
-        .all(|matcher| path_matches(&matcher.prefix, path))
+        .all(|matcher| matcher_matches(matcher, session, ip, is_tls))
+}
+
+/// Evaluate a single matcher term against the request (spec §5.9).
+fn matcher_matches(
+    matcher: &crate::config::ast::Matcher,
+    session: &Session,
+    ip: Option<IpAddr>,
+    is_tls: bool,
+) -> bool {
+    use crate::config::ast::Matcher;
+    match matcher {
+        Matcher::Path(prefix) => path_matches(prefix, request_path(session)),
+        Matcher::Host(host) => normalized_host(session) == host.as_str(),
+        Matcher::Method(method) => session.req_header().method.as_str() == method.as_str(),
+        Matcher::Header { name, value } => session
+            .req_header()
+            .headers
+            .get(name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == value.as_str()),
+        Matcher::Query { key, value } => {
+            query_value(session, key).is_some_and(|v| v == value.as_str())
+        }
+        Matcher::RemoteIp(cidrs) => {
+            ip.is_some_and(|addr| cidrs.iter().any(|cidr| cidr.contains(addr)))
+        }
+        Matcher::Protocol(protocol) => match protocol {
+            crate::config::ast::Protocol::Http => !is_tls,
+            crate::config::ast::Protocol::Https => is_tls,
+        },
+        Matcher::Not(inner) => !matcher_matches(inner, session, ip, is_tls),
+    }
+}
+
+/// The normalized Host header (port stripped, trailing dot stripped,
+/// ASCII-lowercased) — the same normalization site selection applies.
+fn normalized_host(session: &Session) -> String {
+    let host = host_header(session).unwrap_or_default();
+    let host = match host.iter().position(|&b| b == b':') {
+        Some(i) => &host[..i],
+        None => host,
+    };
+    let host = if host.last() == Some(&b'.') {
+        &host[..host.len() - 1]
+    } else {
+        host
+    };
+    String::from_utf8_lossy(host).to_ascii_lowercase()
+}
+
+/// The value of a query parameter (raw, not percent-decoded).
+fn query_value(session: &Session, key: &str) -> Option<String> {
+    let query = session.req_header().uri.query()?;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// The counter identity for a `rate_limit` spec (spec §5.2): the effective
+/// client IP for `remote_ip`, or the request header value for `header <name>`
+/// (requests without the header share one bucket).
+fn rate_limit_key(session: &Session, ctx: &ProxyCtx, spec: &RateSpec) -> Option<String> {
+    match &spec.key {
+        RateLimitKey::RemoteIp => ctx
+            .effective_client_ip
+            .map(|ip| ip.to_string())
+            .or_else(|| {
+                session
+                    .client_addr()
+                    .and_then(|addr| addr.as_inet())
+                    .map(|addr| addr.ip().to_string())
+            }),
+        RateLimitKey::Header(name) => Some(
+            session
+                .req_header()
+                .headers
+                .get(name.as_str())
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    }
+}
+
+/// Whether the request arrived over TLS (the `protocol` matcher input).
+fn session_is_tls(session: &Session) -> bool {
+    session
+        .digest()
+        .is_some_and(|digest| digest.ssl_digest.is_some())
+}
+
+/// The effective request path a terminal serves: `handle_path` strips its
+/// matched prefix, then `rewrite` modifiers replace the path (spec §5.9).
+fn serving_path(
+    strip_prefix: Option<&str>,
+    modifiers: &[Modifier],
+    path: &str,
+    session: &Session,
+) -> String {
+    let mut out = path.to_string();
+    if let Some(prefix) = strip_prefix {
+        if let Some(stripped) = strip_path_prefix(prefix, &out) {
+            out = stripped;
+        }
+    }
+    for modifier in modifiers {
+        if let Modifier::Rewrite { to } = modifier {
+            out = expand_template(to, session);
+        }
+    }
+    out
+}
+
+/// Strip a matched path prefix (`/api` → `/` for `/api`; `/api/users` →
+/// `/users`); returns `None` when `path` is not under `prefix`.
+fn strip_path_prefix(prefix: &str, path: &str) -> Option<String> {
+    if prefix == "/" || path == prefix {
+        return Some("/".to_string());
+    }
+    path.strip_prefix(prefix)
+        .filter(|rest| rest.starts_with('/'))
+        .map(|rest| rest.to_string())
 }
 
 /// A prefix match: the request path equals the prefix or falls under it
@@ -894,5 +1517,24 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
         assert_eq!(values, vec!["origin, Accept-Encoding".to_string()]);
+    }
+
+    #[test]
+    fn common_log_time_epoch_and_known_date() {
+        // Epoch → the classic combined-log timestamp (the caller adds brackets).
+        assert_eq!(common_log_time(0), "01/Jan/1970:00:00:00 +0000");
+        // 2026-08-10 00:00:00 UTC = 20_675 days since the epoch (counted leap
+        // years); the civil-from-days conversion must agree.
+        let known = 20_675u64 * 86_400 * 1000;
+        assert_eq!(common_log_time(known), "10/Aug/2026:00:00:00 +0000");
+    }
+
+    #[test]
+    fn common_log_time_handles_time_of_day() {
+        // 12:34:56 on the epoch day, in milliseconds.
+        assert_eq!(
+            common_log_time((12 * 3600 + 34 * 60 + 56) * 1000),
+            "01/Jan/1970:12:34:56 +0000"
+        );
     }
 }

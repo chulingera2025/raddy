@@ -22,15 +22,18 @@ static.example.com {
 `root` 设置目录;`file_server` 提供它。像 `./public` 这样的相对路径从 raddy
 的工作目录解析。
 
-要发送压缩响应,加 `encode` —— 客户端也支持的第一个算法胜出:
+要发送压缩响应,加 `encode` —— 客户端也支持的第一个算法胜出。可使用
+`gzip`、`zstd` 与 Brotli(`br`):
 
 ```caddyfile
 static.example.com {
     root /var/www/html
     file_server
-    encode zstd gzip
+    encode br zstd gzip
 }
 ```
+
+协商如何工作、如何选择算法,见[压缩指南](../compression/)。
 
 ## 运行
 
