@@ -26,6 +26,7 @@
 //! hung Cloudflare API (DNS, connect, or an unresponsive server) can never
 //! block the single issuance worker (or its DNS-01 cleanup) forever.
 
+use crate::server::dns::{DnsProvider, DnsRecord};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -38,7 +39,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A Cloudflare DNS-01 client. The API token is a secret and must have
-/// `Zone: DNS: Edit` permission.
+/// `Zone: DNS: Edit` permission. `Clone` so a [`RecordHandle`] can carry the
+/// client needed to remove its TXT record later.
+#[derive(Clone)]
 pub struct Cloudflare {
     api_token: String,
     base_url: String,
@@ -48,12 +51,36 @@ pub struct Cloudflare {
     agent: ureq::Agent,
 }
 
-/// A TXT record created by [`Cloudflare::present`], kept so `cleanup` can
-/// remove it once the ACME order has been validated.
-#[derive(Debug)]
+/// A TXT record created by [`Cloudflare::present_txt`], kept so
+/// [`DnsRecord::cleanup`] can remove it once the ACME order has been validated.
+/// It carries its own client, so the handle is self-sufficient through the
+/// [`DnsRecord`] trait.
+#[derive(Clone)]
 pub struct RecordHandle {
+    client: Cloudflare,
     zone_id: String,
     record_id: String,
+}
+
+impl DnsRecord for RecordHandle {
+    /// Remove the TXT record.
+    fn cleanup(self: Box<Self>) -> Result<(), String> {
+        self.client.delete_txt(&self.zone_id, &self.record_id)
+    }
+}
+
+impl DnsProvider for Cloudflare {
+    fn present(&self, host: &str, key_authorization: &str) -> Result<Box<dyn DnsRecord>, String> {
+        Ok(Box::new(self.present_txt(host, key_authorization)?))
+    }
+}
+
+#[cfg(test)]
+impl RecordHandle {
+    /// The zone the record was created in (test helper).
+    fn zone_id(&self) -> &str {
+        &self.zone_id
+    }
 }
 
 impl Cloudflare {
@@ -101,18 +128,17 @@ impl Cloudflare {
     }
 
     /// Publish the DNS-01 challenge: create a `_acme-challenge.<host>` TXT
-    /// record whose content is the key authorization. Returns a handle for
-    /// [`cleanup`](Self::cleanup).
-    pub fn present(&self, host: &str, key_authorization: &str) -> Result<RecordHandle, String> {
+    /// record whose content is the key authorization. Returns a handle that
+    /// carries the client and removes the record via [`DnsRecord::cleanup`].
+    fn present_txt(&self, host: &str, key_authorization: &str) -> Result<RecordHandle, String> {
         let zone_id = self.find_zone_id(host)?;
         let record_name = format!("_acme-challenge.{host}");
         let record_id = self.create_txt(&zone_id, &record_name, key_authorization)?;
-        Ok(RecordHandle { zone_id, record_id })
-    }
-
-    /// Remove a TXT record created by [`present`](Self::present).
-    pub fn cleanup(&self, handle: &RecordHandle) -> Result<(), String> {
-        self.delete_txt(&handle.zone_id, &handle.record_id)
+        Ok(RecordHandle {
+            client: self.clone(),
+            zone_id,
+            record_id,
+        })
     }
 
     /// Find the zone that owns `host` by querying each hostname suffix from
@@ -382,9 +408,11 @@ mod tests {
         let (base, created) = MockApi::start();
         let client = Cloudflare::with_base("test-token", &base);
 
-        let handle = client.present("example.com", "token.thumbprint").unwrap();
+        let handle = client
+            .present_txt("example.com", "token.thumbprint")
+            .unwrap();
         // The zone was found and the record created.
-        assert_eq!(handle.zone_id, "zone_example");
+        assert_eq!(handle.zone_id(), "zone_example");
 
         let records = created.lock().unwrap();
         assert_eq!(records.len(), 1);
@@ -394,7 +422,7 @@ mod tests {
         drop(records);
 
         // Cleanup issues a DELETE for the created record.
-        client.cleanup(&handle).unwrap();
+        Box::new(handle).cleanup().unwrap();
     }
 
     #[test]
@@ -403,8 +431,8 @@ mod tests {
         let client = Cloudflare::with_base("test-token", &base);
 
         // `sub.example.com` is not a zone; discovery falls back to `example.com`.
-        let handle = client.present("sub.example.com", "ka").unwrap();
-        assert_eq!(handle.zone_id, "zone_example");
+        let handle = client.present_txt("sub.example.com", "ka").unwrap();
+        assert_eq!(handle.zone_id(), "zone_example");
 
         let records = created.lock().unwrap();
         assert_eq!(records[0]["name"], "_acme-challenge.sub.example.com");
@@ -414,7 +442,7 @@ mod tests {
     fn errors_when_no_zone_owns_the_host() {
         let (base, _) = MockApi::start();
         let client = Cloudflare::with_base("test-token", &base);
-        let err = client.present("other.org", "ka").unwrap_err();
+        let err = client.present_txt("other.org", "ka").err().unwrap();
         assert!(err.contains("no Cloudflare zone found"), "got: {err}");
     }
 
@@ -445,7 +473,7 @@ mod tests {
             Duration::from_millis(200),
         );
         let start = std::time::Instant::now();
-        let err = client.present("example.com", "ka").unwrap_err();
+        let err = client.present_txt("example.com", "ka").err().unwrap();
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),

@@ -1415,11 +1415,11 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 let provider = match words[1].as_str() {
-                    "cloudflare" => DnsProvider::Cloudflare,
+                    "cloudflare" => DnsProviderKind::Cloudflare,
                     other => {
                         return Err(self.err(format!(
                             "invalid dns_challenge provider '{other}' (expected {})",
-                            DnsProvider::ALL.join(", ")
+                            DnsProviderKind::ALL.join(", ")
                         )));
                     }
                 };
@@ -1590,7 +1590,7 @@ mod tests {
         let input = "{ dns_challenge cloudflare abc123 }\napi.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
         let rf = parse("test", input).unwrap();
         let challenge = rf.global.dns_challenge.expect("dns_challenge parsed");
-        assert_eq!(challenge.provider, DnsProvider::Cloudflare);
+        assert_eq!(challenge.provider, DnsProviderKind::Cloudflare);
         assert_eq!(challenge.api_token, "abc123");
     }
 

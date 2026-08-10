@@ -283,20 +283,24 @@ pub enum AccessLogDirective {
 /// DNS-01 challenge configuration (spec §5.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsChallenge {
-    /// The DNS provider used to publish the challenge TXT record.
-    pub provider: DnsProvider,
+    /// The DNS provider kind used to publish the challenge TXT record. The
+    /// runtime client is built from this via `server::dns::build`.
+    pub provider: DnsProviderKind,
     /// The provider's API token (a secret; e.g. a Cloudflare token with
     /// `Zone: DNS: Edit` permission).
     pub api_token: String,
 }
 
-/// Supported DNS-01 providers.
+/// The configured DNS-01 provider kinds (spec §5.3). Each kind is backed by a
+/// runtime [`DnsProvider`](crate::server::dns::DnsProvider) implementation;
+/// adding one here plus a `server::dns::build` arm is the whole surface for a
+/// new provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DnsProvider {
+pub enum DnsProviderKind {
     Cloudflare,
 }
 
-impl DnsProvider {
+impl DnsProviderKind {
     /// The accepted keyword spellings, for error messages.
     pub const ALL: [&'static str; 1] = ["cloudflare"];
 }

@@ -32,7 +32,7 @@
 //! shared resolver pool), so even synchronous cleanup terminates.
 
 use crate::config::ast::DnsChallenge;
-use crate::server::cloudflare::{Cloudflare, RecordHandle};
+use crate::server::dns::{self, DnsProvider, DnsRecord};
 use crate::server::issuance_queue::{AcmeQueue, EnqueueOutcome, RequestKind};
 use crate::tls::CertStore;
 use instant_acme::{
@@ -54,7 +54,7 @@ const RENEW_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 /// validation polls, finalize, certificate) can take well over a minute; 5
 /// minutes bounds a hung attempt (a stalled ACME server, an unresponsive
 /// authorizer) without being aggressive. When it fires the attempt future is
-/// dropped; the synchronous DNS-01 cleanup then runs under the Cloudflare
+/// dropped; the synchronous DNS-01 cleanup then runs under the provider's
 /// agent's own timeouts, so the single issuance worker always proceeds to the
 /// next queued host.
 const ISSUANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -252,10 +252,13 @@ impl AcmeManager {
             ChallengeType::Http01 => "HTTP-01",
             _ => "challenge",
         };
-        let mut dns_guard = self
-            .dns_challenge
-            .as_ref()
-            .map(|dns| Dns01Guard::new(Cloudflare::new(&dns.api_token)));
+        let mut dns_guard = match &self.dns_challenge {
+            Some(dns) => Some(Dns01Guard::new(
+                dns::build(dns.provider, &dns.api_token)
+                    .map_err(|e| format!("dns-01 provider init: {e}"))?,
+            )),
+            None => None,
+        };
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
             let mut authz = result.map_err(|e| format!("authorization for {host}: {e}"))?;
@@ -375,7 +378,7 @@ impl AcmeManager {
 /// Bound an issuance attempt with a wall-clock timeout.
 ///
 /// `tokio::time::timeout` can only fire while the future is parked on an
-/// `.await`; the synchronous Cloudflare DNS-01 calls inside the attempt are
+/// `.await`; the synchronous DNS-01 provider calls inside the attempt are
 /// separately bounded by the provider's Agent timeouts, so the whole attempt
 /// always terminates even on a single-threaded runtime.
 async fn run_with_timeout<Fut>(timeout: Duration, attempt: Fut) -> Result<(), String>
@@ -418,12 +421,12 @@ where
 /// the issuance attempt finishes, whether it succeeds or fails. A leaked record
 /// would keep the challenge valid (and the record on the zone) indefinitely.
 struct Dns01Guard {
-    provider: Cloudflare,
-    handles: Vec<RecordHandle>,
+    provider: Box<dyn DnsProvider>,
+    handles: Vec<Box<dyn DnsRecord>>,
 }
 
 impl Dns01Guard {
-    fn new(provider: Cloudflare) -> Self {
+    fn new(provider: Box<dyn DnsProvider>) -> Self {
         Self {
             provider,
             handles: Vec::new(),
@@ -433,8 +436,8 @@ impl Dns01Guard {
 
 impl Drop for Dns01Guard {
     fn drop(&mut self) {
-        for handle in &self.handles {
-            if let Err(e) = self.provider.cleanup(handle) {
+        for handle in std::mem::take(&mut self.handles) {
+            if let Err(e) = handle.cleanup() {
                 tracing::warn!("failed to remove DNS-01 TXT record: {e}");
             }
         }
