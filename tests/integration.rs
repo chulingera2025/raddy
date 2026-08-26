@@ -3648,14 +3648,7 @@ fn raw_tcp_proxy_relays_bidirectionally() {
     let raddy = RadRaddy::spawn_tcp(|port| {
         format!("tcp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n}}\n")
     });
-    let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream.write_all(b"ping-l4").unwrap();
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).unwrap();
-    assert_eq!(&buf[..n], b"echo:ping-l4");
+    assert_eq!(tcp_echo(raddy.port(), "ping-l4"), "echo:ping-l4");
 }
 
 #[test]
