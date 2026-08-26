@@ -373,6 +373,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                     sink,
                     opts.upgrade || opts.test,
                     opts.upgrade_sock.clone(),
+                    udp.listen.display(),
                     Some(server.watch_execution_phase()),
                 )?;
                 server.add_service(background_service(

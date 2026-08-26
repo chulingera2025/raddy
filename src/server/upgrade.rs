@@ -136,6 +136,7 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     signal_quit(old_pid)?;
 
     wait_for_exit(old_pid, OLD_PROCESS_EXIT_TIMEOUT)?;
+    verify_udp_handoffs(&snapshot, &opts.upgrade_sock)?;
 
     // Confirm the replacement actually took over: the pidfile must now name a
     // different, live process. Without this check a race where the old process
@@ -193,8 +194,6 @@ pub(crate) fn write_topology_state(pidfile: &Path, config: &CompiledConfig) -> R
 
 /// Remove exact UDP handoff artifacts from a previous interrupted upgrade.
 fn cleanup_udp_handoff_files(upgrade_sock: &str) {
-    let manifest = UdpProxy::handoff_manifest_path(upgrade_sock);
-    let _ = std::fs::remove_file(&manifest);
     let Some(parent) = Path::new(upgrade_sock).parent() else {
         return;
     };
@@ -211,6 +210,43 @@ fn cleanup_udp_handoff_files(upgrade_sock: &str) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Verify that every configured UDP listener completed its custom handoff.
+fn verify_udp_handoffs(config: &CompiledConfig, upgrade_sock: &str) -> Result<(), String> {
+    let udp_listeners: Vec<String> = config
+        .layer4
+        .iter()
+        .filter_map(|listener| match listener {
+            crate::config::ast::Layer4Listener::Udp(udp) => Some(udp.listen.display()),
+            _ => None,
+        })
+        .collect();
+    if udp_listeners.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for listener in udp_listeners {
+        let path = UdpProxy::status_path_for(upgrade_sock, &listener);
+        let status = loop {
+            if let Ok(status) = std::fs::read_to_string(&path) {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "UDP listener {listener} did not publish an upgrade status; use a normal restart"
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        if !status.trim().eq("ok") {
+            return Err(format!(
+                "UDP listener {listener} handoff failed: {}; use a normal restart",
+                status.trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build the `raddy run` argument list for a sub-invocation of this same binary

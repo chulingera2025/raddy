@@ -82,6 +82,17 @@ type UdpHandoffState = (std::net::UdpSocket, Vec<(UdpHandoffFlow, Arc<UdpSocket>
 #[cfg(unix)]
 const HANDOFF_FLOWS_PER_CHUNK: usize = 30;
 
+#[cfg(unix)]
+/// Hash a listener identity into a filesystem-safe handoff namespace.
+fn handoff_key(listener: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in listener.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 /// The selection state of one listener, reload-updatable: a SIGHUP reload swaps
 /// the resolved upstream set and policy for *new* flows.
 struct UdpState {
@@ -232,6 +243,8 @@ pub struct UdpProxy {
     #[cfg(unix)]
     upgrade_sock: String,
     #[cfg(unix)]
+    handoff_id: String,
+    #[cfg(unix)]
     phase_watch: Mutex<Option<tokio::sync::broadcast::Receiver<ExecutionPhase>>>,
     listen: ListenAddress,
     config_store: Arc<ConfigStore>,
@@ -261,6 +274,7 @@ impl UdpProxy {
         access_log: Option<Arc<AccessLogSink>>,
         upgrade: bool,
         #[cfg(unix)] upgrade_sock: String,
+        #[cfg(unix)] handoff_id: String,
         #[cfg(unix)] phase_watch: Option<tokio::sync::broadcast::Receiver<ExecutionPhase>>,
     ) -> Result<Self, String> {
         let listener = format!("udp/{}", udp.listen.display());
@@ -309,6 +323,8 @@ impl UdpProxy {
             #[cfg(unix)]
             upgrade_sock,
             #[cfg(unix)]
+            handoff_id: handoff_key(&handoff_id),
+            #[cfg(unix)]
             phase_watch: Mutex::new(phase_watch),
             listen: udp.listen.clone(),
             config_store,
@@ -320,20 +336,25 @@ impl UdpProxy {
         })
     }
 
-    /// Return the manifest path used by the UDP upgrade handoff.
+    /// Return the status path used by one UDP upgrade handoff.
     ///
     /// The upgrade_sock parameter is the Pingora upgrade socket path.
-    /// Returns the deterministic manifest path beside it.
-    pub fn handoff_manifest_path(upgrade_sock: &str) -> String {
-        format!("{upgrade_sock}.udp.manifest")
+    /// Returns the deterministic status path beside the Pingora upgrade socket.
+    pub(crate) fn status_path_for(upgrade_sock: &str, handoff_id: &str) -> String {
+        format!("{upgrade_sock}.udp.{}.status", handoff_key(handoff_id))
     }
 
-    /// Return the Unix socket path used for one UDP handoff descriptor chunk.
+    /// Return the manifest path for one UDP listener handoff.
     ///
-    /// The upgrade_sock parameter is the Pingora upgrade socket path and chunk
-    /// is the zero-based descriptor batch. Returns the deterministic path.
-    pub fn handoff_part_path(upgrade_sock: &str, chunk: usize) -> String {
-        format!("{upgrade_sock}.udp.part.{chunk}")
+    /// The upgrade_sock parameter is the Pingora upgrade socket path and
+    /// handoff_id identifies the listener. Returns a deterministic path.
+    fn handoff_manifest_path(&self) -> String {
+        format!("{}.udp.{}.manifest", self.upgrade_sock, self.handoff_id)
+    }
+
+    /// Return the status path for this listener's UDP handoff.
+    fn handoff_status_path(&self) -> String {
+        format!("{}.udp.{}.status", self.upgrade_sock, self.handoff_id)
     }
 
     /// The current selection state, rebuilt on reload when the upstream set or
@@ -383,6 +404,25 @@ impl UdpProxy {
     /// so the receiver knows exactly how many bounded SCM_RIGHTS messages to
     /// await.
     async fn send_handoff(&self) -> Result<(), String> {
+        let result = self.send_handoff_inner().await;
+        let status = match &result {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!("error: {error}"),
+        };
+        if let Err(error) = write_handoff_file(&self.handoff_status_path(), status.as_bytes()) {
+            tracing::error!(
+                "udp {}: failed to publish handoff status: {error}",
+                self.listener
+            );
+            if result.is_ok() {
+                return Err(error);
+            }
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    async fn send_handoff_inner(&self) -> Result<(), String> {
         let (listener_fd, flow_fds, manifest) = {
             let socket_guard = self.std_socket.lock().expect("UDP socket lock poisoned");
             let socket = socket_guard
@@ -413,12 +453,13 @@ impl UdpProxy {
                 },
             )
         };
-        let manifest_path = Self::handoff_manifest_path(&self.upgrade_sock);
+        let manifest_path = self.handoff_manifest_path();
         let payload = serde_json::to_vec(&manifest)
             .map_err(|e| format!("serialize UDP handoff manifest: {e}"))?;
-        write_handoff_manifest(&manifest_path, &payload)?;
+        write_handoff_file(&manifest_path, &payload)?;
 
         let upgrade_sock = self.upgrade_sock.clone();
+        let handoff_id = self.handoff_id.clone();
         tokio::task::spawn_blocking(move || {
             for chunk in 0..manifest.chunks {
                 let start = chunk * HANDOFF_FLOWS_PER_CHUNK;
@@ -430,7 +471,7 @@ impl UdpProxy {
                 for (index, fd) in flow_fds.iter().enumerate().take(end).skip(start) {
                     fds.add(format!("flow-{index}"), *fd);
                 }
-                let path = Self::handoff_part_path(&upgrade_sock, chunk);
+                let path = format!("{upgrade_sock}.udp.{handoff_id}.part.{chunk}");
                 fds.send_to_sock(path.as_str())
                     .map_err(|e| format!("send UDP handoff chunk {chunk}: {e}"))?;
             }
@@ -445,7 +486,8 @@ impl UdpProxy {
     /// Receive the inherited UDP listener and connected flow sockets.
     async fn receive_handoff(&self) -> Result<UdpHandoffState, String> {
         let upgrade_sock = self.upgrade_sock.clone();
-        tokio::task::spawn_blocking(move || receive_udp_handoff(&upgrade_sock))
+        let handoff_id = self.handoff_id.clone();
+        tokio::task::spawn_blocking(move || receive_udp_handoff(&upgrade_sock, &handoff_id))
             .await
             .map_err(|e| format!("UDP handoff receiver failed: {e}"))?
     }
@@ -672,7 +714,7 @@ impl UdpProxy {
 
 #[cfg(unix)]
 /// Atomically publish a bounded handoff manifest with private permissions.
-fn write_handoff_manifest(path: &str, payload: &[u8]) -> Result<(), String> {
+fn write_handoff_file(path: &str, payload: &[u8]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let temp = format!("{path}.tmp.{}", std::process::id());
     let mut file = std::fs::OpenOptions::new()
@@ -691,8 +733,8 @@ fn write_handoff_manifest(path: &str, payload: &[u8]) -> Result<(), String> {
 
 #[cfg(unix)]
 /// Receive one complete UDP handoff transaction from the old process.
-fn receive_udp_handoff(upgrade_sock: &str) -> Result<UdpHandoffState, String> {
-    let manifest_path = UdpProxy::handoff_manifest_path(upgrade_sock);
+fn receive_udp_handoff(upgrade_sock: &str, handoff_id: &str) -> Result<UdpHandoffState, String> {
+    let manifest_path = format!("{upgrade_sock}.udp.{handoff_id}.manifest");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let manifest = loop {
         if let Ok(bytes) = std::fs::read(&manifest_path) {
@@ -735,7 +777,7 @@ fn receive_udp_handoff(upgrade_sock: &str) -> Result<UdpHandoffState, String> {
         (0..manifest.flows.len()).map(|_| None).collect();
     let mut listener_fd = None;
     for chunk in 0..manifest.chunks {
-        let path = UdpProxy::handoff_part_path(upgrade_sock, chunk);
+        let path = format!("{upgrade_sock}.udp.{handoff_id}.part.{chunk}");
         let mut fds = Fds::new();
         fds.get_from_sock(path.as_str())
             .map_err(|e| format!("receive UDP handoff chunk {chunk}: {e}"))?;
@@ -837,6 +879,21 @@ impl BackgroundService for UdpProxy {
                         "udp {}: failed to receive upgrade handoff: {error}",
                         self.listener
                     );
+                    #[cfg(unix)]
+                    {
+                        let status = format!("error: {error}");
+                        if let Err(status_error) =
+                            write_handoff_file(&self.handoff_status_path(), status.as_bytes())
+                        {
+                            tracing::error!(
+                                "udp {}: failed to publish receive failure: {status_error}",
+                                self.listener
+                            );
+                        }
+                    }
+                    if self.upgrade {
+                        std::process::exit(1);
+                    }
                     return;
                 }
             }
@@ -874,11 +931,17 @@ impl BackgroundService for UdpProxy {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     tracing::error!("udp {}: failed to wrap listener socket: {e}", self.listener);
+                    if self.upgrade {
+                        std::process::exit(1);
+                    }
                     return;
                 }
             },
             None => {
                 tracing::error!("udp {}: listener socket is unavailable", self.listener);
+                if self.upgrade {
+                    std::process::exit(1);
+                }
                 return;
             }
         };
