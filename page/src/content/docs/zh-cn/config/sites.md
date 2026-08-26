@@ -64,7 +64,9 @@ raddy 比较规范化后的 `Host` 头 —— 去端口、去末尾点、转小�
    控制权——默认在纯 HTTP 监听器上应答 **HTTP-01** 挑战
    (`/.well-known/acme-challenge/…`);当 80 端口不可达时,也可通过
    [全局块](#全局块)中的 `dns_challenge` 走 **DNS-01**(见
-   [指令参考](../directives/#dns_challenge))。
+   [指令参考](../directives/#dns_challenge))。由于 HTTP-01 在纯 HTTP 监听器
+   上应答,配置含具名站点但没有任何站点绑定端口 80 时,raddy 会自动绑定一个
+   仅服务 ACME 挑战的隐式 `:80` 监听器;`dns_challenge` 则跳过它。
 2. **SNI** —— 每个 HTTPS 请求按请求的主机名选择证书,因此多站点服务器按
    站点下发正确证书。
 3. **缓存** —— 证书与账户凭据存放在 `raddy_certs/`(可用 `--cert-dir`

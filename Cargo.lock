@@ -2062,7 +2062,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raddy"
-version = "0.2.10"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2080,6 +2080,7 @@ dependencies = [
  "pingora",
  "prometheus",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "signal-hook",

@@ -261,7 +261,10 @@ file_server
 **行为。** 提供 `root` + 完整请求路径,含任何 `handle` 前缀 ——
 `handle /static/* { root /var/www; file_server }` 将 `/static/foo` 映射到
 `/var/www/static/foo`。目录提供其 `index.html`。路径穿越(`..`)被 `404`
-拒绝。仅允许 `GET` 与 `HEAD`。`encode` 同样作用于 `file_server` 的响应。
+拒绝。隐藏文件永不服务——任何以 `.` 开头的路径段(`.env`、`.git/`、
+`.htaccess`)一律 `404`,唯一例外是 `.well-known` 目录(RFC 8615 的
+well-known URI 天生公开)。仅允许 `GET` 与 `HEAD`。`encode` 同样作用于
+`file_server` 的响应;小于 64 字节的响应体不做压缩。
 
 **示例。**
 

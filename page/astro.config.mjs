@@ -91,6 +91,7 @@ export default defineConfig({
 						{ label: 'Serve static files', translations: { 'zh-CN': '静态托管' }, slug: 'guides/static-files' },
 						{ label: 'Redirect HTTP → HTTPS', translations: { 'zh-CN': 'HTTP → HTTPS 重定向' }, slug: 'guides/http-to-https' },
 						{ label: 'Proxy an API', translations: { 'zh-CN': '代理 API' }, slug: 'guides/api-proxy' },
+						{ label: 'Layer 4 (TCP & UDP)', translations: { 'zh-CN': '四层代理（TCP 与 UDP）' }, slug: 'guides/layer4' },
 					],
 				},
 				{

@@ -65,10 +65,13 @@ A named site on port 443 gets a certificate automatically:
 
 1. **Issuance** — raddy registers with the ACME directory (Let's Encrypt by
    default) and proves control of the domain — by default with the **HTTP-01**
-   challenge on its plain-HTTP listener (`/.well-known/acme-challenge/…`), or
+   challenge on a plain-HTTP listener (`/.well-known/acme-challenge/…`), or
    with **DNS-01** via `dns_challenge` in the [global block](#the-global-block)
    when port 80 is unreachable (see the
-   [directive reference](../directives/#dns_challenge)).
+   [directive reference](../directives/#dns_challenge)). Because HTTP-01 is
+   answered on a plain-HTTP listener, a config with named sites but no site on
+   port 80 automatically binds an implicit `:80` listener that serves only the
+   ACME challenge; `dns_challenge` skips it.
 2. **SNI** — each HTTPS request's certificate is selected by the requested
    hostname, so a multi-site server serves the right certificate per site.
 3. **Caching** — certificates and account credentials are stored under

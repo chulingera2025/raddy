@@ -63,13 +63,17 @@ jobs:
 
       - name: Compute checksums
         run: |
+          set -euo pipefail
           cd artifacts
           : > SHA256SUMS
           for f in $(find . -name "*.tar.gz"); do
             bn=$(basename "$f")
             sha256sum "$f" | sed "s|$f|$bn|" >> SHA256SUMS
           done
-          sha256sum install.sh | sed 's|install.sh|../install.sh|' >> SHA256SUMS
+          # install.sh lives at the repo root (outside artifacts/); record its
+          # checksum under the bare filename so `shasum -c SHA256SUMS` works
+          # from a directory holding install.sh + the tarballs.
+          sha256sum ../install.sh | sed 's|\.\./install.sh|install.sh|' >> SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub release

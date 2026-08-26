@@ -34,8 +34,11 @@ pub fn validate_and_compile(
     raddyfile: &Raddyfile,
 ) -> Result<CompiledConfig, ConfigError> {
     validate_global(file, &raddyfile.global)?;
-    if raddyfile.sites.is_empty() {
-        return Err(validate_error(file, "no sites defined"));
+    if raddyfile.sites.is_empty() && raddyfile.layer4.is_empty() {
+        return Err(validate_error(
+            file,
+            "no sites or layer-4 listeners defined",
+        ));
     }
 
     let mut seen = HashSet::new();
@@ -50,10 +53,72 @@ pub fn validate_and_compile(
         sites.push(compile_site(file, site)?);
     }
 
+    let layer4 = validate_layer4(file, raddyfile)?;
+
     Ok(CompiledConfig {
         global: raddyfile.global.clone(),
         sites,
+        layer4,
     })
+}
+
+/// Validate the layer-4 listener set and return it compiled.
+///
+/// Beyond the per-listener checks already done by the parser (at least one
+/// upstream, non-zero durations/limits), this rejects two cases. First, two
+/// listeners whose socket ownership overlaps for the *same* transport (TCP and
+/// UDP may share an address and port). Second, a raw-TCP listener whose port
+/// collides with an HTTP site's listener (both bind TCP).
+///
+/// Wildcard binds (`0.0.0.0`, `::`) overlap any bind on the same port, and the
+/// IPv6 wildcard also captures IPv4-mapped traffic (dual-stack), so both are
+/// treated as overlapping everything on their port.
+fn validate_layer4(file: &str, raddyfile: &Raddyfile) -> Result<Vec<Layer4Listener>, ConfigError> {
+    let mut seen: Vec<(SocketTransport, ListenAddress)> = Vec::new();
+    for listener in &raddyfile.layer4 {
+        let (transport, address) = match listener {
+            Layer4Listener::Tcp(tcp) => (SocketTransport::Tcp, &tcp.listen),
+            Layer4Listener::Udp(udp) => (SocketTransport::Udp, &udp.listen),
+        };
+        // Raw TCP shares the TCP listener namespace with the HTTP sites.
+        if matches!(transport, SocketTransport::Tcp) {
+            for site in &raddyfile.sites {
+                if site.key.port() == address.port() {
+                    return Err(validate_error(
+                        file,
+                        format!(
+                            "layer-4 TCP listener {} conflicts with HTTP site on port {}",
+                            address.display(),
+                            site.key.port()
+                        ),
+                    ));
+                }
+            }
+        }
+        for (other_transport, other_addr) in &seen {
+            if *other_transport == transport && binds_overlap(other_addr, address) {
+                return Err(validate_error(
+                    file,
+                    format!(
+                        "duplicate or overlapping {transport:?} listener on {}",
+                        address.display()
+                    ),
+                ));
+            }
+        }
+        seen.push((transport, address.clone()));
+    }
+    Ok(raddyfile.layer4.clone())
+}
+
+/// Whether two layer-4 binds of the same transport occupy overlapping socket
+/// ownership. Wildcards overlap everything on their port.
+fn binds_overlap(a: &ListenAddress, b: &ListenAddress) -> bool {
+    let (ListenAddress::Socket(a), ListenAddress::Socket(b)) = (a, b);
+    if a.port() != b.port() {
+        return false;
+    }
+    a.ip().is_unspecified() || b.ip().is_unspecified() || a.ip() == b.ip()
 }
 
 fn validate_global(file: &str, global: &GlobalConfig) -> Result<(), ConfigError> {
@@ -693,6 +758,44 @@ mod tests {
     fn rejects_empty_sites() {
         let err = compile("").unwrap_err();
         assert!(err.to_string().contains("no sites"));
+    }
+
+    #[test]
+    fn layer4_only_config_compiles() {
+        // A config with no HTTP sites but a raw-TCP listener is valid.
+        let cfg = compile("tcp :3306 {\n    to 127.0.0.1:3306\n}\n").unwrap();
+        assert!(cfg.sites.is_empty());
+        assert_eq!(cfg.layer4.len(), 1);
+    }
+
+    #[test]
+    fn rejects_overlapping_tcp_binds() {
+        // A wildcard bind overlaps a specific bind on the same TCP port.
+        let input = "tcp 0.0.0.0:3306 {\n    to 127.0.0.1:3306\n}\n\
+                     tcp 127.0.0.1:3306 {\n    to 127.0.0.1:3307\n}\n";
+        let err = compile(input).unwrap_err();
+        assert!(err.to_string().contains("overlapping"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_tcp_http_port_collision() {
+        // HTTP binds TCP; a raw-TCP listener on the same port cannot coexist.
+        let input = "tcp :8080 {\n    to 127.0.0.1:8080\n}\n\
+                     :8080 {\n    reverse_proxy 127.0.0.1:1\n}\n";
+        let err = compile(input).unwrap_err();
+        assert!(
+            err.to_string().contains("conflicts with HTTP"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn distinct_specific_tcp_binds_are_allowed() {
+        // Two non-wildcard binds on different addresses share the port legally.
+        let input = "tcp 127.0.0.1:3306 {\n    to 127.0.0.1:3306\n}\n\
+                     tcp 127.0.0.2:3306 {\n    to 127.0.0.1:3307\n}\n";
+        let cfg = compile(input).unwrap();
+        assert_eq!(cfg.layer4.len(), 2);
     }
 
     #[test]

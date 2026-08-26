@@ -21,6 +21,8 @@
 use crate::config::ast::*;
 use crate::config::lexer::{lex, Token, TokenKind};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 /// The maximum size of a file pulled in by `import` (spec §5.12), so a config
 /// can never read unbounded input (e.g. `/dev/zero`). An oversized file is an
@@ -28,6 +30,11 @@ use std::collections::HashMap;
 const MAX_IMPORT_BYTES: u64 = 1 << 20;
 /// The maximum `import` nesting depth (spec §5.12).
 const MAX_IMPORT_DEPTH: usize = 32;
+/// The maximum `{ ... }` block nesting depth (a `handle`/`handle_path` can
+/// nest arbitrarily in the grammar). Bounds both the preprocessing recursion
+/// ([`expand_imports`]) and the grammar recursion ([`Parser`]) so an untrusted
+/// config with ~100k nested braces cannot exhaust the stack (SECURITY.md).
+const MAX_BLOCK_DEPTH: usize = 100;
 
 /// Parse a Raddyfile into its source AST.
 ///
@@ -52,7 +59,7 @@ pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
     let mut snippets = HashMap::new();
     let mut stack = Vec::new();
     let tokens =
-        expand_imports(file, tokens, &mut snippets, &mut stack, true).map_err(|message| {
+        expand_imports(file, tokens, &mut snippets, &mut stack, true, 0).map_err(|message| {
             ConfigError::Parse {
                 file: file.to_string(),
                 line: 1,
@@ -65,37 +72,123 @@ pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
         tokens,
         pos: 0,
         stmt_pos: (1, 1),
+        depth: 0,
     }
     .parse_raddyfile()
 }
 
-/// Expand `{$ENV}` placeholders at the token level (spec §5.12): a word token
-/// that is exactly `{$NAME}` is replaced by the value of `NAME` as a single
-/// argument token, so a value containing spaces, `#`, braces, or newlines
-/// cannot change the configuration structure (P2). A missing variable is an
-/// error.
+/// Expand `{$ENV}` placeholders at the token level (spec §5.12): every
+/// `{$NAME}` occurrence is replaced by the value of `NAME`, spliced verbatim
+/// into the same argument token, so a value containing spaces, `#`, braces, or
+/// newlines cannot change the configuration structure (P2).
+///
+/// The lexer splits a word at the placeholder braces (`https://{$HOST}:8443`
+/// lexes as `https://`, `{$HOST}`, `:8443`), so when a word references an env
+/// var the immediately-adjacent fragments are collapsed back into one token
+/// after expansion — the spec's example parses as the single upstream target
+/// `https://<value>:8443`. A missing variable is an error.
 fn expand_env_tokens(tokens: Vec<Token>) -> Result<Vec<Token>, String> {
-    let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        match &token.kind {
-            TokenKind::Word(word) if is_env_token(word) => {
-                let name = &word[2..word.len() - 1];
-                let value = std::env::var(name)
-                    .map_err(|_| format!("environment variable '{name}' is not set"))?;
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if let TokenKind::Word(word) = &token.kind {
+            if word.contains("{$") {
+                // Expand the whole run of adjacent word fragments around this
+                // token. Two words are adjacent only when a `{...}` split them
+                // (no whitespace can sit between two tokens otherwise), so the
+                // run is exactly one logical argument.
+                let mut left = i;
+                while left > 0 {
+                    let (prev, cur) = (&tokens[left - 1], &tokens[left]);
+                    if let (TokenKind::Word(pw), TokenKind::Word(_)) = (&prev.kind, &cur.kind) {
+                        if prev.line == cur.line && prev.col + pw.len() as u32 == cur.col {
+                            left -= 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                let mut right = i;
+                let mut end = token.col + word.len() as u32;
+                while right + 1 < tokens.len() {
+                    let next = &tokens[right + 1];
+                    if let TokenKind::Word(nw) = &next.kind {
+                        if next.line == token.line && next.col == end {
+                            right += 1;
+                            end = next.col + nw.len() as u32;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                let mut value = String::new();
+                for t in &tokens[left..=right] {
+                    let TokenKind::Word(w) = &t.kind else {
+                        unreachable!("the run contains only Word tokens")
+                    };
+                    if w.contains("{$") {
+                        value.push_str(&expand_env_in_word(w)?);
+                    } else {
+                        value.push_str(w);
+                    }
+                }
+                // The run's left side [left..i) was already emitted to `out` on
+                // earlier iterations; pop it back so the merged token replaces
+                // the fragments instead of duplicating them.
+                for _ in left..i {
+                    let popped = out.pop().expect("left run tokens were emitted");
+                    debug_assert!(matches!(popped.kind, TokenKind::Word(_)));
+                }
                 out.push(Token {
                     kind: TokenKind::Word(value),
-                    ..token
+                    line: token.line,
+                    col: token.col,
                 });
+                i = right + 1;
+                continue;
             }
-            _ => out.push(token),
         }
+        out.push(token.clone());
+        i += 1;
     }
     Ok(out)
 }
 
-/// Whether a word token is an `{$NAME}` environment placeholder.
-fn is_env_token(word: &str) -> bool {
-    word.starts_with("{$") && word.ends_with('}') && word.len() >= 4
+/// Replace every `{$NAME}` placeholder embedded in `word` with its environment
+/// value. An unterminated or empty `{$` is left literal; a named but unset
+/// variable is an error, so a typo'd variable never silently vanishes.
+fn expand_env_in_word(word: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(start) = rest.find("{$") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            None => {
+                // No closing brace: not an environment reference; keep the rest.
+                out.push_str(&rest[start..]);
+                return Ok(out);
+            }
+            Some(end) => {
+                let name = &after[..end];
+                if name.is_empty() {
+                    out.push_str("{$}");
+                } else {
+                    let value = std::env::var(name)
+                        .map_err(|_| format!("environment variable '{name}' is not set"))?;
+                    out.push_str(&value);
+                }
+                rest = &after[end + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Expand environment variables in a config's raw text (spec §5.12): every
@@ -110,6 +203,7 @@ fn expand_imports(
     snippets: &mut HashMap<String, Vec<Token>>,
     stack: &mut Vec<String>,
     top_level: bool,
+    depth: usize,
 ) -> Result<Vec<Token>, String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -121,6 +215,9 @@ fn expand_imports(
                 i += 1;
             }
             TokenKind::LBrace => {
+                if depth >= MAX_BLOCK_DEPTH {
+                    return Err(format!("block nesting exceeds {MAX_BLOCK_DEPTH} levels"));
+                }
                 let (content, end) = capture_block(&tokens, i);
                 if end == i {
                     // Unclosed block; leave it for the parser to reject.
@@ -129,7 +226,14 @@ fn expand_imports(
                     continue;
                 }
                 out.push(token.clone());
-                out.extend(expand_imports(file, content, snippets, stack, false)?);
+                out.extend(expand_imports(
+                    file,
+                    content,
+                    snippets,
+                    stack,
+                    false,
+                    depth + 1,
+                )?);
                 out.push(tokens[end].clone());
                 i = end + 1;
             }
@@ -186,6 +290,7 @@ fn expand_imports(
                             snippets,
                             stack,
                             true,
+                            0,
                         )?);
                         stack.pop();
                     }
@@ -348,6 +453,8 @@ struct Parser<'a> {
     /// The start position of the statement being parsed, so errors point at
     /// the offending directive rather than the block terminator.
     stmt_pos: (u32, u32),
+    /// Current `{ ... }` block nesting depth ([`MAX_BLOCK_DEPTH`]).
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -477,6 +584,7 @@ impl<'a> Parser<'a> {
         }
 
         let mut sites = Vec::new();
+        let mut layer4 = Vec::new();
         loop {
             while matches!(
                 self.peek(),
@@ -499,13 +607,25 @@ impl<'a> Parser<'a> {
             ) {
                 return Err(self.err("unexpected '}'"));
             }
-            sites.push(self.parse_site()?);
+            let (words, block_open) = self.parse_statement()?;
+            if words.is_empty() {
+                continue;
+            }
+            match words[0].as_str() {
+                // Layer-4 listener blocks (L4_PROXY_PLAN): peers of HTTP sites.
+                "tcp" => layer4.push(self.parse_layer4_tcp(&words, block_open)?),
+                "udp" => layer4.push(self.parse_layer4_udp(&words, block_open)?),
+                _ => sites.push(self.parse_site(&words, block_open)?),
+            }
         }
-        Ok(Raddyfile { global, sites })
+        Ok(Raddyfile {
+            global,
+            sites,
+            layer4,
+        })
     }
 
-    fn parse_site(&mut self) -> Result<Site, ConfigError> {
-        let (words, block_open) = self.parse_statement()?;
+    fn parse_site(&mut self, words: &[String], block_open: bool) -> Result<Site, ConfigError> {
         if words.len() != 1 {
             return Err(self.err("expected a site address such as ':8080' or 'example.com'"));
         }
@@ -555,6 +675,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_directive_block(&mut self) -> Result<Vec<Directive>, ConfigError> {
+        self.depth += 1;
+        if self.depth > MAX_BLOCK_DEPTH {
+            return Err(self.err(format!("block nesting exceeds {MAX_BLOCK_DEPTH} levels")));
+        }
+        let directives = self.parse_directive_block_body();
+        self.depth -= 1;
+        directives
+    }
+
+    /// The body of [`parse_directive_block`] (the actual loop), split out so the
+    /// depth guard above wraps every return without duplicating the decrement.
+    fn parse_directive_block_body(&mut self) -> Result<Vec<Directive>, ConfigError> {
         let mut directives = Vec::new();
         loop {
             match self.peek() {
@@ -824,6 +956,372 @@ impl<'a> Parser<'a> {
         Ok(spec)
     }
 
+    /// Parse a `tcp <address> { ... }` layer-4 listener block (L4_PROXY_PLAN
+    /// P0). `words` is `["tcp", "<address>"]`; the block is read from the
+    /// token stream.
+    fn parse_layer4_tcp(
+        &mut self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Layer4Listener, ConfigError> {
+        if !block_open {
+            return Err(self.err("tcp requires a block: tcp <address> { ... }"));
+        }
+        if words.len() != 2 {
+            return Err(self.err("tcp requires exactly one listen address, e.g. tcp :3306"));
+        }
+        let listen = parse_listen_address(&words[1]).map_err(|m| self.err(m))?;
+        let mut upstreams: Vec<L4Upstream> = Vec::new();
+        let mut lb_policy: Option<LbPolicy> = None;
+        let mut connect_timeout: Option<Duration> = None;
+        let mut idle_timeout: Option<Duration> = None;
+        let mut max_connections: Option<usize> = None;
+        let mut health_check: Option<TcpHealthCheckSpec> = None;
+        let mut sni_routes: Vec<SniRoute> = Vec::new();
+        let mut sni_fallback: Option<L4Upstream> = None;
+        loop {
+            match self.peek() {
+                Some(Token {
+                    kind: TokenKind::RBrace,
+                    ..
+                }) => {
+                    self.pos += 1;
+                    break;
+                }
+                None => return Err(self.err("unexpected end of file in tcp block")),
+                _ => {}
+            }
+            let (line, nested) = self.parse_statement()?;
+            if line.is_empty() {
+                continue;
+            }
+            let name = line[0].clone();
+            match name.as_str() {
+                "to" => {
+                    if nested {
+                        return Err(self.err("unexpected '{' after to"));
+                    }
+                    if line.len() < 2 {
+                        return Err(self.err("to requires at least one upstream"));
+                    }
+                    for target in &line[1..] {
+                        upstreams.push(parse_l4_upstream(target).map_err(|m| self.err(m))?);
+                    }
+                }
+                "lb_policy" => {
+                    if nested {
+                        return Err(self.err("unexpected '{' after lb_policy"));
+                    }
+                    if lb_policy.is_some() {
+                        return Err(self.err("duplicate lb_policy"));
+                    }
+                    lb_policy = Some(self.parse_lb_policy(&line)?);
+                }
+                "connect_timeout" => {
+                    if nested {
+                        return Err(self.err("unexpected '{' after connect_timeout"));
+                    }
+                    if connect_timeout.is_some() {
+                        return Err(self.err("duplicate connect_timeout"));
+                    }
+                    connect_timeout = Some(parse_duration(&line).map_err(|m| self.err(m))?);
+                }
+                "idle_timeout" => {
+                    if nested {
+                        return Err(self.err("unexpected '{' after idle_timeout"));
+                    }
+                    if idle_timeout.is_some() {
+                        return Err(self.err("duplicate idle_timeout"));
+                    }
+                    idle_timeout = Some(parse_duration(&line).map_err(|m| self.err(m))?);
+                }
+                "max_connections" => {
+                    if nested {
+                        return Err(self.err("unexpected '{' after max_connections"));
+                    }
+                    if max_connections.is_some() {
+                        return Err(self.err("duplicate max_connections"));
+                    }
+                    max_connections =
+                        Some(parse_count(&line, "max_connections").map_err(|m| self.err(m))?);
+                }
+                "health_check" => {
+                    if health_check.is_some() {
+                        return Err(self.err("duplicate health_check"));
+                    }
+                    health_check = Some(self.parse_l4_health_check(nested)?);
+                }
+                "sni" => {
+                    if nested {
+                        return Err(self.err("unexpected '{' after sni"));
+                    }
+                    if line.len() != 3 {
+                        return Err(self.err("sni requires: sni <name> <host:port>"));
+                    }
+                    let name = line[1].to_ascii_lowercase();
+                    if name.is_empty() || name.contains('*') {
+                        return Err(self.err("invalid sni name (exact match only in v1)"));
+                    }
+                    if sni_routes.iter().any(|r| r.name == name) {
+                        return Err(self.err(format!("duplicate sni route for '{name}'")));
+                    }
+                    let upstream = parse_l4_upstream(&line[2]).map_err(|m| self.err(m))?;
+                    sni_routes.push(SniRoute { name, upstream });
+                }
+                "fallback" => {
+                    if nested {
+                        return Err(self.err("unexpected '{' after fallback"));
+                    }
+                    if line.len() != 2 {
+                        return Err(self.err("fallback requires: fallback <host:port>"));
+                    }
+                    if sni_fallback.is_some() {
+                        return Err(self.err("duplicate fallback"));
+                    }
+                    sni_fallback = Some(parse_l4_upstream(&line[1]).map_err(|m| self.err(m))?);
+                }
+                other => return Err(self.err(format!("unknown tcp directive '{other}'"))),
+            }
+        }
+        // SNI routing (`sni`) is an alternative to the shared `to` set, and
+        // `fallback` only makes sense in SNI mode. Active health checks apply
+        // only to `to` mode (per-route health is a P1 follow-up), so the
+        // combination is rejected rather than silently ignored.
+        if !sni_routes.is_empty() {
+            if !upstreams.is_empty() {
+                return Err(self.err("sni routing cannot be combined with `to`"));
+            }
+            if health_check.is_some() {
+                return Err(self.err(
+                    "sni routing does not support health_check (per-route health is planned)",
+                ));
+            }
+        } else {
+            if sni_fallback.is_some() {
+                return Err(self.err("fallback requires sni routing"));
+            }
+            if upstreams.is_empty() {
+                return Err(self
+                    .err("tcp requires at least one upstream (to <host>:<port> ... or sni ...)"));
+            }
+        }
+        let tcp = TcpProxyConfig {
+            listen,
+            upstreams,
+            lb_policy: lb_policy.unwrap_or(LbPolicy::RoundRobin),
+            connect_timeout: connect_timeout.unwrap_or(Duration::from_secs(5)),
+            idle_timeout: idle_timeout.unwrap_or(Duration::from_secs(5 * 60)),
+            max_connections: max_connections.unwrap_or(10_000),
+            health_check,
+            sni_routes,
+            sni_fallback,
+        };
+        // A zero timeout would disable the bound it controls (an immediate
+        // connect timeout or an "idle" that closes instantly); reject.
+        if tcp.connect_timeout.is_zero() || tcp.idle_timeout.is_zero() {
+            return Err(self.err("tcp connect_timeout and idle_timeout must be greater than zero"));
+        }
+        Ok(Layer4Listener::Tcp(tcp))
+    }
+
+    /// Parse a `udp <address> { ... }` layer-4 listener block (L4 P2).
+    fn parse_layer4_udp(
+        &mut self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<Layer4Listener, ConfigError> {
+        if !block_open {
+            return Err(self.err("udp requires a block: udp <address> { ... }"));
+        }
+        if words.len() != 2 {
+            return Err(self.err("udp requires exactly one listen address, e.g. udp :53"));
+        }
+        let listen = parse_listen_address(&words[1]).map_err(|m| self.err(m))?;
+        let mut upstreams: Vec<L4Upstream> = Vec::new();
+        let mut lb_policy: Option<LbPolicy> = None;
+        let mut idle_timeout: Option<Duration> = None;
+        let mut max_flows: Option<usize> = None;
+        let mut max_datagram_size: Option<usize> = None;
+        let mut recv_buffer: Option<usize> = None;
+        let mut send_buffer: Option<usize> = None;
+        loop {
+            match self.peek() {
+                Some(Token {
+                    kind: TokenKind::RBrace,
+                    ..
+                }) => {
+                    self.pos += 1;
+                    break;
+                }
+                None => return Err(self.err("unexpected end of file in udp block")),
+                _ => {}
+            }
+            let (line, nested) = self.parse_statement()?;
+            if line.is_empty() {
+                continue;
+            }
+            if nested {
+                return Err(self.err("unexpected '{' in udp block"));
+            }
+            let name = line[0].clone();
+            match name.as_str() {
+                "to" => {
+                    if line.len() < 2 {
+                        return Err(self.err("to requires at least one upstream"));
+                    }
+                    for target in &line[1..] {
+                        upstreams.push(parse_l4_upstream(target).map_err(|m| self.err(m))?);
+                    }
+                }
+                "lb_policy" => {
+                    if lb_policy.is_some() {
+                        return Err(self.err("duplicate lb_policy"));
+                    }
+                    lb_policy = Some(self.parse_lb_policy(&line)?);
+                }
+                "idle_timeout" => {
+                    if idle_timeout.is_some() {
+                        return Err(self.err("duplicate idle_timeout"));
+                    }
+                    idle_timeout = Some(parse_duration(&line).map_err(|m| self.err(m))?);
+                }
+                "max_flows" => {
+                    if max_flows.is_some() {
+                        return Err(self.err("duplicate max_flows"));
+                    }
+                    max_flows = Some(parse_count(&line, "max_flows").map_err(|m| self.err(m))?);
+                }
+                "max_datagram_size" => {
+                    if max_datagram_size.is_some() {
+                        return Err(self.err("duplicate max_datagram_size"));
+                    }
+                    if line.len() != 2 {
+                        return Err(self.err("max_datagram_size requires exactly one value"));
+                    }
+                    max_datagram_size = Some(parse_bytes(&line[1]).map_err(|m| self.err(m))?);
+                }
+                "recv_buffer" => {
+                    if recv_buffer.is_some() {
+                        return Err(self.err("duplicate recv_buffer"));
+                    }
+                    if line.len() != 2 {
+                        return Err(self.err("recv_buffer requires exactly one value"));
+                    }
+                    recv_buffer = Some(parse_bytes(&line[1]).map_err(|m| self.err(m))?);
+                }
+                "send_buffer" => {
+                    if send_buffer.is_some() {
+                        return Err(self.err("duplicate send_buffer"));
+                    }
+                    if line.len() != 2 {
+                        return Err(self.err("send_buffer requires exactly one value"));
+                    }
+                    send_buffer = Some(parse_bytes(&line[1]).map_err(|m| self.err(m))?);
+                }
+                other => return Err(self.err(format!("unknown udp directive '{other}'"))),
+            }
+        }
+        if upstreams.is_empty() {
+            return Err(self.err("udp requires at least one upstream (to <host>:<port> ...)"));
+        }
+        let udp = UdpProxyConfig {
+            listen,
+            upstreams,
+            lb_policy: lb_policy.unwrap_or(LbPolicy::RoundRobin),
+            idle_timeout: idle_timeout.unwrap_or(Duration::from_secs(30)),
+            max_flows: max_flows.unwrap_or(50_000),
+            max_datagram_size: max_datagram_size.unwrap_or(4096),
+            recv_buffer: recv_buffer.unwrap_or(0),
+            send_buffer: send_buffer.unwrap_or(0),
+        };
+        if udp.idle_timeout.is_zero() || udp.max_flows == 0 || udp.max_datagram_size == 0 {
+            return Err(self.err(
+                "udp idle_timeout, max_flows, and max_datagram_size must be greater than zero",
+            ));
+        }
+        Ok(Layer4Listener::Udp(udp))
+    }
+
+    /// Parse a `health_check { ... }` sub-block of a `tcp` listener (or bare
+    /// `health_check` for defaults).
+    fn parse_l4_health_check(
+        &mut self,
+        block_open: bool,
+    ) -> Result<TcpHealthCheckSpec, ConfigError> {
+        if !block_open {
+            return Ok(TcpHealthCheckSpec {
+                interval: Duration::from_secs(5),
+                timeout: Duration::from_secs(2),
+                consecutive_failures: 3,
+                consecutive_successes: 2,
+            });
+        }
+        let mut interval: Option<Duration> = None;
+        let mut timeout: Option<Duration> = None;
+        let mut failures: Option<usize> = None;
+        let mut successes: Option<usize> = None;
+        loop {
+            match self.peek() {
+                Some(Token {
+                    kind: TokenKind::RBrace,
+                    ..
+                }) => {
+                    self.pos += 1;
+                    break;
+                }
+                None => return Err(self.err("unexpected end of file in health_check block")),
+                _ => {}
+            }
+            let (line, nested) = self.parse_statement()?;
+            if line.is_empty() {
+                continue;
+            }
+            if nested {
+                return Err(self.err("unexpected '{' in health_check block"));
+            }
+            let name = line[0].clone();
+            match name.as_str() {
+                "interval" => {
+                    if interval.is_some() {
+                        return Err(self.err("duplicate interval"));
+                    }
+                    interval = Some(parse_duration(&line).map_err(|m| self.err(m))?);
+                }
+                "timeout" => {
+                    if timeout.is_some() {
+                        return Err(self.err("duplicate timeout"));
+                    }
+                    timeout = Some(parse_duration(&line).map_err(|m| self.err(m))?);
+                }
+                "consecutive_failures" => {
+                    if failures.is_some() {
+                        return Err(self.err("duplicate consecutive_failures"));
+                    }
+                    failures =
+                        Some(parse_count(&line, "consecutive_failures").map_err(|m| self.err(m))?);
+                }
+                "consecutive_successes" => {
+                    if successes.is_some() {
+                        return Err(self.err("duplicate consecutive_successes"));
+                    }
+                    successes =
+                        Some(parse_count(&line, "consecutive_successes").map_err(|m| self.err(m))?);
+                }
+                other => return Err(self.err(format!("unknown health_check option '{other}'"))),
+            }
+        }
+        let spec = TcpHealthCheckSpec {
+            interval: interval.unwrap_or(Duration::from_secs(5)),
+            timeout: timeout.unwrap_or(Duration::from_secs(2)),
+            consecutive_failures: failures.unwrap_or(3),
+            consecutive_successes: successes.unwrap_or(2),
+        };
+        if spec.interval.is_zero() || spec.timeout.is_zero() {
+            return Err(self.err("health_check interval and timeout must be greater than zero"));
+        }
+        Ok(spec)
+    }
+
     fn parse_upstream(&self, s: &str) -> Result<Upstream, ConfigError> {
         // Optional scheme prefix decides whether the upstream connection is TLS
         // (spec §5.4); a bare `host:port` stays plain HTTP.
@@ -966,12 +1464,22 @@ impl<'a> Parser<'a> {
             return Err(self.err("redir requires a target"));
         }
         let (target, code) = match words.len() {
-            2 => (words[1].clone(), REDIR_DEFAULT_CODE),
+            2 => (concat_tokens(&words[1..]), REDIR_DEFAULT_CODE),
             _ => {
                 let last = words.last().expect("len >= 3");
                 match parse_redirect_code(last) {
                     Some(code) => (concat_tokens(&words[1..words.len() - 1]), code),
-                    None => (concat_tokens(&words[1..]), REDIR_DEFAULT_CODE),
+                    // A trailing token that is neither a redirect code nor a
+                    // `{placeholder}` fragment is an error, never silently
+                    // spliced into the target (`redir /foo 200` → `/foo200`).
+                    None if last.starts_with('{') => {
+                        (concat_tokens(&words[1..]), REDIR_DEFAULT_CODE)
+                    }
+                    None => {
+                        return Err(self.err(format!(
+                            "invalid redirect code '{last}' (expected a 3xx number, 'permanent', or 'temporary')"
+                        )));
+                    }
                 }
             }
         };
@@ -1552,6 +2060,102 @@ fn normalize_host_name(host: &str) -> Result<String, String> {
     Ok(host.to_ascii_lowercase())
 }
 
+/// Parse a layer-4 listen address (L4_PROXY_PLAN): `:PORT` (IPv4 wildcard),
+/// `IP:PORT`, or a bracketed IPv6 `[::1]:PORT`. Listeners bind an IP literal,
+/// not a hostname (a hostname is resolved by the OS for bind, which is not
+/// portable; use a wildcard or a specific IP).
+fn parse_listen_address(s: &str) -> Result<ListenAddress, String> {
+    if let Some(port) = s.strip_prefix(':') {
+        let port = parse_port_str(port)?;
+        return Ok(ListenAddress::Socket(SocketAddr::from((
+            [0, 0, 0, 0],
+            port,
+        ))));
+    }
+    let (host, port) = split_host_port(s)?;
+    let ip: IpAddr = host.parse().map_err(|_| {
+        format!(
+            "listen address '{s}' must be an IP literal (e.g. :3306, 127.0.0.1:3306, [::1]:3306)"
+        )
+    })?;
+    Ok(ListenAddress::Socket(SocketAddr::new(ip, port)))
+}
+
+/// Parse a layer-4 upstream: `[v6]:port`, `ip:port`, or `hostname:port`. The
+/// hostname is kept verbatim for the layer-4 runtime to resolve (L4 plan).
+fn parse_l4_upstream(s: &str) -> Result<L4Upstream, String> {
+    let (host, port) = split_host_port(s)?;
+    if host.is_empty() {
+        return Err(format!("upstream '{s}' must be host:port"));
+    }
+    Ok(L4Upstream {
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// Split an endpoint into `(host, port)`, accepting a bracketed IPv6 literal
+/// (`[::1]:53` → `("::1", 53)`). Hostnames and bare IPs pass through.
+fn split_host_port(s: &str) -> Result<(&str, u16), String> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let Some(close) = rest.find(']') else {
+            return Err(format!("unclosed '[' in address '{s}'"));
+        };
+        let host = &rest[..close];
+        let port_part = rest[close + 1..]
+            .strip_prefix(':')
+            .ok_or_else(|| format!("address '{s}' is missing a port after ']'"))?;
+        let port = parse_port_str(port_part)?;
+        return Ok((host, port));
+    }
+    let (host, port_part) = s
+        .rsplit_once(':')
+        .ok_or_else(|| format!("address '{s}' must be host:port"))?;
+    if host.is_empty() {
+        return Err(format!("address '{s}' has an empty host"));
+    }
+    if host.contains(':') {
+        return Err(format!("IPv6 addresses must be bracketed: [{host}]:port"));
+    }
+    let port = parse_port_str(port_part)?;
+    Ok((host, port))
+}
+
+/// Parse a TCP/UDP port number (1..=65535).
+fn parse_port_str(s: &str) -> Result<u16, String> {
+    let port: u16 = s.parse().map_err(|_| format!("invalid port '{s}'"))?;
+    if port == 0 {
+        return Err("port must be in 1..=65535".to_string());
+    }
+    Ok(port)
+}
+
+/// Parse a byte size: a bare number of bytes, or a binary unit suffix
+/// (`KiB`/`MiB`/`GiB`, base 1024) or decimal (`kB`/`MB`/`GB`, base 1000).
+/// Overflow-checked; `0` is valid (meaning "OS default" where applicable).
+fn parse_bytes(s: &str) -> Result<usize, String> {
+    let (num, mult) = if let Some(v) = s.strip_suffix("KiB") {
+        (v, 1024usize)
+    } else if let Some(v) = s.strip_suffix("MiB") {
+        (v, 1024 * 1024)
+    } else if let Some(v) = s.strip_suffix("GiB") {
+        (v, 1024 * 1024 * 1024)
+    } else if let Some(v) = s.strip_suffix("kB") {
+        (v, 1000)
+    } else if let Some(v) = s.strip_suffix("MB") {
+        (v, 1000 * 1000)
+    } else if let Some(v) = s.strip_suffix("GB") {
+        (v, 1000 * 1000 * 1000)
+    } else {
+        (s, 1)
+    };
+    let n: usize = num
+        .parse()
+        .map_err(|_| format!("invalid byte size '{s}'"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("byte size '{s}' is too large"))
+}
+
 /// Parse a `redir` status code: a 3xx number or the `permanent`/`temporary`
 /// keywords (spec §5).
 fn parse_redirect_code(s: &str) -> Option<u16> {
@@ -1621,6 +2225,277 @@ mod tests {
             }
             other => panic!("expected redir, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn redir_rejects_invalid_code_instead_of_concatenating() {
+        // A trailing non-code token must error, not silently join the target
+        // (`redir /foo 200` used to become `/foo200` with 308).
+        for input in [
+            ":8080 {\n    redir /foo 200\n}\n",
+            ":8080 {\n    redir /foo 299\n}\n",
+            ":8080 {\n    redir /foo bar\n}\n",
+            ":8080 {\n    redir https://{host} 200\n}\n",
+        ] {
+            let message = parse("test", input).unwrap_err().to_string();
+            assert!(
+                message.contains("invalid redirect code"),
+                "expected an invalid-code error for {input:?}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn redir_placeholder_target_without_code_keeps_default() {
+        // A multi-token target ending in a `{placeholder}` fragment carries no
+        // code: the placeholder is part of the target, the default 308 applies.
+        let rf = parse("test", ":8080 {\n    redir https://{host}{uri}\n}\n").unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Redir { to, code } => {
+                assert_eq!(to, "https://{host}{uri}");
+                assert_eq!(*code, 308);
+            }
+            other => panic!("expected redir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embedded_env_placeholder_expands_inside_word() {
+        // The spec §5.12 example: `reverse_proxy https://{$BACKEND_HOST}:8443`
+        // must expand to a single upstream target, not a three-argument parse
+        // error (P1).
+        std::env::set_var("RADDY_TEST_EMBEDDED_UPSTREAM", "127.0.0.1");
+        let parsed = parse(
+            "test",
+            ":8080 {\n    reverse_proxy https://{$RADDY_TEST_EMBEDDED_UPSTREAM}:8443\n}\n",
+        );
+        std::env::remove_var("RADDY_TEST_EMBEDDED_UPSTREAM");
+        let rf = parsed.unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::ReverseProxy { to, .. } => {
+                assert_eq!(to.len(), 1);
+                assert_eq!(to[0].host, "127.0.0.1");
+                assert_eq!(to[0].port, 8443);
+                assert!(to[0].tls, "an https:// target must be marked TLS");
+            }
+            other => panic!("expected reverse_proxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adjacent_env_placeholders_merge_into_one_word() {
+        // Two adjacent `{$A}{$B}` placeholders (plus a trailing fragment) are
+        // one logical argument; each placeholder expands.
+        std::env::set_var("RADDY_TEST_A", "a");
+        std::env::set_var("RADDY_TEST_B", "b");
+        let parsed = parse(
+            "test",
+            ":8080 {\n    redir https://{$RADDY_TEST_A}{$RADDY_TEST_B}.example.com\n}\n",
+        );
+        std::env::remove_var("RADDY_TEST_A");
+        std::env::remove_var("RADDY_TEST_B");
+        let rf = parsed.unwrap();
+        match &rf.sites[0].directives[0] {
+            Directive::Redir { to, code } => {
+                assert_eq!(to, "https://ab.example.com");
+                assert_eq!(*code, 308);
+            }
+            other => panic!("expected redir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deep_block_nesting_is_rejected_not_a_crash() {
+        // SECURITY.md: an untrusted config must never panic or overflow the
+        // stack. Deeply nested `handle` blocks (no depth limit in the grammar)
+        // must be rejected by the guard, not exhaust the stack.
+        let depth = MAX_BLOCK_DEPTH + 20;
+        let mut config = String::from(":8080 {\n");
+        for _ in 0..depth {
+            config.push_str("    handle path / {\n");
+        }
+        for _ in 0..depth {
+            config.push_str("    }\n");
+        }
+        config.push_str("}\n");
+        let message = parse("test", &config).unwrap_err().to_string();
+        assert!(
+            message.contains("block nesting exceeds"),
+            "expected a nesting error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn parses_tcp_listener_block() {
+        let rf = parse(
+            "test",
+            "tcp :3306 {\n    to db-1.internal:3306 db-2.internal:3306\n    lb_policy ip_hash\n    connect_timeout 3s\n    idle_timeout 5m\n    max_connections 10000\n    health_check {\n        interval 10s\n        timeout 2s\n    }\n}\n",
+        )
+        .unwrap();
+        assert!(rf.sites.is_empty(), "a tcp block is not an HTTP site");
+        assert_eq!(rf.layer4.len(), 1);
+        let Layer4Listener::Tcp(tcp) = &rf.layer4[0] else {
+            panic!("expected a tcp listener")
+        };
+        assert_eq!(tcp.listen.port(), 3306);
+        assert!(tcp.listen.is_wildcard(), ":3306 binds all interfaces");
+        assert_eq!(tcp.upstreams.len(), 2);
+        assert_eq!(tcp.upstreams[0].host, "db-1.internal");
+        assert_eq!(tcp.upstreams[0].port, 3306);
+        assert_eq!(tcp.lb_policy, LbPolicy::IpHash);
+        assert_eq!(tcp.connect_timeout, Duration::from_secs(3));
+        assert_eq!(tcp.idle_timeout, Duration::from_secs(300));
+        assert_eq!(tcp.max_connections, 10_000);
+        let hc = tcp.health_check.expect("health_check parsed");
+        assert_eq!(hc.interval, Duration::from_secs(10));
+        assert_eq!(hc.timeout, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn parses_ipv6_tcp_listener_and_upstream() {
+        // L4 addresses accept bracketed IPv6 (the HTTP site parser rejects it).
+        let rf = parse("test", "tcp [::1]:8080 {\n    to [::1]:9090\n}\n").unwrap();
+        let Layer4Listener::Tcp(tcp) = &rf.layer4[0] else {
+            panic!("expected a tcp listener")
+        };
+        assert_eq!(tcp.listen.port(), 8080);
+        assert!(!tcp.listen.is_wildcard());
+        assert_eq!(tcp.upstreams[0].host, "::1");
+        assert_eq!(tcp.upstreams[0].port, 9090);
+    }
+
+    #[test]
+    fn tcp_requires_upstream_and_rejects_unknown() {
+        let message = parse("test", "tcp :3306 {\n}\n").unwrap_err().to_string();
+        assert!(message.contains("at least one upstream"), "got: {message}");
+        let message = parse("test", "tcp :3306 {\n    bogus 1\n    to 127.0.0.1:1\n}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("unknown tcp directive"), "got: {message}");
+    }
+
+    #[test]
+    fn parses_udp_listener_block() {
+        // A UDP listener parses and carries its bounds.
+        let rf = parse(
+            "test",
+            "udp :53 {\n    to 1.1.1.1:53 8.8.8.8:53\n    lb_policy ip_hash\n    idle_timeout 30s\n    max_flows 50000\n    max_datagram_size 4096\n    recv_buffer 4MiB\n    send_buffer 2MiB\n}\n",
+        )
+        .unwrap();
+        let Layer4Listener::Udp(udp) = &rf.layer4[0] else {
+            panic!("expected a udp listener");
+        };
+        assert_eq!(udp.listen.port(), 53);
+        assert_eq!(udp.upstreams.len(), 2);
+        assert_eq!(udp.lb_policy, LbPolicy::IpHash);
+        assert_eq!(udp.idle_timeout, Duration::from_secs(30));
+        assert_eq!(udp.max_flows, 50_000);
+        assert_eq!(udp.max_datagram_size, 4096);
+        assert_eq!(udp.recv_buffer, 4 * 1024 * 1024);
+        assert_eq!(udp.send_buffer, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn udp_block_rejects_bad_config() {
+        // No upstream.
+        let message = parse("test", "udp :53 {\n}\n").unwrap_err().to_string();
+        assert!(message.contains("at least one upstream"), "got: {message}");
+        // Zero idle timeout.
+        let message = parse(
+            "test",
+            "udp :53 {\n    to 1.1.1.1:53\n    idle_timeout 0s\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("greater than zero"), "got: {message}");
+        // Unknown directive.
+        let message = parse("test", "udp :53 {\n    to 1.1.1.1:53\n    bogus 1\n}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("unknown udp directive"), "got: {message}");
+    }
+
+    #[test]
+    fn tcp_zero_timeout_is_rejected() {
+        let message = parse(
+            "test",
+            "tcp :3306 {\n    to 127.0.0.1:1\n    idle_timeout 0s\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("greater than zero"), "got: {message}");
+    }
+
+    #[test]
+    fn parses_sni_routing_block() {
+        let rf = parse(
+            "test",
+            "tcp 0.0.0.0:443 {\n    sni Api.Example.COM 10.0.0.1:9001\n    sni web.example.com 10.0.0.1:9002\n    fallback 10.0.0.1:9003\n}\n",
+        )
+        .unwrap();
+        let Layer4Listener::Tcp(tcp) = &rf.layer4[0] else {
+            panic!("expected a tcp listener")
+        };
+        assert!(tcp.upstreams.is_empty(), "sni mode has no `to`");
+        assert_eq!(tcp.sni_routes.len(), 2);
+        assert_eq!(
+            tcp.sni_routes[0].name, "api.example.com",
+            "SNI names are lowercased"
+        );
+        assert_eq!(tcp.sni_routes[0].upstream.port, 9001);
+        let fb = tcp.sni_fallback.as_ref().expect("fallback");
+        assert_eq!(fb.host, "10.0.0.1");
+        assert_eq!(fb.port, 9003);
+    }
+
+    #[test]
+    fn sni_routing_rejects_misconfiguration() {
+        // `to` and `sni` are mutually exclusive.
+        let message = parse(
+            "test",
+            "tcp :443 {\n    to 127.0.0.1:1\n    sni api.example.com 10.0.0.1:9001\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("cannot be combined with `to`"),
+            "got: {message}"
+        );
+        // Duplicate SNI names.
+        let message = parse(
+            "test",
+            "tcp :443 {\n    sni api.example.com 10.0.0.1:9001\n    sni api.example.com 10.0.0.2:9002\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("duplicate sni route"), "got: {message}");
+        // `fallback` requires sni routing.
+        let message = parse("test", "tcp :443 {\n    fallback 10.0.0.1:9003\n}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("fallback requires sni routing"),
+            "got: {message}"
+        );
+        // Wildcard SNI is rejected (P1: exact match only).
+        let message = parse(
+            "test",
+            "tcp :443 {\n    sni *.example.com 10.0.0.1:9001\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("invalid sni name"), "got: {message}");
+        // `health_check` does not apply to SNI mode.
+        let message = parse(
+            "test",
+            "tcp :443 {\n    sni api.example.com 10.0.0.1:9001\n    health_check {\n        interval 10s\n    }\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("does not support health_check"),
+            "got: {message}"
+        );
     }
 
     #[test]

@@ -98,7 +98,7 @@ api.example.com {
 
 **单机 vs 集群限流**：限流为**单机**（每实例独立计数）；集群级（跨实例共享计数）需外挂 Redis，属后续可选特性，不在本文档文法上预留参数。
 
-**`file_server` 运行时语义**：`file_server` 从 `root` 目录提供**完整请求路径**（含 `handle` 前缀）对应的文件——`handle /static/* { root /var/www; file_server }` 将 `/static/foo` 映射到 `/var/www/static/foo`。支持目录 `index.html`；拒绝 `..` 目录穿越（404）；仅允许 GET/HEAD。`encode` 对 `file_server` 响应同样生效。
+**`file_server` 运行时语义**：`file_server` 从 `root` 目录提供**完整请求路径**（含 `handle` 前缀）对应的文件——`handle /static/* { root /var/www; file_server }` 将 `/static/foo` 映射到 `/var/www/static/foo`。支持目录 `index.html`；拒绝 `..` 目录穿越（404）；仅允许 GET/HEAD。**永不服务隐藏文件**：任何以 `.` 开头的路径段（`.env`、`.git/`、`.htaccess`）一律 404，唯一例外是 `.well-known` 目录（RFC 8615 的 well-known URI 是公开发现端点）。`encode` 对 `file_server` 响应同样生效；小于 64 字节的响应体不做压缩（编码框架会使其更大）。
 
 ### 5.1 `lb_policy` / `health_check`（`reverse_proxy` 块内子指令）
 
@@ -417,6 +417,7 @@ api.example.com {
 
 - **站点选择按监听器收敛**：请求到达某监听器后，仅在该监听器的候选站点集合内匹配——TLS 监听器按 SNI、纯 HTTP 监听器按规范化 Host（去端口、去尾点、ASCII 小写）。候选集合 = 地址落在该端口的具名站点 + 该端口的 `:port` 兜底块。
 - **具名站点默认端口 443**：`api.example.com`（不带端口）默认绑 443（TLS）。自动 HTTPS 生效：具名站点通过 ACME 签发证书——默认 HTTP-01，配置 `dns_challenge` 后走 DNS-01（见 第 5.3 节）。TLS-ALPN-01（`tls_alpn_challenge`）已推迟（见 第 5.8 节）。`tls` 来源为静态或 internal 证书的站点（见 第 5.7 节）被排除在 ACME 之外。SNI 按域名返回对应证书；端口 443 监听器使用 SNI 动态证书（`raddy_certs/` 目录缓存，重启复用）。证书在到期前 30 天内自动续期。
+- **隐式 HTTP-01 监听器（:80）**：HTTP-01 挑战在明文 HTTP 监听器上应答，因此当配置含具名站点但没有任何站点绑定端口 80 时，raddy 会隐式绑定一个仅服务 ACME 挑战的明文 `:80` 监听器（其余请求返回 404）。没有它，ACME 服务器永远无法触达挑战，签发会一直挂起。配置 `dns_challenge`（DNS-01）时跳过该隐式监听器——选择 DNS 部署正是因为端口 80 不可用。显式配置 `:80` catch-all 已能应答挑战，因此不会重复绑定。
 - **具名站点显式端口**：`api.example.com:8081 { ... }` 将具名站点绑定到非标端口（用于本地多端口部署与测试）；省略端口时默认 443。IPv6 字面量地址（`[::1]:8080`）暂不支持。带 `tls` 指令的具名站点（见 第 5.7 节）即使端口不是 443 也以 TLS 提供。
 - **选不中兜底**：Host 缺失或畸形 → `400 Bad Request`；Host 合法但不匹配任何站点、且无兜底块 → `404 Not Found`。不提供可配置错误页。
 - **非标端口**：`:8443`。
@@ -455,7 +456,70 @@ api.example.com {
 
 > 推迟与远期指令（`tls_alpn_challenge` 等）不在示例中出现，避免读者照抄无法解析的配置。
 
-## 8. 待办
+## 8. 四层监听器（TCP、SNI 透传与 UDP）
+
+**状态：可用（TCP/SNI/UDP），属于 `v0.3.0` release candidate。** UDP 不支持
+零停机升级，这是刻意保留的限制；请使用普通重启。
+
+`tcp` 块是**顶级监听器**，与 HTTP 站点块平级。它将裸 TCP 连接（不做 HTTP
+解析、不终止 TLS）转发到一个或多个上游：
+
+```caddyfile
+tcp :3306 {
+    to db-1.internal:3306 db-2.internal:3306
+    lb_policy round_robin          # round_robin | random | ip_hash
+    connect_timeout 3s
+    idle_timeout 5m
+    max_connections 10000
+    health_check {
+        interval 10s
+        timeout 2s
+        consecutive_failures 3
+        consecutive_successes 2
+    }
+}
+```
+
+- **监听地址**：IP 字面量，或 `:port` 表示所有接口；IPv6 需加方括号
+  （`tcp [::1]:8080`、`udp [::1]:53`）。TCP 与 UDP 可共享同一地址端口，但两个 TCP 监听器
+  若绑定重叠（通配符与任意具体绑定重叠）会被拒绝，与 HTTP 站点端口冲突的
+  裸 TCP 监听器同样被拒绝。
+- **`to <host>:<port>...`**：至少一个上游。主机名在启动时解析，并按周期
+  重新解析（默认 60s；新的地址集合仅对*新*连接生效）；瞬时刷新失败会保留
+  最后可用地址（`raddy_l4_tcp_dns_refresh_failures_total` 计数）。启动时无法
+  解析的上游是错误。
+- **SNI 路由**（`sni <name> <host:port>` + 可选 `fallback <host:port>`，L4 P1）：
+  含 `sni` 行的 `tcp` 监听器按 ClientHello 的精确 SNI 路由 TLS 连接——不终止
+  TLS（在有界前缀内检查 ClientHello 并原样转发）。每个 `sni` 将精确（小写）
+  名称映射到其专属上游；未知/缺失/畸形/超大的 SNI 在设置 `fallback` 时走
+  fallback，否则关闭连接。`sni` 与 `to` 互斥，v1 不支持通配符名称，且
+  `health_check` 不适用于 SNI 模式。
+- **`lb_policy`** 复用 HTTP 策略：`round_robin`（默认）、`random`、`ip_hash`
+  （源 IP 粘滞——同一客户端固定到同一上游）。
+- **`connect_timeout`** 限制单次上游连接的时长（默认 `5s`）；**`idle_timeout`**
+  是*真正的*空闲超时，任一方有流量即重置（默认 `5m`，长存活活跃连接不会
+  超时）；**`max_connections`** 限制并发连接数（默认 `10000`，被拒绝的连接
+  计入指标）。
+- **`health_check { ... }`** 运行主动 TCP 连接探活，默认值与 HTTP 相同
+  （`5s` 间隔、`2s` 超时、连续 `3` 次失败 / `2` 次成功）。不健康的上游会被
+  跳过；全部不健康时连接被拒绝。
+- 每条关闭的连接输出一条类型化访问日志行（JSON，与 HTTP 访问日志相互独立）
+  及 Prometheus 指标（`raddy_l4_tcp_*`，按监听器打标签）。
+- **UDP 代理**（`udp <address> { to ... lb_policy idle_timeout max_flows
+  max_datagram_size recv_buffer send_buffer }`，L4 P2）：代理数据报。每个客户端
+  （地址 + 端口）映射为一个 **flow**，各自持有与所选上游相连的 socket（本地
+  临时端口负责响应多路复用）。选择每个 flow 只发生一次——`ip_hash` 按客户端
+  *IP* 钉住，flow 身份仍含端口。上限：`max_flows` 限制表大小（最旧优先驱逐）、
+  `idle_timeout` 驱逐空闲 flow、`max_datagram_size` 丢弃并计数超大报文、
+  `recv_buffer`/`send_buffer` 设置 socket 缓冲（0 = 系统默认）。UDP 与 TCP 可
+  共享同一地址端口。指标：`raddy_l4_udp_*`。**零停机升级不适用于 UDP**：监听
+  socket 在 fd 移交机制之外绑定，`raddy upgrade` 无法服务 UDP 配置——请用普通
+  重启（flow 会重置）。
+- **重载语义**：SIGHUP 重载会把新的上游集合、策略、限制与超时应用到*新*连接；
+  已有连接保持其选定的上游。修改监听器的绑定地址属于**拓扑变更**，会被拒绝
+  并提示改用重启或 `raddy upgrade`。
+
+## 9. 待办
 
 - 任何本规范未覆盖的语法细节，实现时**先补文档再动手**。
 - Cloudflare 之外的 DNS-01 服务商**推迟**——每个服务商开一个 GitHub issue（欢迎社区贡献）。

@@ -21,7 +21,7 @@
 //! retention, and the `raddy check` exit codes.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -297,6 +297,221 @@ impl Drop for UpgradeEchoUpstream {
     }
 }
 
+/// A raw TCP echo upstream (no HTTP framing): returns each received message
+/// prefixed with `echo:`, and counts accepted connections. Used to verify the
+/// layer-4 raw-TCP proxy (L4_PROXY_PLAN P0).
+struct TcpEchoUpstream {
+    port: u16,
+    hits: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TcpEchoUpstream {
+    fn spawn() -> (u16, TcpEchoUpstream) {
+        let (port, listener) = bind_listener();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits_thread = hits.clone();
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                hits_thread.fetch_add(1, Ordering::Relaxed);
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream
+                                    .write_all(b"echo:")
+                                    .and_then(|()| stream.write_all(&buf[..n]))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (
+            port,
+            TcpEchoUpstream {
+                port,
+                hits,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+
+    fn hit_count(&self) -> usize {
+        self.hits.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TcpEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A raw TCP upstream that waits for the client half-close before replying.
+/// This verifies that the proxy propagates EOF in one direction while draining
+/// a response in the other direction.
+struct TcpHalfCloseUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TcpHalfCloseUpstream {
+    fn spawn() -> (u16, TcpHalfCloseUpstream) {
+        let (port, listener) = bind_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = stream.write_all(b"after-half-close");
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        (
+            port,
+            TcpHalfCloseUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for TcpHalfCloseUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A raw UDP echo upstream: returns each received datagram prefixed with its
+/// label (`<label>:<data>`), so tests can tell which upstream served a client.
+struct UdpEchoUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl UdpEchoUpstream {
+    fn spawn(label: &str) -> (u16, UdpEchoUpstream) {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let label = label.to_string();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                match sock.recv_from(&mut buf) {
+                    Ok((n, src)) => {
+                        let mut reply = label.as_bytes().to_vec();
+                        reply.push(b':');
+                        reply.extend_from_slice(&buf[..n]);
+                        let _ = sock.send_to(&reply, src);
+                    }
+                    Err(_) => continue, // read timeout; re-check stop
+                }
+            }
+        });
+        (
+            port,
+            UdpEchoUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for UdpEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Wake the blocking recv so the thread can check stop and exit.
+        let _ = std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.send_to(b"x", ("127.0.0.1", self.port)));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Send a datagram through a `udp` listener and return the reply (the upstream
+/// echoes `<label>:<data>`).
+fn udp_roundtrip(port: u16, msg: &str) -> Option<String> {
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+    client.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    client.send_to(msg.as_bytes(), ("127.0.0.1", port)).ok()?;
+    let mut buf = [0u8; 256];
+    let (n, _) = client.recv_from(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// Send a datagram through an IPv6 UDP listener and return the reply.
+fn udp_roundtrip_ipv6(port: u16, msg: &str) -> Option<String> {
+    let client = UdpSocket::bind("[::1]:0").ok()?;
+    client.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let target = SocketAddr::new("::1".parse().ok()?, port);
+    client.send_to(msg.as_bytes(), target).ok()?;
+    let mut buf = [0u8; 256];
+    let (n, _) = client.recv_from(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// Read a numeric Prometheus metric from a test server.
+fn metric_value(port: u16, name: &str) -> Option<u64> {
+    let response = try_request(port, None, "/metrics")?;
+    response
+        .body
+        .lines()
+        .find(|line| line.starts_with(name))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
 /// An upstream that answers `path=<request path>`, so tests can assert what
 /// path a `handle_path` strip or `rewrite` produced (spec §5.9).
 struct PathEchoUpstream {
@@ -507,6 +722,11 @@ enum ReadyProbe {
     Plain,
     Tls,
     Tcp,
+    /// A UDP listener: the child is alive and a datagram send succeeds
+    /// (UDP is connectionless; the actual relay is polled by the test).
+    Udp,
+    /// An IPv6 UDP listener, probed through the IPv6 loopback address.
+    UdpV6,
 }
 
 /// A running `raddy run` subprocess plus the config file it reads.
@@ -547,6 +767,22 @@ impl RadRaddy {
         Self::spawn_with_probe(config_for, &[], ReadyProbe::Tcp)
     }
 
+    /// Spawn a server for a `udp` listener (L4 P2); readiness is a UDP send
+    /// succeeding while the child stays alive.
+    fn spawn_udp(config_for: impl Fn(u16) -> String) -> RadRaddy {
+        Self::spawn_with_probe(config_for, &[], ReadyProbe::Udp)
+    }
+
+    /// Like [`spawn_udp`], with extra CLI arguments.
+    fn spawn_udp_with_args(config_for: impl Fn(u16) -> String, extra: &[String]) -> RadRaddy {
+        Self::spawn_with_probe(config_for, extra, ReadyProbe::Udp)
+    }
+
+    /// Spawn a server for a UDP listener bound to the IPv6 loopback address.
+    fn spawn_udp_ipv6(config_for: impl Fn(u16) -> String) -> RadRaddy {
+        Self::spawn_with_probe(config_for, &[], ReadyProbe::UdpV6)
+    }
+
     fn spawn_with_env_probe(
         config_for: impl Fn(u16) -> String,
         env: &[(&str, &str)],
@@ -577,6 +813,8 @@ impl RadRaddy {
                 ReadyProbe::Plain => raddy.wait_for_ready(),
                 ReadyProbe::Tls => raddy.wait_for_ready_tls(),
                 ReadyProbe::Tcp => raddy.wait_for_ready_tcp(),
+                ReadyProbe::Udp => raddy.wait_for_ready_udp(),
+                ReadyProbe::UdpV6 => raddy.wait_for_ready_udp_v6(),
             };
             if ready {
                 return raddy;
@@ -615,6 +853,8 @@ impl RadRaddy {
                 ReadyProbe::Plain => raddy.wait_for_ready(),
                 ReadyProbe::Tls => raddy.wait_for_ready_tls(),
                 ReadyProbe::Tcp => raddy.wait_for_ready_tcp(),
+                ReadyProbe::Udp => raddy.wait_for_ready_udp(),
+                ReadyProbe::UdpV6 => raddy.wait_for_ready_udp_v6(),
             };
             if ready {
                 return raddy;
@@ -679,6 +919,44 @@ impl RadRaddy {
             }
             if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
                 return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Poll until the child is alive and a datagram send to the UDP listener
+    /// succeeds. UDP is connectionless (a send succeeds regardless), so this
+    /// mainly catches a child that failed to bind (e.g. a port conflict) and
+    /// exits; the test polls the actual relay to confirm readiness.
+    fn wait_for_ready_udp(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.child.try_wait().expect("try_wait failed").is_some() {
+                return false;
+            }
+            if let Ok(sock) = UdpSocket::bind("127.0.0.1:0") {
+                if sock.send_to(b"ready", ("127.0.0.1", self.port)).is_ok() {
+                    return true;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Poll until an IPv6 UDP listener is alive and accepts a datagram send.
+    fn wait_for_ready_udp_v6(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let target = SocketAddr::new("::1".parse().expect("IPv6 loopback"), self.port);
+        while Instant::now() < deadline {
+            if self.child.try_wait().expect("try_wait failed").is_some() {
+                return false;
+            }
+            if let Ok(sock) = UdpSocket::bind("[::1]:0") {
+                if sock.send_to(b"ready", target).is_ok() {
+                    return true;
+                }
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -1813,11 +2091,10 @@ fn file_server_serves_static_files() {
 fn file_server_compresses_on_accept_encoding() {
     let dir = std::env::temp_dir().join(format!("raddy_fs_b_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("hello.txt"),
-        "hello compressible compressible compressible",
-    )
-    .unwrap();
+    // A body comfortably above the compress-minimum (64 B): gzip must apply.
+    // (A tiny body is skipped — see the tiny-body test below.)
+    let content = "hello compressible ".repeat(8);
+    std::fs::write(dir.join("hello.txt"), &content).unwrap();
     let dir_cfg = dir.clone();
     let raddy = RadRaddy::spawn(move |port| {
         format!(
@@ -1835,7 +2112,7 @@ fn file_server_compresses_on_accept_encoding() {
     );
     let plain = send_request(port, Some("localhost"), "/hello.txt");
     assert_eq!(plain.status, 200);
-    assert_eq!(plain.body, "hello compressible compressible compressible");
+    assert_eq!(plain.body, content);
 
     let gz = send_request_hdr(
         port,
@@ -1848,6 +2125,38 @@ fn file_server_compresses_on_accept_encoding() {
         gz.body, plain.body,
         "gzip response body must differ from the plain body"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_server_skips_compressing_tiny_bodies() {
+    // A body under the 64 B compress minimum must be served uncompressed: the
+    // codec framing would make it larger than the payload.
+    let dir = std::env::temp_dir().join(format!("raddy_fs_tiny_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tiny.txt"), "tiny").unwrap();
+    let dir_cfg = dir.clone();
+    let raddy = RadRaddy::spawn(move |port| {
+        format!(
+            ":{port} {{\n    root {}\n    encode gzip\n    file_server\n}}\n",
+            dir_cfg.display()
+        )
+    });
+    let port = raddy.port();
+    wait_until(
+        || try_request(port, Some("localhost"), "/tiny.txt").is_some_and(|r| r.status == 200),
+        "tiny file response",
+    );
+    let resp = send_request_hdr(
+        port,
+        Some("localhost"),
+        "/tiny.txt",
+        &["Accept-Encoding: gzip"],
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.header("content-encoding"), None);
+    assert_eq!(resp.body, "tiny");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3326,4 +3635,802 @@ fn import_rejects_unknown_format() {
         .status()
         .unwrap();
     assert!(!status.success(), "an unknown format is a CLI error");
+}
+
+// ---------------------------------------------------------------------------
+// Layer-4 raw TCP proxy (L4_PROXY_PLAN P0)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn raw_tcp_proxy_relays_bidirectionally() {
+    // A `tcp` listener proxies a raw byte stream to the upstream and back.
+    let (echo_port, _echo) = TcpEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!("tcp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n}}\n")
+    });
+    let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"ping-l4").unwrap();
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"echo:ping-l4");
+}
+
+#[test]
+fn raw_tcp_proxy_round_robins_across_upstreams() {
+    let (a_port, a) = TcpEchoUpstream::spawn();
+    let (b_port, b) = TcpEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!("tcp 127.0.0.1:{port} {{\n    to 127.0.0.1:{a_port} 127.0.0.1:{b_port}\n}}\n")
+    });
+    // Alternate connections must reach both upstreams (round-robin). The
+    // readiness probe already made one connection, so a few more cover both.
+    for _ in 0..4 {
+        let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"rr").unwrap();
+        let mut buf = [0u8; 8];
+        let n = stream.read(&mut buf).unwrap();
+        assert!(
+            &buf[..n] == b"echo:rr",
+            "unexpected echo: {}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+    }
+    assert!(
+        a.hit_count() >= 1 && b.hit_count() >= 1,
+        "round-robin must reach both upstreams: a={}, b={}",
+        a.hit_count(),
+        b.hit_count()
+    );
+}
+
+#[test]
+fn raw_tcp_proxy_idle_timeout_closes_connection() {
+    // A 1s idle timeout must close a connection with no traffic.
+    let (echo_port, _echo) = TcpEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!("tcp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n    idle_timeout 1s\n}}\n")
+    });
+    let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // No traffic: the idle watchdog should close the connection within ~1s.
+    let mut buf = [0u8; 8];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "an idle connection must be closed (EOF), got {n} bytes"
+    );
+}
+
+#[test]
+fn raw_tcp_proxy_enforces_max_connections() {
+    // The second connection must be rejected while the first connection keeps
+    // its admission permit by remaining open and idle.
+    let (echo_port, echo) = TcpEchoUpstream::spawn();
+    let l4_port = free_port();
+    let metrics_port = free_port();
+    let extra = [format!("--metrics-addr=127.0.0.1:{metrics_port}")];
+    let _raddy = RadRaddy::spawn_with_probe(
+        |http_port| {
+            format!(
+                ":{http_port} {{\n    respond 200 ready\n}}\n\
+                 tcp 127.0.0.1:{l4_port} {{\n    to 127.0.0.1:{echo_port}\n    max_connections 1\n}}\n"
+            )
+        },
+        &extra,
+        ReadyProbe::Plain,
+    );
+    let first = TcpStream::connect(("127.0.0.1", l4_port)).unwrap();
+    wait_until(
+        || echo.hit_count() >= 1,
+        "the first admitted connection to reach the upstream",
+    );
+
+    let mut second = TcpStream::connect(("127.0.0.1", l4_port)).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let _ = second.read(&mut buf);
+    wait_until(
+        || metric_value(metrics_port, "raddy_l4_tcp_rejected_total").unwrap_or(0) >= 1,
+        "the TCP admission rejection metric",
+    );
+    drop(first);
+}
+
+#[test]
+fn raw_tcp_proxy_propagates_half_close_and_drains_response() {
+    // The upstream replies only after seeing EOF from the client. The proxy
+    // must forward that half-close and still relay the upstream response.
+    let (upstream_port, _upstream) = TcpHalfCloseUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!("tcp 127.0.0.1:{port} {{\n    to 127.0.0.1:{upstream_port}\n}}\n")
+    });
+    let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"before-half-close").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"after-half-close");
+}
+
+#[test]
+fn raw_tcp_proxy_closes_on_failed_upstream_connect() {
+    // A reserved local port has no listener. The client connection must be
+    // closed promptly, and the failed connect must be observable in metrics.
+    let l4_port = free_port();
+    let dead_port = free_port();
+    let metrics_port = free_port();
+    let extra = [format!("--metrics-addr=127.0.0.1:{metrics_port}")];
+    let _raddy = RadRaddy::spawn_with_probe(
+        |http_port| {
+            format!(
+                ":{http_port} {{\n    respond 200 ready\n}}\n\
+                 tcp 127.0.0.1:{l4_port} {{\n    to 127.0.0.1:{dead_port}\n    connect_timeout 200ms\n}}\n"
+            )
+        },
+        &extra,
+        ReadyProbe::Plain,
+    );
+    let started = Instant::now();
+    let mut stream = TcpStream::connect(("127.0.0.1", l4_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    wait_until(
+        || metric_value(metrics_port, "raddy_l4_tcp_connect_failures_total").unwrap_or(0) >= 1,
+        "the failed upstream-connect metric",
+    );
+    let mut buf = [0u8; 16];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "a failed upstream connect must close the client stream"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "failed upstream connect exceeded its bound"
+    );
+}
+
+#[test]
+fn raw_tcp_proxy_health_check_routes_around_dead_upstream() {
+    // A `tcp` listener with an active health check must route new connections
+    // only to healthy upstreams once the dead one is marked unhealthy.
+    let (a_port, a) = TcpEchoUpstream::spawn();
+    let dead_port = free_port(); // nothing listening
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!(
+            "tcp 127.0.0.1:{port} {{\n    to 127.0.0.1:{a_port} 127.0.0.1:{dead_port}\n    health_check {{\n        interval 200ms\n        timeout 200ms\n        consecutive_failures 2\n        consecutive_successes 1\n    }}\n}}\n"
+        )
+    });
+    // Give the health check time to mark the dead upstream unhealthy.
+    thread::sleep(Duration::from_secs(2));
+    for _ in 0..5 {
+        let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"hc").unwrap();
+        let mut buf = [0u8; 8];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        assert_eq!(
+            &buf[..n],
+            b"echo:hc",
+            "the dead upstream must not receive traffic (got {n} bytes)"
+        );
+    }
+    assert!(
+        a.hit_count() >= 1,
+        "the healthy upstream must have served traffic"
+    );
+}
+
+/// Send `msg` over a fresh connection to a `tcp` listener and return the echo.
+fn tcp_echo(port: u16, msg: &str) -> String {
+    tcp_echo_opt(port, msg).expect("tcp echo request failed")
+}
+
+/// Like [`tcp_echo`], but `None` on any failure (used for polling during a
+/// reload).
+fn tcp_echo_opt(port: u16, msg: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.write_all(msg.as_bytes()).ok()?;
+    let mut buf = [0u8; 128];
+    let expected = 5 + msg.len();
+    let mut total = 0;
+    while total < expected {
+        let n = stream.read(&mut buf[total..]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        total += n;
+    }
+    Some(String::from_utf8_lossy(&buf[..total]).into_owned())
+}
+
+#[test]
+fn raw_tcp_proxy_reload_updates_upstream_set_for_new_connections() {
+    // A SIGHUP reload that changes the upstream set must apply to *new*
+    // connections (L4 plan §reload semantics): traffic flows to the new
+    // upstream, while the listener itself is untouched.
+    let (a_port, a) = TcpEchoUpstream::spawn();
+    let (b_port, b) = TcpEchoUpstream::spawn();
+    let mut raddy = RadRaddy::spawn_tcp(|port| {
+        format!("tcp 127.0.0.1:{port} {{\n    to 127.0.0.1:{a_port}\n}}\n")
+    });
+    assert_eq!(tcp_echo(raddy.port(), "pre"), "echo:pre");
+
+    raddy.reload(&format!(
+        "tcp 127.0.0.1:{} {{\n    to 127.0.0.1:{b_port}\n}}\n",
+        raddy.port()
+    ));
+    // Poll with a connection each round (NOT short-circuited by b's hit count,
+    // which only rises once the reload applies): keep connecting until the
+    // reloaded upstream serves one.
+    wait_until(
+        || tcp_echo_opt(raddy.port(), "post").as_deref() == Some("echo:post") && b.hit_count() >= 1,
+        "the reloaded upstream to serve new connections",
+    );
+    assert!(
+        a.hit_count() >= 1,
+        "the original upstream served the pre-reload connection"
+    );
+}
+
+#[test]
+fn raw_tcp_proxy_reload_rejects_listener_topology_change() {
+    // A reload that changes the layer-4 listener *topology* (the bound
+    // address) is rejected: listeners are fixed at startup (ADR-010), so the
+    // original listener keeps serving.
+    let (a_port, _a) = TcpEchoUpstream::spawn();
+    let mut raddy = RadRaddy::spawn_tcp(|port| {
+        format!("tcp 127.0.0.1:{port} {{\n    to 127.0.0.1:{a_port}\n}}\n")
+    });
+    let other = free_port();
+    raddy.reload(&format!(
+        "tcp 127.0.0.1:{other} {{\n    to 127.0.0.1:{a_port}\n}}\n"
+    ));
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        tcp_echo(raddy.port(), "still"),
+        "echo:still",
+        "the original listener must keep serving after a rejected reload"
+    );
+}
+
+/// Build a minimal TLS ClientHello carrying the given SNI (the L4 P1
+/// inspector must route on it without terminating TLS).
+fn build_test_client_hello(name: &str) -> Vec<u8> {
+    let mut hello = Vec::new();
+    hello.extend_from_slice(&[0x03, 0x03]); // client_version TLS 1.2
+    hello.extend_from_slice(&[0u8; 32]); // random
+    hello.push(0); // empty session_id
+    hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // one cipher suite
+    hello.push(1);
+    hello.push(0); // null compression
+    let name_bytes = name.as_bytes();
+    let mut list = vec![0u8]; // host_name type
+    list.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+    list.extend_from_slice(name_bytes);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(list.len() as u16).to_be_bytes());
+    payload.extend_from_slice(&list);
+    let mut exts = Vec::new();
+    exts.extend_from_slice(&[0x00, 0x00]); // server_name
+    exts.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    exts.extend_from_slice(&payload);
+    hello.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    hello.extend_from_slice(&exts);
+    let mut msg = vec![0x01]; // ClientHello
+    let len = hello.len();
+    msg.extend_from_slice(&[
+        ((len >> 16) & 0xff) as u8,
+        ((len >> 8) & 0xff) as u8,
+        (len & 0xff) as u8,
+    ]);
+    msg.extend_from_slice(&hello);
+    let mut rec = vec![0x16, 0x03, 0x01]; // handshake record
+    rec.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&msg);
+    rec
+}
+
+/// Send a ClientHello with `name` through the listener and require the relay
+/// to forward it (the raw upstream echoes it back).
+fn send_sni(port: u16, name: &str) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(&build_test_client_hello(name)).unwrap();
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    assert!(
+        n > 0,
+        "the relay must forward the ClientHello to the upstream for {name}"
+    );
+}
+
+#[test]
+fn raw_tcp_proxy_sni_routes_by_hostname() {
+    // A `sni`-routing listener forwards a ClientHello to the upstream matching
+    // its exact SNI (L4 P1), without terminating TLS.
+    let (a_port, a) = TcpEchoUpstream::spawn();
+    let (b_port, b) = TcpEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!(
+            "tcp 127.0.0.1:{port} {{\n    sni a.test 127.0.0.1:{a_port}\n    sni b.test 127.0.0.1:{b_port}\n}}\n"
+        )
+    });
+    send_sni(raddy.port(), "a.test");
+    send_sni(raddy.port(), "b.test");
+    assert!(a.hit_count() >= 1, "SNI a.test must route to A");
+    assert!(b.hit_count() >= 1, "SNI b.test must route to B");
+}
+
+#[test]
+fn raw_tcp_proxy_sni_fallback_serves_unmatched() {
+    let (a_port, a) = TcpEchoUpstream::spawn();
+    let (fb_port, fb) = TcpEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!(
+            "tcp 127.0.0.1:{port} {{\n    sni a.test 127.0.0.1:{a_port}\n    fallback 127.0.0.1:{fb_port}\n}}\n"
+        )
+    });
+    send_sni(raddy.port(), "a.test");
+    send_sni(raddy.port(), "unknown.test");
+    assert!(a.hit_count() >= 1, "SNI a.test must route to A");
+    assert!(
+        fb.hit_count() >= 1,
+        "an unmatched SNI must route to the fallback"
+    );
+}
+
+#[test]
+fn raw_tcp_proxy_sni_without_route_or_fallback_closes() {
+    let (a_port, _a) = TcpEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!("tcp 127.0.0.1:{port} {{\n    sni a.test 127.0.0.1:{a_port}\n}}\n")
+    });
+    // An unknown SNI with no fallback is closed (EOF, no echo).
+    let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(&build_test_client_hello("unknown.test"))
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    assert_eq!(n, 0, "an unmatched SNI without a fallback must be closed");
+}
+
+#[test]
+fn raw_udp_proxy_relays_datagrams() {
+    // A `udp` listener relays datagrams to the upstream and replies back.
+    let (echo_port, _e) = UdpEchoUpstream::spawn("echo");
+    let raddy = RadRaddy::spawn_udp(|port| {
+        format!("udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n}}\n")
+    });
+    wait_until(
+        || udp_roundtrip(raddy.port(), "ping").as_deref() == Some("echo:ping"),
+        "the udp relay to echo a datagram",
+    );
+}
+
+#[test]
+fn raw_udp_proxy_supports_ipv6_listeners() {
+    // IPv6 loopback is expected on the supported Linux environments; keep the
+    // test portable for hosts where IPv6 is explicitly disabled.
+    if UdpSocket::bind("[::1]:0").is_err() {
+        return;
+    }
+    let (echo_port, _echo) = UdpEchoUpstream::spawn("v6");
+    let raddy = RadRaddy::spawn_udp_ipv6(|port| {
+        format!("udp [::1]:{port} {{\n    to 127.0.0.1:{echo_port}\n}}\n")
+    });
+    wait_until(
+        || udp_roundtrip_ipv6(raddy.port(), "v6").as_deref() == Some("v6:v6"),
+        "the IPv6 UDP listener to relay a datagram",
+    );
+}
+
+#[test]
+fn raw_udp_proxy_round_robins_and_pins_by_ip_hash() {
+    let (a_port, _a) = UdpEchoUpstream::spawn("A");
+    let (b_port, _b) = UdpEchoUpstream::spawn("B");
+
+    // round_robin: each new flow (fresh client socket) alternates upstreams.
+    let rr = RadRaddy::spawn_udp(|port| {
+        format!(
+            "udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{a_port} 127.0.0.1:{b_port}\n    lb_policy round_robin\n}}\n"
+        )
+    });
+    wait_until(
+        || udp_roundtrip(rr.port(), "x").is_some(),
+        "round-robin udp relay",
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..6 {
+        let r = udp_roundtrip(rr.port(), "x").expect("rr reply");
+        seen.insert(r.split(':').next().unwrap().to_string());
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "round-robin must reach both upstreams: {seen:?}"
+    );
+
+    // ip_hash: source-IP stickiness pins every 127.0.0.1 client (any source
+    // port) to the same upstream.
+    let ih = RadRaddy::spawn_udp(|port| {
+        format!(
+            "udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{a_port} 127.0.0.1:{b_port}\n    lb_policy ip_hash\n}}\n"
+        )
+    });
+    wait_until(
+        || udp_roundtrip(ih.port(), "x").is_some(),
+        "ip_hash udp relay",
+    );
+    let mut labels = std::collections::BTreeSet::new();
+    for _ in 0..6 {
+        let r = udp_roundtrip(ih.port(), "x").expect("ih reply");
+        labels.insert(r.split(':').next().unwrap().to_string());
+    }
+    assert_eq!(
+        labels.len(),
+        1,
+        "ip_hash must pin 127.0.0.1 to one upstream: {labels:?}"
+    );
+}
+
+#[test]
+fn raw_udp_proxy_idle_timeout_evicts_flows() {
+    // A flow idle for `idle_timeout` is evicted (counted in metrics).
+    let (echo_port, _e) = UdpEchoUpstream::spawn("echo");
+    let metrics_port = free_port();
+    let raddy = RadRaddy::spawn_udp_with_args(
+        |port| {
+            format!(
+                "udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n    idle_timeout 1s\n}}\n"
+            )
+        },
+        &[format!("--metrics-addr=127.0.0.1:{metrics_port}")],
+    );
+    wait_until(
+        || udp_roundtrip(raddy.port(), "x").is_some(),
+        "udp relay to create a flow",
+    );
+    // Wait for the idle eviction (1s) to be counted by the metrics endpoint.
+    wait_until(
+        || {
+            try_request(metrics_port, None, "/metrics").is_some_and(|r| {
+                r.body.lines().any(|l| {
+                    l.starts_with("raddy_l4_udp_idle_evictions_total{")
+                        && l.split_whitespace()
+                            .last()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0)
+                            >= 1
+                })
+            })
+        },
+        "the idle-eviction metric to count a flow",
+    );
+}
+
+#[test]
+fn raw_udp_proxy_drops_oversized_datagrams() {
+    let (echo_port, _echo) = UdpEchoUpstream::spawn("echo");
+    let metrics_port = free_port();
+    let raddy = RadRaddy::spawn_udp_with_args(
+        |port| {
+            format!(
+                "udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n    max_datagram_size 8\n}}\n"
+            )
+        },
+        &[format!("--metrics-addr=127.0.0.1:{metrics_port}")],
+    );
+    wait_until(
+        || udp_roundtrip(raddy.port(), "small").as_deref() == Some("echo:small"),
+        "the UDP listener to become ready before the oversized packet",
+    );
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    client
+        .send_to(b"123456789", ("127.0.0.1", raddy.port()))
+        .unwrap();
+    let mut buf = [0u8; 64];
+    assert!(
+        client.recv_from(&mut buf).is_err(),
+        "an oversized datagram must not reach the upstream"
+    );
+    wait_until(
+        || metric_value(metrics_port, "raddy_l4_udp_oversized_drops_total").unwrap_or(0) >= 1,
+        "the UDP oversized-datagram metric",
+    );
+}
+
+#[test]
+fn raw_udp_proxy_reload_updates_datagram_limit() {
+    let (echo_port, _echo) = UdpEchoUpstream::spawn("echo");
+    let metrics_port = free_port();
+    let mut raddy = RadRaddy::spawn_udp_with_args(
+        |port| {
+            format!(
+                "udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n    max_datagram_size 8\n}}\n"
+            )
+        },
+        &[format!("--metrics-addr=127.0.0.1:{metrics_port}")],
+    );
+    wait_until(
+        || udp_roundtrip(raddy.port(), "small").as_deref() == Some("echo:small"),
+        "the initial UDP listener to become ready",
+    );
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    client
+        .send_to(b"123456789", ("127.0.0.1", raddy.port()))
+        .unwrap();
+    let mut buf = [0u8; 64];
+    assert!(client.recv_from(&mut buf).is_err());
+    wait_until(
+        || metric_value(metrics_port, "raddy_l4_udp_oversized_drops_total").unwrap_or(0) >= 1,
+        "the initial UDP datagram limit to reject the oversized packet",
+    );
+
+    raddy.reload(&format!(
+        "udp 127.0.0.1:{} {{\n    to 127.0.0.1:{echo_port}\n    max_datagram_size 16\n}}\n",
+        raddy.port()
+    ));
+    wait_until(
+        || udp_roundtrip(raddy.port(), "123456789").as_deref() == Some("echo:123456789"),
+        "the reloaded UDP datagram limit to accept the packet",
+    );
+}
+
+#[test]
+fn raw_udp_proxy_evicts_flows_at_capacity() {
+    let (echo_port, _echo) = UdpEchoUpstream::spawn("echo");
+    let metrics_port = free_port();
+    let raddy = RadRaddy::spawn_udp_with_args(
+        |port| {
+            format!("udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n    max_flows 1\n}}\n")
+        },
+        &[format!("--metrics-addr=127.0.0.1:{metrics_port}")],
+    );
+    wait_until(
+        || udp_roundtrip(raddy.port(), "first").as_deref() == Some("echo:first"),
+        "the first bounded UDP flow to receive a reply",
+    );
+    wait_until(
+        || udp_roundtrip(raddy.port(), "second").as_deref() == Some("echo:second"),
+        "the second bounded UDP flow to receive a reply",
+    );
+    wait_until(
+        || metric_value(metrics_port, "raddy_l4_udp_capacity_evictions_total").unwrap_or(0) >= 1,
+        "the UDP capacity-eviction metric",
+    );
+}
+
+#[test]
+fn raw_udp_proxy_reload_updates_upstream_for_new_flows() {
+    let (a_port, _a) = UdpEchoUpstream::spawn("A");
+    let (b_port, _b) = UdpEchoUpstream::spawn("B");
+    let mut raddy = RadRaddy::spawn_udp(|port| {
+        format!("udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{a_port}\n}}\n")
+    });
+    wait_until(
+        || udp_roundtrip(raddy.port(), "before").as_deref() == Some("A:before"),
+        "the initial UDP upstream",
+    );
+    raddy.reload(&format!(
+        "udp 127.0.0.1:{} {{\n    to 127.0.0.1:{b_port}\n}}\n",
+        raddy.port()
+    ));
+    wait_until(
+        || udp_roundtrip(raddy.port(), "after").as_deref() == Some("B:after"),
+        "the reloaded UDP upstream to serve new flows",
+    );
+}
+
+#[test]
+fn raw_udp_proxy_writes_typed_flow_access_records() {
+    let (echo_port, _echo) = UdpEchoUpstream::spawn("echo");
+    let log_path = std::env::temp_dir().join(format!(
+        "raddy_l4_udp_access_{}_{}.log",
+        std::process::id(),
+        free_port()
+    ));
+    let raddy = RadRaddy::spawn_udp_with_args(
+        |port| {
+            format!(
+                "udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{echo_port}\n    idle_timeout 1s\n}}\n"
+            )
+        },
+        &[String::from("--access-log"), log_path.display().to_string()],
+    );
+    wait_until(
+        || udp_roundtrip(raddy.port(), "logged").as_deref() == Some("echo:logged"),
+        "the UDP flow to receive a reply before logging",
+    );
+    wait_until(
+        || {
+            std::fs::read_to_string(&log_path)
+                .map(|content| {
+                    content.contains("\"listener\":\"udp/")
+                        && content.contains("\"outcome\":\"evicted\"")
+                })
+                .unwrap_or(false)
+        },
+        "the typed UDP flow access record",
+    );
+    let _ = std::fs::remove_file(&log_path);
+}
+
+#[test]
+fn udp_listener_conflicts_with_overlapping_udp_bind() {
+    // Two UDP listeners on the same address:port are rejected.
+    let config = std::env::temp_dir().join(format!(
+        "raddy_l4_udp_conflict_{}.Raddyfile",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config,
+        "udp :53 {\n    to 1.1.1.1:53\n}\nudp 0.0.0.0:53 {\n    to 8.8.8.8:53\n}\n",
+    )
+    .unwrap();
+    let out = Command::new(BIN)
+        .args(["check", "-c"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "check must reject overlapping UDP listeners"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[test]
+fn zero_downtime_upgrade_hands_off_raw_tcp_listeners() {
+    // The zero-downtime upgrade must hand the raw-TCP listener's fd to the new
+    // process: after `raddy upgrade`, new TCP connections are served by the
+    // replacement (the plan's P0 acceptance criterion).
+    let tag = format!(
+        "{}_{}",
+        std::process::id(),
+        UPGRADE_TAG.fetch_add(1, Ordering::Relaxed)
+    );
+    let (pidfile, upgrade_sock, cert_dir) = upgrade_paths(&tag);
+    let extra = vec![
+        format!("--pidfile={}", pidfile.display()),
+        format!("--upgrade-sock={}", upgrade_sock.display()),
+        format!("--cert-dir={}", cert_dir.display()),
+    ];
+
+    let (up_port, _up) = EchoUpstream::spawn("A");
+    let (tcp_echo_port, _echo) = TcpEchoUpstream::spawn();
+    let l4_port = free_port();
+    let raddy = RadRaddy::spawn_with_args(
+        move |port| {
+            format!(
+                ":{port} {{\n    reverse_proxy 127.0.0.1:{up_port}\n}}\n\
+                 tcp 127.0.0.1:{l4_port} {{\n    to 127.0.0.1:{tcp_echo_port}\n}}\n"
+            )
+        },
+        &extra,
+    );
+    let http_port = raddy.port();
+    let old_pid = read_pid_file(&pidfile);
+    assert!(process_alive(old_pid), "initial instance should be running");
+
+    // The old process serves both the HTTP site and the raw-TCP listener.
+    let mut old_conn = TcpStream::connect(("127.0.0.1", l4_port)).unwrap();
+    old_conn
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    old_conn.write_all(b"pre").unwrap();
+    let mut buf = [0u8; 16];
+    let n = old_conn.read(&mut buf).unwrap();
+    assert_eq!(
+        &buf[..n],
+        b"echo:pre",
+        "old process must serve the tcp listener"
+    );
+    assert_eq!(
+        send_request(http_port, Some("localhost"), "/").status,
+        200,
+        "old process must serve HTTP"
+    );
+
+    // Run the upgrade: the replacement must claim the raw-TCP listener's fd.
+    let status = Command::new(BIN)
+        .args(["upgrade", "-c"])
+        .arg(&raddy.config_path)
+        .args(&extra)
+        .status()
+        .expect("failed to spawn raddy upgrade");
+    assert!(status.success(), "raddy upgrade should succeed: {status:?}");
+
+    // The replacement serves new raw-TCP connections on the same listener.
+    let mut new_conn = TcpStream::connect(("127.0.0.1", l4_port)).unwrap();
+    new_conn
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    new_conn.write_all(b"post").unwrap();
+    let n = new_conn.read(&mut buf).unwrap();
+    assert_eq!(
+        &buf[..n],
+        b"echo:post",
+        "the new process must serve the handed-off raw-TCP listener"
+    );
+    // HTTP on the replacement works too.
+    wait_until(
+        || try_request(http_port, Some("localhost"), "/").is_some_and(|r| r.status == 200),
+        "HTTP after the upgrade",
+    );
+
+    drop(old_conn);
+    let new_pid = read_pid_file(&pidfile);
+    assert_ne!(new_pid, old_pid, "upgrade should replace the process");
+    assert!(process_alive(new_pid), "replacement should be running");
+
+    // Stop the replacement (it is detached from `RadRaddy`'s Drop).
+    unsafe {
+        libc::kill(new_pid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && process_alive(new_pid) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_alive(new_pid),
+        "replacement should have been stopped"
+    );
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = std::fs::remove_file(&upgrade_sock);
+    let _ = std::fs::remove_dir_all(&cert_dir);
+}
+
+#[test]
+fn tcp_listener_conflicts_with_http_site_at_check() {
+    // `raddy check` must reject a raw-TCP listener on an HTTP site's port.
+    let config = std::env::temp_dir().join(format!(
+        "raddy_l4_conflict_{}.Raddyfile",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config,
+        "tcp :8080 {\n    to 127.0.0.1:1\n}\n:8080 {\n    reverse_proxy 127.0.0.1:1\n}\n",
+    )
+    .unwrap();
+    let out = Command::new(BIN)
+        .args(["check", "-c"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "check must reject an L4/HTTP port collision"
+    );
+    let _ = std::fs::remove_file(&config);
 }

@@ -115,7 +115,8 @@ pub async fn serve(
     // Compression is negotiated only for full GET responses: partial (206)
     // ranges must be byte-exact and are never compressed, and HEAD is served
     // un-compressed with the full Content-Length so it never reads the body.
-    let algo = if is_partial || is_head {
+    // A tiny body compresses larger than it is, so it is skipped too.
+    let algo = if is_partial || is_head || (body_len as usize) < compress::MIN_COMPRESS_BYTES {
         None
     } else {
         compress::choose(
@@ -345,6 +346,19 @@ fn resolve(root: &str, request_path: &str) -> Option<PathBuf> {
     if request_path.split('/').any(|seg| seg == "..") {
         return None;
     }
+    // Hidden files and directories (`.env`, `.git/`, `.htaccess`) are never
+    // served: a dot-prefixed segment can leak secrets from a static root. The
+    // `.well-known` directory is the one exception — RFC 8615 well-known URIs
+    // (`.well-known/security.txt`, `apple-app-site-association`, …) are public
+    // discovery endpoints and legitimately live under a static root. (The ACME
+    // `/.well-known/acme-challenge/` path is answered before site selection,
+    // so this rule never affects issuance.)
+    if request_path
+        .split('/')
+        .any(|seg| !seg.is_empty() && seg.starts_with('.') && seg != ".well-known")
+    {
+        return None;
+    }
     let root_path = Path::new(root);
     let rel = request_path.trim_start_matches('/');
     let candidate = root_path.join(rel);
@@ -374,6 +388,39 @@ mod tests {
         assert!(resolve("/tmp", "/../../etc/passwd").is_none());
         assert!(resolve("/tmp", "/a/../b").is_none());
         assert!(resolve("/tmp", "/..").is_none());
+    }
+
+    #[test]
+    fn hidden_files_are_rejected() {
+        // `.env`, `.git/config`, and dot-directories must not be servable from
+        // a static root (secret leakage), even when they exist on disk.
+        let root = std::env::temp_dir().join(format!("raddy_fs_hidden_{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".well-known")).unwrap();
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(root.join(".git/config"), "[core]").unwrap();
+        std::fs::write(
+            root.join(".well-known/security.txt"),
+            "Contact: ops@example.com",
+        )
+        .unwrap();
+        std::fs::write(root.join("hello.txt"), "hi").unwrap();
+        let root = root.to_str().unwrap();
+
+        assert!(resolve(root, "/.env").is_none());
+        assert!(resolve(root, "/.git/config").is_none());
+        // A dot-directory path (even to a normal file inside it) is rejected.
+        assert!(resolve(root, "/.git/").is_none());
+        // A normal file still resolves.
+        assert!(resolve(root, "/hello.txt").is_some());
+        // RFC 8615 well-known URIs are public by design and remain servable
+        // (the only dot-segment exception).
+        assert!(
+            resolve(root, "/.well-known/security.txt").is_some(),
+            ".well-known must not be treated as hidden"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

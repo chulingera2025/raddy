@@ -15,9 +15,12 @@ request to the given file:
 raddy run -c Raddyfile --access-log /var/log/raddy/access.jsonl
 ```
 
-Each line is a single JSON object (JSON Lines). Appending (never truncating),
-so you can rotate the file out from under raddy and it keeps writing to the new
-path.
+Each line is a single JSON object (JSON Lines). Appending (never truncating).
+The file is opened once at startup and the handle is held for the process
+lifetime, so rotate it with logrotate's **`copytruncate`** mode (raddy keeps
+appending to the same inode); a rename-based rotation would leave raddy writing
+to the renamed file, not the fresh path. A SIGHUP reload does not reopen the
+log.
 
 ## Via the Raddyfile: `access_log`
 

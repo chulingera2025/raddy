@@ -65,6 +65,18 @@ const ISSUANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// the configured hosts plus this queue capacity.
 pub(crate) const ISSUANCE_QUEUE_CAPACITY: usize = 256;
 
+/// The ACME DNS identifier for a certificate-store key: the host part, with a
+/// `:port` suffix stripped when present. Store keys are the bare host on port
+/// 443 and `host:port` on any other TLS port ([`crate::tls::cert_store_key`]);
+/// `host:port` is not a valid DNS identifier, so every ACME order and DNS-01
+/// record must use the bare name.
+fn dns_name_for(store_key: &str) -> &str {
+    match store_key.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => host,
+        _ => store_key,
+    }
+}
+
 /// In-memory HTTP-01 challenge registry: token -> key authorization.
 ///
 /// Populated when an order is created, read by the proxy handler to answer
@@ -221,24 +233,34 @@ impl AcmeManager {
 
     /// Issue a certificate for a single hostname and publish it.
     ///
+    /// `store_key` is the certificate-store key the caller enqueued — the bare
+    /// host on port 443, `host:port` on a non-443 TLS listener (see
+    /// [`crate::tls::cert_store_key`]). The ACME order and DNS-01 records use
+    /// the *bare* DNS name (a `host:port` is not a valid DNS identifier), while
+    /// the store and `cert_dir` persist under `store_key` so the SNI callback
+    /// finds the certificate (P2, A1).
+    ///
     /// Domain control is proven via HTTP-01 by default, or via DNS-01 when
     /// `dns_challenge` is configured. With `force` (renewal) the existing
     /// certificate, if any, is replaced.
-    pub async fn issue_for(&self, host: &str, force: bool) -> Result<(), String> {
-        if !force && self.store.has(host) {
+    pub async fn issue_for(&self, store_key: &str, force: bool) -> Result<(), String> {
+        if !force && self.store.has(store_key) {
             return Ok(());
         }
         let _guard = self.issuance_lock.lock().await;
-        if !force && self.store.has(host) {
+        if !force && self.store.has(store_key) {
             return Ok(());
         }
+        // The ACME DNS identifier: the host part of the store key, stripping a
+        // `:port` suffix when present.
+        let dns_name = dns_name_for(store_key);
 
         let account = self.account().await?;
-        let identifiers = vec![Identifier::Dns(host.to_string())];
+        let identifiers = vec![Identifier::Dns(dns_name.to_string())];
         let mut order = account
             .new_order(&NewOrder::new(&identifiers))
             .await
-            .map_err(|e| format!("new_order for {host}: {e}"))?;
+            .map_err(|e| format!("new_order for {store_key}: {e}"))?;
 
         // For each authorization, present the challenge then notify the server
         // it is ready. HTTP-01 answers from the ChallengeStore; DNS-01 publishes
@@ -261,20 +283,20 @@ impl AcmeManager {
         };
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
-            let mut authz = result.map_err(|e| format!("authorization for {host}: {e}"))?;
+            let mut authz = result.map_err(|e| format!("authorization for {store_key}: {e}"))?;
             if authz.status == AuthorizationStatus::Valid {
                 continue;
             }
             let mut challenge = authz
                 .challenge(challenge_type.clone())
-                .ok_or_else(|| format!("no {challenge_label} challenge offered for {host}"))?;
+                .ok_or_else(|| format!("no {challenge_label} challenge offered for {store_key}"))?;
             let key_authorization = challenge.key_authorization().as_str().to_string();
             match &mut dns_guard {
                 Some(guard) => {
                     let handle = guard
                         .provider
-                        .present(host, &key_authorization)
-                        .map_err(|e| format!("dns-01 present for {host}: {e}"))?;
+                        .present(dns_name, &key_authorization)
+                        .map_err(|e| format!("dns-01 present for {store_key}: {e}"))?;
                     guard.handles.push(handle);
                 }
                 None => {
@@ -285,43 +307,50 @@ impl AcmeManager {
             challenge
                 .set_ready()
                 .await
-                .map_err(|e| format!("set_ready for {host}: {e}"))?;
+                .map_err(|e| format!("set_ready for {store_key}: {e}"))?;
         }
 
         let status = order
             .poll_ready(&RetryPolicy::default())
             .await
-            .map_err(|e| format!("poll_ready for {host}: {e}"))?;
+            .map_err(|e| format!("poll_ready for {store_key}: {e}"))?;
         if status != OrderStatus::Ready {
-            return Err(format!("order for {host} not ready: {status:?}"));
+            return Err(format!("order for {store_key} not ready: {status:?}"));
         }
         let private_key_pem = order
             .finalize()
             .await
-            .map_err(|e| format!("finalize for {host}: {e}"))?;
+            .map_err(|e| format!("finalize for {store_key}: {e}"))?;
         let cert_chain_pem = order
             .poll_certificate(&RetryPolicy::default())
             .await
-            .map_err(|e| format!("certificate for {host}: {e}"))?;
+            .map_err(|e| format!("certificate for {store_key}: {e}"))?;
 
-        tracing::info!("certificate issued for {host}");
+        tracing::info!("certificate issued for {store_key}");
         publish(
             &self.store,
             &self.cert_dir,
-            host,
+            store_key,
             &cert_chain_pem,
             &private_key_pem,
         )
-        .map_err(|e| format!("failed to persist certificate for {host}: {e}"))?;
+        .map_err(|e| format!("failed to persist certificate for {store_key}: {e}"))?;
         Ok(())
     }
 
     /// Build the ACME account, resuming persisted credentials when present.
     async fn account(&self) -> Result<Account, String> {
+        // Secure the cert dir first: the ACME root CA PEM below is written into
+        // it, and account credentials are persisted here. A fixed /tmp path for
+        // the root PEM would be world-writable and a symlink-attack vector, and
+        // would race between concurrent instances.
+        ensure_cert_dir(&self.cert_dir)
+            .map_err(|e| format!("failed to secure cert dir {}: {e}", self.cert_dir.display()))?;
         let builder = match &self.acme_root_pem {
             Some(pem) => {
-                let path = std::env::temp_dir().join("raddy_acme_root.pem");
-                std::fs::write(&path, pem).map_err(|e| format!("write acme root pem: {e}"))?;
+                let path = self.cert_dir.join("acme_root.pem");
+                atomic_write(&path, pem, CERT_FILE_MODE)
+                    .map_err(|e| format!("write acme root pem: {e}"))?;
                 Account::builder_with_root(path).map_err(|e| format!("acme builder: {e}"))?
             }
             None => Account::builder().map_err(|e| format!("acme builder: {e}"))?,
@@ -359,9 +388,8 @@ impl AcmeManager {
             .map_err(|e| format!("failed to create ACME account: {e}"))?;
         // Persist atomically with private permissions. A failure is returned
         // rather than merely logged: losing the account means every restart
-        // registers a fresh ACME account.
-        ensure_cert_dir(&self.cert_dir)
-            .map_err(|e| format!("failed to secure cert dir {}: {e}", self.cert_dir.display()))?;
+        // registers a fresh ACME account. (The cert dir was secured at the top
+        // of `account`.)
         let json = serde_json::to_string(&credentials)
             .map_err(|e| format!("serialize account credentials: {e}"))?;
         atomic_write(&account_path, &json, PRIVATE_FILE_MODE).map_err(|e| {
@@ -747,6 +775,15 @@ fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_name_for_strips_a_port_suffix() {
+        // Store keys are bare hosts on 443 and `host:port` elsewhere; the ACME
+        // identifier must always be the bare DNS name (A1/A3).
+        assert_eq!(dns_name_for("example.test"), "example.test");
+        assert_eq!(dns_name_for("example.test:8443"), "example.test");
+        assert_eq!(dns_name_for("example.test:443"), "example.test");
+    }
 
     #[test]
     fn challenge_store_register_lookup() {

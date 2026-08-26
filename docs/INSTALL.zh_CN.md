@@ -64,6 +64,22 @@ docker run --rm -p 80:80 -p 443:443 \
 
 > 签名说明：用 **sha256 checksum** 保证完整性（安装脚本内置校验）。基于发布密钥的代码签名（如 minisign/cosign）作为后续增强，密钥与流程定稿后补充。
 
+## 作为 systemd 服务运行
+
+`examples/raddy.service` 是一个开箱即用的 systemd unit：开机自启、`systemctl
+reload`（SIGHUP）热重载配置、失败自动重启：
+
+```bash
+sudo install -Dm644 examples/raddy.service /etc/systemd/system/raddy.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now raddy
+```
+
+由于自动 HTTPS 需要绑定 80/443，服务以 root 运行（或授予
+`CAP_NET_BIND_SERVICE`）。unit 默认配置在 `/etc/raddy/Raddyfile`、证书存于
+`/var/lib/raddy/certs`——请按你的布局修改。unit 的 `ExecStart` 参数也是执行
+`raddy upgrade` 做零停机二进制升级时必须一致传入的参数。
+
 ## 验证安装
 
 ```bash

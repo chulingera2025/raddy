@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml/badge.svg)](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/chulingera2025/raddy)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v0.2.10-blue)]()
+[![Version](https://img.shields.io/badge/version-v0.3.0-blue)]()
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)]()
 [English](README.md)
 
@@ -14,7 +14,7 @@ Rust 网关生态的现状大致两类：直接手写 Pingora 代码，或者使
 
 1. **可预期的配置体验**：指令严格按书写顺序执行，不引入隐式指令排序表。配置结果可预期、无需查表。
 2. **自动 HTTPS 作为一等公民**：原生集成 ACME，自动申请证书并支持 SNI 动态证书，开箱即用。
-3. **Pingora 引擎的硬核能力**：多线程共享连接池、无 GC，以及（远期）零停机二进制升级。
+3. **Pingora 引擎的硬核能力**：多线程共享连接池、无 GC，以及零停机二进制升级（`raddy upgrade` 将监听套接字移交给新二进制，不丢弃任何请求）。
 
 ## 功能特性
 
@@ -26,6 +26,7 @@ Rust 网关生态的现状大致两类：直接手写 Pingora 代码，或者使
 - **转发**：`reverse_proxy` 支持 `to` 多目标轮询、头改写、重定向、干净的 400/404 兜底。
 - **边缘防护**：`rate_limit remote_ip` 单机令牌桶限流，配合 `trusted_proxies` 解析真实客户端 IP。
 - **迁移**：`raddy import caddyfile|nginx <file>` 将常见 Caddyfile / nginx.conf 子集转换为 Raddyfile（独立转换器，永不改动 Raddyfile 文法）。
+- **四层代理**：`tcp <address> { ... }` 与 `udp <address> { ... }` 监听器代理裸 TCP 连接和 UDP 数据报（不做 HTTP 解析），支持负载均衡、SNI 透传路由、空闲/连接超时、连接/flow 上限、健康检查、DNS 刷新与指标。
 
 ## 快速开始
 
@@ -87,7 +88,7 @@ raddy run -c Raddyfile --acme-directory https://acme-v02.api.letsencrypt.org/dir
 
 ## 开发状态
 
-核心实现已完成：转发 + 热重载、Raddyfile 解析器（fuzz 验证、带行列号错误）、ACME 自动 HTTPS（已用本地 Pebble 测试 CA 验证）、静态托管 + 压缩、可观测性、发布工具链。
+核心实现已完成：转发 + 热重载、Raddyfile 解析器（fuzz 验证、带行列号错误）、ACME 自动 HTTPS（已用本地 Pebble 测试 CA 验证，HTTP-01 + DNS-01，自动续期）、站点级 TLS（静态/internal 证书、mTLS、上游 TLS）、健康检查与负载均衡策略、单机限流与可信客户端 IP 模型、gzip/zstd/brotli 压缩（流式、感知 Range）、结构化 JSON 与 common 格式访问日志、Caddyfile/nginx 迁移工具、零停机二进制升级，以及已通过集成测试的 L4 TCP/SNI/UDP 代理。UDP 升级仍采用普通重启路径。发布工具链提供 Linux x86_64/aarch64 的校验和安装脚本与 Docker。
 
 ## License
 
