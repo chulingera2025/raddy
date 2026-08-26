@@ -31,15 +31,19 @@ use crate::config::ast::{
     TlsSource,
 };
 use crate::config::snapshot::{self, ConfigStore};
-use crate::layer4::tcp::{TcpAccessRecord, TcpProxyApp};
+use crate::layer4::tcp::{TcpAccessRecord, TcpProxyApp, TransparentTcpProxy};
 use crate::layer4::udp::{UdpFlowRecord, UdpProxy};
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
 use crate::server::acme::{AcmeManager, ChallengeStore, ISSUANCE_QUEUE_CAPACITY};
 use crate::server::issuance_queue::{EnqueueOutcome, RequestKind};
 use crate::server::reload;
-use crate::tls::{cert_store_key, CertStore, SniCallback};
-use pingora::listeners::{tls::TlsSettings, TlsAcceptCallbacks};
+use crate::server::upgrade;
+use crate::tls::{
+    cert_store_key, configure_http_alpn, CertStore, SniCallback, StaticCertCallback,
+    TlsAlpnChallengeStore,
+};
+use pingora::listeners::{tls::TlsSettings, TcpSocketOptions, TlsAcceptCallbacks};
 use pingora::prelude::*;
 use pingora::server::configuration::{Opt, ServerConf};
 use pingora::services::background::background_service;
@@ -87,6 +91,19 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     // the issuance worker can make its first TLS connection.
     install_rustls_crypto_provider();
     let snapshot = snapshot::build(config_path)?;
+    if opts.upgrade
+        && snapshot.layer4.iter().any(|listener| {
+            matches!(
+                listener,
+                Layer4Listener::Tcp(tcp) if tcp.transparent
+            )
+        })
+    {
+        return Err(
+            "transparent TCP listeners cannot be inherited by Pingora upgrade; use a restart"
+                .into(),
+        );
+    }
     let ports = listeners_to_serve(&snapshot);
     let email = snapshot.global.acme_email.clone();
     // The access-log directive (spec §5.13); read before `snapshot` is moved.
@@ -102,6 +119,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     // survive config reloads; reload swaps only the routing snapshot).
     let cert_store = Arc::new(CertStore::new());
     let challenges = Arc::new(ChallengeStore::new());
+    let tls_alpn_challenges = Arc::new(TlsAlpnChallengeStore::new());
     let acme_root_pem = match &opts.acme_root_pem {
         Some(path) => Some(
             std::fs::read_to_string(path)
@@ -112,11 +130,13 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     let acme = Arc::new(AcmeManager::new(
         cert_store.clone(),
         challenges.clone(),
+        tls_alpn_challenges.clone(),
         opts.acme_directory.clone(),
         acme_root_pem,
         opts.cert_dir.clone(),
         email,
         snapshot.global.dns_challenge.clone(),
+        snapshot.global.tls_alpn_challenge,
     ));
     acme.load_persisted_certs();
     // Sites with a static or internal `tls` source (spec §5.7) serve their own
@@ -240,6 +260,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         if let Some(pidfile) = &opts.pidfile {
             std::fs::write(pidfile, std::process::id().to_string())
                 .map_err(|e| format!("failed to write pidfile {}: {e}", pidfile.display()))?;
+            upgrade::write_topology_state(pidfile, &config_store.load())?;
         }
     }
 
@@ -251,21 +272,26 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
             // TLS listener with SNI dynamic certificates from the store. The
             // callback is bound to this listener's port so per-(host, port)
             // certs and `tls` options stay independent (P2).
-            let callbacks: TlsAcceptCallbacks = Box::new(SniCallback::new(
+            let callbacks: TlsAcceptCallbacks = Box::new(SniCallback::new_with_alpn(
                 cert_store.clone(),
                 config_store.clone(),
                 port,
                 on_miss.clone(),
+                tls_alpn_challenges.clone(),
             ));
             // Advertise HTTP/2 over ALPN (`h2` preferred, HTTP/1.1 fallback),
             // spec §5.6.
             let mut settings = TlsSettings::with_callbacks(callbacks)?;
-            settings.enable_h2();
-            proxy.add_tls_with_settings(&format!("0.0.0.0:{port}"), None, settings);
-            tracing::info!("listening (TLS) on 0.0.0.0:{port}");
+            configure_http_alpn(&mut settings, tls_alpn_challenges.clone());
+            proxy.add_tls_with_settings(
+                &format!("[::]:{port}"),
+                Some(ipv6_dual_stack_options()),
+                settings,
+            );
+            tracing::info!("listening (TLS) on [::]:{port} (IPv4 + IPv6)");
         } else {
-            proxy.add_tcp(&format!("0.0.0.0:{port}"));
-            tracing::info!("listening (plain HTTP) on 0.0.0.0:{port}");
+            proxy.add_tcp_with_settings(&format!("[::]:{port}"), ipv6_dual_stack_options());
+            tracing::info!("listening (plain HTTP) on [::]:{port} (IPv4 + IPv6)");
         }
     }
     server.add_service(proxy);
@@ -287,11 +313,49 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                         let _ = guard.flush();
                     }) as Arc<dyn Fn(&TcpAccessRecord) + Send + Sync>
                 });
+                if tcp.transparent {
+                    let transparent = TransparentTcpProxy::new(tcp, config_store.clone(), sink)?;
+                    server.add_service(background_service(
+                        &format!("transparent-tcp/{}", tcp.listen.display()),
+                        transparent,
+                    ));
+                    tracing::info!("listening (transparent TCP) on {}", tcp.listen.display());
+                    continue;
+                }
                 let app = TcpProxyApp::new(tcp, config_store.clone(), sink)?;
                 let mut service = Service::new(format!("tcp/{}", tcp.listen.display()), app);
-                service.add_tcp(&tcp.listen.display());
+                if let Some(tls) = &tcp.tls {
+                    let cert = match &tls.source {
+                        TlsSource::Internal => generate_internal_cert("localhost")?,
+                        TlsSource::Static {
+                            cert_file,
+                            key_file,
+                        } => {
+                            let cert_pem = std::fs::read_to_string(cert_file).map_err(|e| {
+                                format!("failed to read certificate {cert_file}: {e}")
+                            })?;
+                            let key_pem = std::fs::read_to_string(key_file)
+                                .map_err(|e| format!("failed to read key {key_file}: {e}"))?;
+                            crate::tls::cert_key_from_pem(&cert_pem, &key_pem)?
+                        }
+                        TlsSource::Acme => {
+                            return Err(
+                                "TCP TLS termination cannot use ACME without a site identity"
+                                    .into(),
+                            )
+                        }
+                    };
+                    let callbacks =
+                        Box::new(StaticCertCallback::with_options(cert, Some(tls.clone())))
+                            as TlsAcceptCallbacks;
+                    let settings = TlsSettings::with_callbacks(callbacks)?;
+                    service.add_tls_with_settings(&tcp.listen.display(), None, settings);
+                    tracing::info!("listening (TLS-terminated TCP) on {}", tcp.listen.display());
+                } else {
+                    service.add_tcp(&tcp.listen.display());
+                    tracing::info!("listening (raw TCP) on {}", tcp.listen.display());
+                }
                 server.add_service(service);
-                tracing::info!("listening (raw TCP) on {}", tcp.listen.display());
             }
             Layer4Listener::Udp(udp) => {
                 let sink = l4_access_log.as_ref().map(|log| {
@@ -303,7 +367,15 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                         let _ = guard.flush();
                     }) as Arc<dyn Fn(&UdpFlowRecord) + Send + Sync>
                 });
-                let proxy = UdpProxy::new(udp, config_store.clone(), sink)?;
+                let proxy = UdpProxy::new(
+                    udp,
+                    config_store.clone(),
+                    sink,
+                    opts.upgrade || opts.test,
+                    opts.upgrade_sock.clone(),
+                    udp.listen.display(),
+                    Some(server.watch_execution_phase()),
+                )?;
                 server.add_service(background_service(
                     &format!("udp/{}", udp.listen.display()),
                     proxy,
@@ -327,6 +399,16 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     server.run_forever();
 }
 
+/// Configure an IPv6 wildcard listener to accept IPv4-mapped connections too.
+/// A single dual-stack socket keeps the IPv4/IPv6 listener pair in lockstep,
+/// which also makes Pingora's listener-FD upgrade path transfer both families
+/// as one endpoint.
+fn ipv6_dual_stack_options() -> TcpSocketOptions {
+    let mut options = TcpSocketOptions::default();
+    options.ipv6_only = Some(false);
+    options
+}
+
 /// The listeners to serve: the configured sites' ports, plus an implicit
 /// plain-HTTP :80 listener when automatic HTTPS needs HTTP-01.
 ///
@@ -337,15 +419,62 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
 /// precisely because port 80 is unavailable. An explicit :80 catch-all already
 /// covers the challenge (it is served before site selection), so it is never
 /// duplicated.
-fn listeners_to_serve(snapshot: &CompiledConfig) -> BTreeSet<u16> {
+pub(crate) fn listeners_to_serve(snapshot: &CompiledConfig) -> BTreeSet<u16> {
     let mut ports = snapshot.listeners();
     if snapshot.global.dns_challenge.is_none()
+        && !snapshot.global.tls_alpn_challenge
         && !ports.contains(&80)
         && !hosts_needing_certs(snapshot).is_empty()
     {
         ports.insert(80);
     }
     ports
+}
+
+/// The HTTP listener topology and immutable challenge mode used by reload
+/// validation. TLS source/config changes are included because static/internal
+/// certificates are loaded only when the listener is constructed.
+pub(crate) fn http_listener_topology_keys(snapshot: &CompiledConfig) -> BTreeSet<String> {
+    let tls_ports = tls_listener_ports(snapshot);
+    let challenge_mode = format!(
+        "dns={} alpn={}",
+        snapshot.global.dns_challenge.is_some(),
+        snapshot.global.tls_alpn_challenge
+    );
+    let mut keys = listeners_to_serve(snapshot)
+        .into_iter()
+        .map(|port| {
+            format!(
+                "Http:{port}:tls={}:{}",
+                tls_ports.contains(&port),
+                challenge_mode
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    keys.extend(snapshot.sites.iter().filter_map(|site| {
+        site.tls
+            .as_ref()
+            .map(|tls| format!("SiteTls:{}:{tls:?}", site.key.describe()))
+    }));
+    keys
+}
+
+/// The layer-4 listener topology, including whether each TCP endpoint is
+/// Pingora-owned, TLS-terminated, or custom transparent TCP.
+pub(crate) fn l4_listener_topology_keys(snapshot: &CompiledConfig) -> BTreeSet<String> {
+    snapshot
+        .layer4
+        .iter()
+        .map(|listener| match listener {
+            Layer4Listener::Tcp(tcp) => format!(
+                "Tcp:{}:tls={:?}:transparent={}",
+                tcp.listen.display(),
+                tcp.tls,
+                tcp.transparent
+            ),
+            Layer4Listener::Udp(udp) => format!("Udp:{}", udp.listen.display()),
+        })
+        .collect()
 }
 
 /// Certificate-store keys that need an ACME certificate up front: named sites
@@ -588,6 +717,20 @@ mod tests {
     }
 
     #[test]
+    fn tls_alpn_challenge_skips_implicit_http01_listener() {
+        let cfg = build_snapshot(
+            "tls-alpn01",
+            "{ tls_alpn_challenge }\napi.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n",
+        );
+        let ports = listeners_to_serve(&cfg);
+        assert!(
+            !ports.contains(&80),
+            "TLS-ALPN-01 must not force a plain HTTP listener: {ports:?}"
+        );
+        assert!(ports.contains(&443));
+    }
+
+    #[test]
     fn explicit_http_listener_is_not_duplicated() {
         // An explicit :80 catch-all already answers the challenge (it is served
         // before site selection), so the implicit listener must not be added.
@@ -608,5 +751,24 @@ mod tests {
             "no named sites, no implicit :80: {ports:?}"
         );
         assert_eq!(ports, BTreeSet::from([8080]));
+    }
+
+    #[test]
+    fn http_topology_allows_site_routing_changes_on_an_existing_listener() {
+        let old = build_snapshot("topology-old", ":8080 {\n    respond 200 old\n}\n");
+        let new = build_snapshot(
+            "topology-new",
+            ":8080 {\n    respond 200 old\n}\napi.example.com:8080 {\n    respond 200 new\n}\n",
+        );
+        assert_eq!(
+            http_listener_topology_keys(&old),
+            http_listener_topology_keys(&new),
+            "adding routing on an existing plain listener must be reloadable"
+        );
+        let changed = build_snapshot("topology-port", ":8081 {\n    respond 200 changed\n}\n");
+        assert_ne!(
+            http_listener_topology_keys(&old),
+            http_listener_topology_keys(&changed)
+        );
     }
 }

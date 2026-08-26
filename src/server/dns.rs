@@ -34,7 +34,7 @@ pub trait DnsRecord: Send + Sync {
 pub trait DnsProvider: Send + Sync {
     /// Publish the challenge TXT record for `host` carrying `key_authorization`,
     /// returning a handle that removes it via [`DnsRecord::cleanup`].
-    fn present(&self, host: &str, key_authorization: &str) -> Result<Box<dyn DnsRecord>, String>;
+    fn present(&self, host: &str, dns_value: &str) -> Result<Box<dyn DnsRecord>, String>;
 }
 
 /// Build the runtime provider client for a configured provider kind (spec §5.3).

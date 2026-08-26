@@ -23,7 +23,8 @@
 //! metrics and an access record on close.
 
 use crate::config::ast::{
-    L4Upstream, Layer4Listener, ListenAddress, TcpHealthCheckSpec, TcpProxyConfig,
+    wildcard_match_specificity, L4Upstream, Layer4Listener, ListenAddress, TcpHealthCheckSpec,
+    TcpProxyConfig,
 };
 use crate::config::snapshot::ConfigStore;
 use crate::layer4::tls;
@@ -32,15 +33,20 @@ use pingora::apps::ServerApp;
 use pingora::lb::health_check;
 use pingora::lb::selection::{Consistent, Random, RoundRobin};
 use pingora::lb::LoadBalancer;
-use pingora::protocols::Stream;
+use pingora::protocols::l4::stream::Stream as L4Stream;
+use pingora::protocols::{SocketDigest, Stream};
 use pingora::server::ShutdownWatch;
+use pingora::services::background::BackgroundService;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
+use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 
 /// Read chunk used by the relay pump. Bounded, so per-connection memory is two
@@ -221,6 +227,7 @@ pub struct TcpProxyApp {
 /// connections (a `header_up`-style non-selection change does not).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TcpSelectionSpec {
+    transparent: bool,
     upstreams: Vec<L4Upstream>,
     lb_policy: crate::config::ast::LbPolicy,
     connect_timeout: Duration,
@@ -235,6 +242,7 @@ struct TcpSelectionSpec {
 impl TcpSelectionSpec {
     fn from(tcp: &TcpProxyConfig) -> Self {
         Self {
+            transparent: tcp.transparent,
             upstreams: tcp.upstreams.clone(),
             lb_policy: tcp.lb_policy,
             connect_timeout: tcp.connect_timeout,
@@ -264,8 +272,8 @@ struct AppRuntime {
 enum L4Selector {
     /// `to` mode: a health-checked balancer over the shared upstream set.
     Balancer(Arc<L4Balancer>),
-    /// SNI-routing mode (L4 P1): exact SNI -> its own upstream, plus a fallback
-    /// for unknown/absent/malformed SNI (absent = close the connection).
+    /// SNI-routing mode (L4 P1): exact or one-label wildcard SNI -> its own
+    /// upstream, plus a fallback for unknown/absent/malformed SNI.
     Sni {
         routes: Arc<HashMap<String, SocketAddr>>,
         fallback: Option<SocketAddr>,
@@ -396,6 +404,7 @@ struct RuntimeHandle {
     /// The load-balancing policy (for building the `ip_hash` selection key in
     /// `to` mode; unused in SNI mode).
     policy: crate::config::ast::LbPolicy,
+    transparent: bool,
 }
 
 /// A type-erased, health-checked backend selector for one L4 listener.
@@ -564,8 +573,144 @@ impl TcpProxyApp {
             connect_timeout: guard.connect_timeout,
             idle_timeout: guard.idle_timeout,
             policy: guard.spec.lb_policy,
+            transparent: guard.spec.transparent,
         }
     }
+}
+
+/// A Linux transparent-proxy acceptor. Pingora's ServerApp and relay logic are
+/// reused after this small listener shim attaches the socket digest that carries
+/// the original destination.
+pub struct TransparentTcpProxy {
+    listener: Arc<TcpListener>,
+    app: Arc<TcpProxyApp>,
+}
+
+impl TransparentTcpProxy {
+    /// Bind a transparent TCP listener and build its Pingora-backed proxy app.
+    ///
+    /// The tcp parameter supplies the listener and routing configuration;
+    /// config_store supplies reloadable upstream state; access_log is the
+    /// optional typed access-log sink. Returns the service on success, or an
+    /// error when the Linux transparent socket or proxy app cannot be built.
+    pub fn new(
+        tcp: &TcpProxyConfig,
+        config_store: Arc<ConfigStore>,
+        access_log: Option<Arc<AccessLogSink>>,
+    ) -> Result<Self, String> {
+        let ListenAddress::Socket(address) = &tcp.listen;
+        let listener = bind_transparent_listener(*address)?;
+        Ok(Self {
+            listener: Arc::new(listener),
+            app: Arc::new(TcpProxyApp::new(tcp, config_store, access_log)?),
+        })
+    }
+}
+
+#[async_trait]
+impl BackgroundService for TransparentTcpProxy {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        loop {
+            let accepted = tokio::select! {
+                result = self.listener.accept() => result,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let (stream, peer) = match accepted {
+                Ok(pair) => pair,
+                Err(error) => {
+                    tracing::warn!("transparent TCP accept failed: {error}");
+                    continue;
+                }
+            };
+            let raw_fd = stream.as_raw_fd();
+            let mut session: Stream = Box::new(L4Stream::from(stream));
+            session.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
+            tracing::debug!("transparent TCP connection from {peer}");
+            let app = self.app.clone();
+            let child_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let _ = app.process_new(session, &child_shutdown).await;
+            });
+        }
+    }
+}
+
+/// Bind a TCP socket with the Linux transparent-proxy option before bind.
+fn bind_transparent_listener(address: SocketAddr) -> Result<TcpListener, String> {
+    let domain = if address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|e| format!("create transparent TCP socket: {e}"))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| format!("set transparent TCP reuseaddr: {e}"))?;
+    set_transparent_fd(socket.as_raw_fd(), address.is_ipv4())?;
+    socket
+        .bind(&SockAddr::from(address))
+        .map_err(|e| format!("bind transparent TCP listener {address}: {e}"))?;
+    socket
+        .listen(65_535)
+        .map_err(|e| format!("listen on transparent TCP {address}: {e}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("set transparent TCP nonblocking: {e}"))?;
+    let listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(listener)
+        .map_err(|e| format!("adopt transparent TCP listener {address}: {e}"))
+}
+
+/// Set IP_TRANSPARENT/IPV6_TRANSPARENT on a socket.
+fn set_transparent_fd(fd: std::os::fd::RawFd, ipv4: bool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let value: libc::c_int = 1;
+        let (level, option) = if ipv4 {
+            (libc::IPPROTO_IP, libc::IP_TRANSPARENT)
+        } else {
+            (libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT)
+        };
+        // SAFETY: fd is an open socket owned by the caller and value points to
+        // a valid c_int for the duration of setsockopt.
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                option,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "set transparent socket option: {}",
+                io::Error::last_os_error()
+            ))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, ipv4);
+        Err("transparent proxying is supported only on Linux".to_string())
+    }
+}
+
+/// Read the destination selected by a Linux REDIRECT/TPROXY rule.
+fn original_dst(stream: &Stream) -> Option<SocketAddr> {
+    stream
+        .get_socket_digest()?
+        .original_dst()?
+        .as_inet()
+        .copied()
 }
 
 #[async_trait]
@@ -580,6 +725,8 @@ impl ServerApp for TcpProxyApp {
         // new connections always use the latest upstream set and limits.
         let handle = self.current_handle();
         let client_addr = peer_addr(&mut session);
+        let transparent = handle.transparent;
+        let original_destination = transparent.then(|| original_dst(&session)).flatten();
         // Admission first: reject before spending a worker on connect/relay
         // when the listener is at capacity.
         let permit = match handle.admission.clone().try_acquire_owned() {
@@ -599,15 +746,18 @@ impl ServerApp for TcpProxyApp {
         // `to` mode selects up front so an empty (all-unhealthy) backend set
         // refuses before spawning a worker; SNI mode selects inside the relay
         // after inspecting the ClientHello.
-        let pre_selected = match &*handle.selector {
-            L4Selector::Balancer(balancer) => match balancer.select(&key) {
-                Some(addr) => Some(addr),
-                None => {
-                    self.metrics.no_upstream.inc();
-                    return None;
-                }
+        let pre_selected = match original_destination {
+            Some(addr) => Some(addr),
+            None => match &*handle.selector {
+                L4Selector::Balancer(balancer) => match balancer.select(&key) {
+                    Some(addr) => Some(addr),
+                    None => {
+                        self.metrics.no_upstream.inc();
+                        return None;
+                    }
+                },
+                L4Selector::Sni { .. } => None,
             },
-            L4Selector::Sni { .. } => None,
         };
         self.metrics.accepted.inc();
 
@@ -630,6 +780,7 @@ impl ServerApp for TcpProxyApp {
                     relay_tcp(
                         session,
                         upstream,
+                        transparent.then_some(client_addr).flatten(),
                         connect_timeout,
                         idle_timeout,
                         &shutdown,
@@ -679,38 +830,68 @@ struct RelayOutcome {
 }
 
 /// Connect to the upstream under a hard wall-clock bound, then relay.
+async fn connect_upstream(
+    upstream: SocketAddr,
+    source: Option<SocketAddr>,
+) -> io::Result<TcpStream> {
+    let Some(source) = source else {
+        return TcpStream::connect(upstream).await;
+    };
+    if source.is_ipv4() != upstream.is_ipv4() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "transparent source and upstream address families differ",
+        ));
+    }
+    let socket = if source.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    set_transparent_fd(socket.as_raw_fd(), source.is_ipv4()).map_err(io::Error::other)?;
+    socket.bind(source)?;
+    socket.connect(upstream).await
+}
+
+/// Connect to the upstream under a hard wall-clock bound, then relay.
 async fn relay_tcp(
     client: Stream,
     upstream_addr: SocketAddr,
+    source_addr: Option<SocketAddr>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     shutdown: &ShutdownWatch,
     metrics: &TcpMetrics,
 ) -> RelayOutcome {
-    let upstream =
-        match tokio::time::timeout(connect_timeout, TcpStream::connect(upstream_addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                metrics.connect_failures.inc();
-                tracing::warn!("tcp connect to {upstream_addr} failed: {e}");
-                return RelayOutcome {
-                    c2u: 0,
-                    u2c: 0,
-                    upstream: upstream_addr,
-                    reason: "connect_failed",
-                };
-            }
-            Err(_) => {
-                metrics.connect_failures.inc();
-                tracing::warn!("tcp connect to {upstream_addr} timed out");
-                return RelayOutcome {
-                    c2u: 0,
-                    u2c: 0,
-                    upstream: upstream_addr,
-                    reason: "connect_timeout",
-                };
-            }
-        };
+    let upstream = match tokio::time::timeout(
+        connect_timeout,
+        connect_upstream(upstream_addr, source_addr),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            metrics.connect_failures.inc();
+            tracing::warn!("tcp connect to {upstream_addr} failed: {e}");
+            return RelayOutcome {
+                c2u: 0,
+                u2c: 0,
+                upstream: upstream_addr,
+                reason: "connect_failed",
+            };
+        }
+        Err(_) => {
+            metrics.connect_failures.inc();
+            tracing::warn!("tcp connect to {upstream_addr} timed out");
+            return RelayOutcome {
+                c2u: 0,
+                u2c: 0,
+                upstream: upstream_addr,
+                reason: "connect_timeout",
+            };
+        }
+    };
     tracing::debug!("tcp relay established to {upstream_addr}");
     let (c2u, u2c, end) = bidirectional(client, upstream, idle_timeout, shutdown).await;
     metrics.client_to_upstream_bytes.inc_by(c2u as f64);
@@ -726,6 +907,21 @@ async fn relay_tcp(
         upstream: upstream_addr,
         reason: end.as_str(),
     }
+}
+
+/// Select an SNI route with exact-match precedence and longest-suffix wildcard
+/// precedence. Wildcards are intentionally limited to one DNS label.
+fn select_sni_route(routes: &HashMap<String, SocketAddr>, name: &str) -> Option<SocketAddr> {
+    if let Some(addr) = routes.get(name) {
+        return Some(*addr);
+    }
+    routes
+        .iter()
+        .filter_map(|(pattern, addr)| {
+            wildcard_match_specificity(pattern, name).map(|specificity| (specificity, *addr))
+        })
+        .max_by_key(|(suffix_len, _)| *suffix_len)
+        .map(|(_, addr)| addr)
 }
 
 /// SNI-routed relay (L4 P1): inspect a bounded ClientHello prefix, select the
@@ -747,8 +943,8 @@ async fn relay_tcp_sni(
     // 2. Select the upstream: exact SNI -> its route; else the fallback; else
     // close (recorded under the relevant outcome).
     let (upstream_addr, route_reason) = match &inspected {
-        tls::InspectOutcome::Sni { name, .. } => match routes.get(name) {
-            Some(addr) => (*addr, "sni_routed"),
+        tls::InspectOutcome::Sni { name, .. } => match select_sni_route(&routes, name) {
+            Some(addr) => (addr, "sni_routed"),
             None => match fallback {
                 Some(f) => (f, "sni_fallback"),
                 None => {
@@ -987,6 +1183,19 @@ fn peer_addr(session: &mut Stream) -> Option<SocketAddr> {
         .as_ref()
         .and_then(|addr| addr.as_inet())
         .copied()
+        .map(normalize_socket_addr)
+}
+
+/// Collapse an IPv4-mapped IPv6 peer address from a dual-stack listener.
+fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(address) => address
+            .ip()
+            .to_ipv4()
+            .map(|ip| SocketAddr::new(ip.into(), address.port()))
+            .unwrap_or(SocketAddr::V6(address)),
+        SocketAddr::V4(address) => SocketAddr::V4(address),
+    }
 }
 
 /// Resolve a layer-4 upstream host: a literal IP parses directly, a hostname
@@ -1110,6 +1319,8 @@ mod tests {
     fn tcp_config(upstreams: &[&str]) -> TcpProxyConfig {
         TcpProxyConfig {
             listen: ListenAddress::Socket("127.0.0.1:3306".parse().unwrap()),
+            tls: None,
+            transparent: false,
             upstreams: upstreams
                 .iter()
                 .map(|u| {

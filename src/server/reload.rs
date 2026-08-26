@@ -18,11 +18,10 @@
 //! SIGHUP, atomically swapping the snapshot on success and keeping the old one
 //! on failure. Listeners are never touched (ADR-010).
 
-use crate::config::ast::{CompiledConfig, Layer4Listener};
 use crate::config::snapshot::{self, ConfigStore};
 use crate::proxy::lb::LoadBalancerPool;
+use crate::server::startup;
 use signal_hook::consts::SIGHUP;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -34,7 +33,7 @@ use std::sync::Arc;
 /// The load-balancing pool is reconciled against the new snapshot so removed
 /// sites stop their health probes. A reload that changes the layer-4 listener
 /// *topology* is rejected: listeners are fixed at process start (ADR-010) — the
-/// operator must restart or use `raddy upgrade` (L4 plan §reload semantics).
+/// operator must perform a normal restart.
 pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>, lb_pool: Arc<LoadBalancerPool>) {
     std::thread::spawn(move || {
         let mut signals = match signal_hook::iterator::Signals::new([SIGHUP]) {
@@ -47,12 +46,22 @@ pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>, lb_pool: Arc<LoadBal
         for _ in signals.forever() {
             match snapshot::build(&config_path) {
                 Ok(new_snapshot) => {
-                    let old_keys = l4_listener_keys(&store.load());
-                    let new_keys = l4_listener_keys(&new_snapshot);
+                    let old_snapshot = store.load();
+                    let old_http = startup::http_listener_topology_keys(&old_snapshot);
+                    let new_http = startup::http_listener_topology_keys(&new_snapshot);
+                    if old_http != new_http {
+                        tracing::error!(
+                            "config reload rejected: HTTP listener topology changed \
+                             (listeners are fixed at startup); use a normal restart"
+                        );
+                        continue;
+                    }
+                    let old_keys = startup::l4_listener_topology_keys(&old_snapshot);
+                    let new_keys = startup::l4_listener_topology_keys(&new_snapshot);
                     if old_keys != new_keys {
                         tracing::error!(
                             "config reload rejected: layer-4 listener topology changed \
-                             (listeners are fixed at startup); restart or use `raddy upgrade`"
+                             (listeners are fixed at startup); use a normal restart"
                         );
                         continue;
                     }
@@ -66,18 +75,4 @@ pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>, lb_pool: Arc<LoadBal
             }
         }
     });
-}
-
-/// The set of layer-4 listener identities (`Tcp:0.0.0.0:3306`, …) in a
-/// snapshot. The listener topology is fixed at process start, so a reload whose
-/// set differs is rejected.
-fn l4_listener_keys(config: &CompiledConfig) -> BTreeSet<String> {
-    config
-        .layer4
-        .iter()
-        .map(|listener| match listener {
-            Layer4Listener::Tcp(tcp) => format!("Tcp:{}", tcp.listen.display()),
-            Layer4Listener::Udp(udp) => format!("Udp:{}", udp.listen.display()),
-        })
-        .collect()
 }

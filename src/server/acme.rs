@@ -34,7 +34,7 @@
 use crate::config::ast::DnsChallenge;
 use crate::server::dns::{self, DnsProvider, DnsRecord};
 use crate::server::issuance_queue::{AcmeQueue, EnqueueOutcome, RequestKind};
-use crate::tls::CertStore;
+use crate::tls::{CertStore, TlsAlpnChallengeStore};
 use instant_acme::{
     Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
     RetryPolicy,
@@ -86,6 +86,38 @@ pub struct ChallengeStore {
     challenges: RwLock<HashMap<String, String>>,
 }
 
+/// RAII guard that removes all temporary TLS-ALPN-01 certificates after an
+/// issuance attempt, including when the ACME future fails or times out.
+struct TlsAlpnGuard {
+    store: Arc<TlsAlpnChallengeStore>,
+    hosts: Vec<String>,
+}
+
+impl TlsAlpnGuard {
+    /// Create an empty guard for one issuance attempt.
+    fn new(store: Arc<TlsAlpnChallengeStore>) -> Self {
+        Self {
+            store,
+            hosts: Vec::new(),
+        }
+    }
+
+    /// Register a challenge certificate and remember it for cleanup.
+    fn register(&mut self, host: &str, digest: &[u8]) -> Result<(), String> {
+        self.store.register(host, digest)?;
+        self.hosts.push(host.to_ascii_lowercase());
+        Ok(())
+    }
+}
+
+impl Drop for TlsAlpnGuard {
+    fn drop(&mut self) {
+        for host in self.hosts.drain(..) {
+            self.store.remove(&host);
+        }
+    }
+}
+
 impl ChallengeStore {
     /// Create an empty store.
     pub fn new() -> Self {
@@ -114,6 +146,7 @@ impl ChallengeStore {
 pub struct AcmeManager {
     store: Arc<CertStore>,
     challenges: Arc<ChallengeStore>,
+    tls_alpn_challenges: Arc<TlsAlpnChallengeStore>,
     /// The ACME directory URL (Let's Encrypt production, or a Pebble test
     /// server such as `https://localhost:14000/dir`).
     directory_url: String,
@@ -127,6 +160,8 @@ pub struct AcmeManager {
     /// DNS-01 challenge credentials (spec §5.3); when set, issuance proves
     /// domain control via DNS-01 (the provider's API) instead of HTTP-01.
     dns_challenge: Option<DnsChallenge>,
+    /// Whether ACME should use TLS-ALPN-01 instead of HTTP-01 or DNS-01.
+    tls_alpn_challenge: bool,
     /// Serializes issuance so account creation/order processing is never
     /// concurrent (a v0.1 simplification; `instant-acme` supports concurrent
     /// orders per account, but account creation races are messy on first run).
@@ -135,24 +170,33 @@ pub struct AcmeManager {
 
 impl AcmeManager {
     /// Create a manager bound to one directory/account/cert dir.
+    ///
+    /// The certificate and challenge stores are process-local; the directory,
+    /// root PEM, certificate directory, email, DNS challenge, and
+    /// TLS-ALPN-01 flag select the ACME behavior. Returns a manager ready for
+    /// worker startup; validation errors are reported when issuance begins.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<CertStore>,
         challenges: Arc<ChallengeStore>,
+        tls_alpn_challenges: Arc<TlsAlpnChallengeStore>,
         directory_url: String,
         acme_root_pem: Option<String>,
         cert_dir: PathBuf,
         email: Option<String>,
         dns_challenge: Option<DnsChallenge>,
+        tls_alpn_challenge: bool,
     ) -> Self {
         Self {
             store,
             challenges,
+            tls_alpn_challenges,
             directory_url,
             acme_root_pem,
             cert_dir,
             email,
             dns_challenge,
+            tls_alpn_challenge,
             issuance_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -241,8 +285,10 @@ impl AcmeManager {
     /// finds the certificate (P2, A1).
     ///
     /// Domain control is proven via HTTP-01 by default, or via DNS-01 when
-    /// `dns_challenge` is configured. With `force` (renewal) the existing
-    /// certificate, if any, is replaced.
+    /// dns_challenge is configured, or via TLS-ALPN-01 when the corresponding
+    /// global flag is enabled. With force (renewal) the existing certificate,
+    /// if any, is replaced. Errors include ACME, challenge setup, polling,
+    /// finalization, persistence, and cleanup failures.
     pub async fn issue_for(&self, store_key: &str, force: bool) -> Result<(), String> {
         if !force && self.store.has(store_key) {
             return Ok(());
@@ -263,15 +309,21 @@ impl AcmeManager {
             .map_err(|e| format!("new_order for {store_key}: {e}"))?;
 
         // For each authorization, present the challenge then notify the server
-        // it is ready. HTTP-01 answers from the ChallengeStore; DNS-01 publishes
-        // a TXT record through the provider (removed on drop via the guard).
-        let challenge_type = match &self.dns_challenge {
-            Some(_) => ChallengeType::Dns01,
-            None => ChallengeType::Http01,
+        // it is ready. TLS-ALPN-01 serves a temporary certificate on 443;
+        // HTTP-01 answers from the ChallengeStore; DNS-01 publishes a TXT
+        // record through the provider (removed on drop via the guard).
+        let challenge_type = if self.tls_alpn_challenge {
+            ChallengeType::TlsAlpn01
+        } else {
+            match &self.dns_challenge {
+                Some(_) => ChallengeType::Dns01,
+                None => ChallengeType::Http01,
+            }
         };
         let challenge_label = match &challenge_type {
             ChallengeType::Dns01 => "DNS-01",
             ChallengeType::Http01 => "HTTP-01",
+            ChallengeType::TlsAlpn01 => "TLS-ALPN-01",
             _ => "challenge",
         };
         let mut dns_guard = match &self.dns_challenge {
@@ -281,6 +333,9 @@ impl AcmeManager {
             )),
             None => None,
         };
+        let mut tls_alpn_guard = self
+            .tls_alpn_challenge
+            .then(|| TlsAlpnGuard::new(self.tls_alpn_challenges.clone()));
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
             let mut authz = result.map_err(|e| format!("authorization for {store_key}: {e}"))?;
@@ -290,18 +345,28 @@ impl AcmeManager {
             let mut challenge = authz
                 .challenge(challenge_type.clone())
                 .ok_or_else(|| format!("no {challenge_label} challenge offered for {store_key}"))?;
-            let key_authorization = challenge.key_authorization().as_str().to_string();
-            match &mut dns_guard {
-                Some(guard) => {
-                    let handle = guard
-                        .provider
-                        .present(dns_name, &key_authorization)
-                        .map_err(|e| format!("dns-01 present for {store_key}: {e}"))?;
-                    guard.handles.push(handle);
-                }
-                None => {
-                    let token = challenge.token.clone();
-                    self.challenges.register(&token, &key_authorization);
+            let key_authorization = challenge.key_authorization();
+            if matches!(&challenge_type, ChallengeType::TlsAlpn01) {
+                let digest = key_authorization.digest();
+                tls_alpn_guard
+                    .as_mut()
+                    .expect("TLS-ALPN guard")
+                    .register(dns_name, digest.as_ref())
+                    .map_err(|e| format!("TLS-ALPN-01 present for {store_key}: {e}"))?;
+            } else {
+                match &mut dns_guard {
+                    Some(guard) => {
+                        let dns_value = key_authorization.dns_value();
+                        let handle = guard
+                            .provider
+                            .present(dns_name, &dns_value)
+                            .map_err(|e| format!("dns-01 present for {store_key}: {e}"))?;
+                        guard.handles.push(handle);
+                    }
+                    None => {
+                        let token = challenge.token.clone();
+                        self.challenges.register(&token, key_authorization.as_str());
+                    }
                 }
             }
             challenge

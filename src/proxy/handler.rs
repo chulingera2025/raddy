@@ -21,7 +21,7 @@
 
 use crate::config::ast::{
     AccessLogFormat, Cidr, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec, SiteKey,
-    TemplatePart, TerminalKind, UpstreamTls, ValueTemplate, Variable,
+    TemplatePart, TerminalKind, UpstreamHttpVersion, UpstreamTls, ValueTemplate, Variable,
 };
 use crate::config::snapshot::ConfigStore;
 use crate::proxy::compress;
@@ -482,7 +482,7 @@ impl ProxyHttp for ProxyHandler {
         let addr = lb_spec.upstreams[index].addr;
         let is_tls = lb_spec.upstreams[index].tls;
         let default_sni = lb_spec.upstreams[index].host.as_str();
-        let peer = if is_tls {
+        let mut peer = if is_tls {
             // A `https://` upstream (spec §5.4): TLS with the compiled options.
             // `UpstreamTls` is always present when any upstream is TLS (the
             // validator guarantees it), so fall back to plain HTTP defensively.
@@ -493,6 +493,14 @@ impl ProxyHttp for ProxyHandler {
         } else {
             HttpPeer::new(addr, false, String::new())
         };
+        match lb_spec.upstreams[index].http_version {
+            UpstreamHttpVersion::Auto => {}
+            UpstreamHttpVersion::H2 | UpstreamHttpVersion::H2c => {
+                // Pingora's connector uses ALPN for TLS H2. For plaintext, a
+                // minimum version of 2 selects the prior-knowledge h2c path.
+                peer.options.set_http_version(2, 2);
+            }
+        }
         Ok(Box::new(peer))
     }
 
@@ -975,7 +983,7 @@ fn challenge_token(path: &str) -> Option<&str> {
 /// The real client IP per the §4 trust model, or `None` when the peer address
 /// is unavailable (callers then fall back to the TCP peer).
 fn client_ip(session: &Session, trusted: &[Cidr]) -> Option<IpAddr> {
-    let peer = session.client_addr()?.as_inet()?.ip();
+    let peer = normalize_ip(session.client_addr()?.as_inet()?.ip());
     let xff = session
         .req_header()
         .headers
@@ -989,6 +997,7 @@ fn client_ip(session: &Session, trusted: &[Cidr]) -> Option<IpAddr> {
 /// proxy (malformed entries are skipped). When the whole chain is trusted or
 /// absent, the trusted peer itself is the client (spec §4).
 fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[Cidr]) -> IpAddr {
+    let peer = normalize_ip(peer);
     if trusted.iter().all(|cidr| !cidr.contains(peer)) {
         return peer;
     }
@@ -997,11 +1006,25 @@ fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[Cidr]) -> IpAdd
         let Ok(addr) = entry.trim().parse::<IpAddr>() else {
             continue;
         };
+        let addr = normalize_ip(addr);
         if trusted.iter().all(|cidr| !cidr.contains(addr)) {
             return addr;
         }
     }
     peer
+}
+
+/// Collapse IPv4-mapped IPv6 addresses produced by a dual-stack listener.
+/// This keeps IPv4 trusted-proxy CIDRs, rate-limit keys, logs, and matchers
+/// stable when the listener is bound on the IPv6 wildcard.
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(address) => address
+            .to_ipv4()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        IpAddr::V4(address) => IpAddr::V4(address),
+    }
 }
 
 /// All matchers must match for a terminal to serve (spec §5.9, ADR-012).
@@ -1445,6 +1468,16 @@ mod tests {
         // An all-trusted chain falls back to the trusted peer.
         assert_eq!(resolve_client_ip(peer, Some("2001:db8::2"), &t), peer);
         assert_eq!(resolve_client_ip(peer, None, &t), peer);
+    }
+
+    #[test]
+    fn client_ip_collapses_ipv4_mapped_peer() {
+        let peer = IpAddr::V6("::ffff:127.0.0.1".parse().unwrap());
+        let t = trusted(&["127.0.0.1"]);
+        assert_eq!(
+            resolve_client_ip(peer, Some("203.0.113.9"), &t),
+            ipv4(203, 0, 113, 9)
+        );
     }
 
     #[test]

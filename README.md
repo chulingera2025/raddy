@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml/badge.svg)](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/chulingera2025/raddy)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v0.3.0-blue)]()
+[![Version](https://img.shields.io/badge/version-v0.3.5-blue)]()
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)]()
 [中文文档](README.zh_CN.md)
 
@@ -33,8 +33,9 @@ models, limited extensibility). Raddy takes a different answer on three things:
   `handle` mutual-exclusion blocks, and no hidden ordering rules. See the
   [Raddyfile specification](docs/RADDYFILE_SPEC.md).
 - **Automatic HTTPS** — ACME issuance for named sites (HTTP-01 by default, or
-  **DNS-01** via `dns_challenge cloudflare <token>`), SNI dynamic certificates,
-  and an on-demand `ask` authorization callback.
+  **DNS-01** via `dns_challenge cloudflare <token>`, or TLS-ALPN-01 via
+  `tls_alpn_challenge`), SNI dynamic and wildcard certificates, and an
+  on-demand `ask` authorization callback.
 - **Config hot reload** — SIGHUP swaps the routing snapshot atomically; the
   upstream connection pools survive reloads (zero-interrupt).
 - **Static file serving + compression** — `file_server` with traversal
@@ -42,7 +43,8 @@ models, limited extensibility). Raddy takes a different answer on three things:
 - **Observability** — structured JSON access logs and a Prometheus `/metrics`
   endpoint (QPS + latency).
 - **Forwarding** — `reverse_proxy` with `to` multi-target round-robin, header
-  rewrites, redirects, and clean 400/404 fallbacks.
+  rewrites, upstream HTTP/2/h2c, multi-domain site blocks, IPv6 listeners,
+  redirects, and clean 400/404 fallbacks.
 - **Edge protection** — `rate_limit remote_ip` single-node token-bucket rate
   limiting, with `trusted_proxies` for the real client IP.
 - **Migration** — `raddy import caddyfile|nginx <file>` converts a common
@@ -50,8 +52,9 @@ models, limited extensibility). Raddy takes a different answer on three things:
   changes the Raddyfile grammar).
 - **Layer-4 proxying** — `tcp <address> { ... }` and `udp <address> { ... }`
   listeners proxy raw TCP connections and UDP datagrams (no HTTP parsing), with
-  load-balancing policies, SNI passthrough routing, idle/connect timeouts,
-  bounded connections/flows, health checks, DNS refresh, and metrics.
+  load-balancing policies, wildcard SNI passthrough, TLS termination,
+  transparent Linux routing, idle/connect timeouts, bounded connections/flows,
+  health checks, DNS refresh, lossless Linux UDP upgrades, and metrics.
 
 ## Quick start
 
@@ -118,16 +121,18 @@ and the global block.
 ## Development status
 
 The core implementation is complete: forwarding + hot reload, the Raddyfile
-parser (fuzz-verified, with line/column errors), ACME automatic HTTPS (verified
-against a local Pebble test CA, HTTP-01 + DNS-01, with automatic renewal),
-per-site TLS (static/internal certs, mTLS, TLS to upstreams), health checks and
+parser (fuzz-verified, with line/column errors), ACME automatic HTTPS
+(HTTP-01, DNS-01, and TLS-ALPN-01, with automatic renewal), per-site TLS
+(static/internal certs, mTLS, TLS to upstreams), upstream HTTP/2/h2c,
+multi-domain and wildcard routing, IPv6 listeners, health checks and
 load-balancing policies, single-node rate limiting with a trusted client-IP
 model, gzip/zstd/brotli compression (streaming, range-aware), structured JSON
 and common-format access logs, the Caddyfile/nginx migration tool, and
-zero-downtime binary upgrades. Layer-4 TCP, SNI passthrough, and UDP are
-implemented and covered by integration tests; UDP intentionally uses a restart
-path for upgrades. Release tooling ships a checksum-verified installer for
-Linux x86_64/aarch64 plus Docker.
+zero-downtime binary upgrades. Layer-4 TCP, SNI passthrough, UDP, TLS
+termination, transparent Linux routing, and UDP flow handoff are implemented
+and covered by integration tests. QUIC/HTTP/3 termination remains a separate
+sidecar boundary because Pingora 0.8.1 has no QUIC transport. Release tooling
+ships a checksum-verified installer for Linux x86_64/aarch64 plus Docker.
 
 ## License
 

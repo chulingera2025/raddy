@@ -29,6 +29,7 @@ description: 每一条 Raddyfile 指令的语法、参数与可运行示例。
 | [`access_log`](#access_log) | 配置访问日志(全局),或按站点关闭 | 配置 |
 | [`trusted_proxies`](#trusted_proxies) | 推导真实客户端 IP 的可信网络 | 配置 |
 | [`dns_challenge`](#dns_challenge) | 经 DNS 服务商(Cloudflare)做 DNS-01 签发 | 配置 |
+| [`tls_alpn_challenge`](#tls_alpn_challenge) | 在 443 上使用 TLS-ALPN-01 签发 | 配置 |
 | [`log_level`](#log_level) | 全局日志级别 | 配置 |
 | [`acme_email`](#acme_email) | ACME 注册邮箱 | 配置 |
 | [`import` / `(name)`](#import-and-snippets) | 多文件包含 / 可复用片段 | 配置(DX) |
@@ -106,7 +107,9 @@ reverse_proxy [<matcher>] {
 - `health_check { ... }` —— 对上游的主动健康检查。见[健康检查](#lb_policy-and-health_check)。
 - `<matcher>` —— 可选的内联[匹配器](#matchers)。
 
-**行为。** 目前上游使用 HTTP/1.1(上游 HTTP/2 是未来工作)。WebSocket 及其他
+**行为。** 上游默认使用 HTTP/1.1；`h2://host:port` 启用带 TLS 的 HTTP/2，
+`h2c://host:port` 启用明文先验 HTTP/2。`h2c://` 要求上游直接接受
+HTTP/2 connection preface，不使用 HTTP/1.1 Upgrade。WebSocket 及其他
 HTTP `Upgrade` 请求会被透明转发——见 [WebSocket 与协议升级](#websocket-and-protocol-upgrades)。
 
 **示例。**
@@ -654,6 +657,22 @@ api.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
+
+## `tls_alpn_challenge`
+
+**作用。** 当 80 端口不可达时，使用 ACME TLS-ALPN-01 替代 HTTP-01。
+
+**语法。**
+
+```caddyfile
+{
+    tls_alpn_challenge
+}
+```
+
+**行为。** 挑战在标准 TLS 443 上提供带 RFC 8737 `acmeIdentifier` 扩展和
+`acme-tls/1` ALPN 的临时证书。它与 `dns_challenge` 互斥，并要求
+ACME 站点使用 443 端口；不会回退到 HTTP-01。
 
 ## `log_level`
 

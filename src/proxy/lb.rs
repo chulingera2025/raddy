@@ -322,6 +322,7 @@ mod tests {
             .map(|s| UpstreamPeer {
                 addr: s.parse().expect("test upstream"),
                 tls: false,
+                http_version: crate::config::ast::UpstreamHttpVersion::Auto,
                 host: String::new(),
             })
             .collect();
@@ -425,6 +426,7 @@ mod tests {
         spec.upstreams.push(UpstreamPeer {
             addr: "10.0.0.1:443".parse().unwrap(),
             tls: true,
+            http_version: crate::config::ast::UpstreamHttpVersion::Auto,
             host: "b.example.com".into(),
         });
         let balancer = pool.balancer_for(&key, 0, spec);
@@ -453,6 +455,7 @@ mod tests {
         spec.upstreams.push(UpstreamPeer {
             addr: "10.0.0.1:443".parse().unwrap(),
             tls: true,
+            http_version: crate::config::ast::UpstreamHttpVersion::Auto,
             host: "b.example.com".into(),
         });
         let balancer = pool.balancer_for(&key, 0, spec);

@@ -71,7 +71,9 @@ A named site on port 443 gets a certificate automatically:
    [directive reference](../directives/#dns_challenge)). Because HTTP-01 is
    answered on a plain-HTTP listener, a config with named sites but no site on
    port 80 automatically binds an implicit `:80` listener that serves only the
-   ACME challenge; `dns_challenge` skips it.
+   ACME challenge; `dns_challenge` skips it. Set
+   `tls_alpn_challenge` in the global block to use TLS-ALPN-01 on 443
+   instead of HTTP-01.
 2. **SNI** — each HTTPS request's certificate is selected by the requested
    hostname, so a multi-site server serves the right certificate per site.
 3. **Caching** — certificates and account credentials are stored under
@@ -122,13 +124,34 @@ static.example.com {
 }
 ```
 
-> A shared site block for several domains (`a.com, b.com { ... }`) is not
-> supported yet — declare one block per host.
+Several domains can share one site block. Raddy clones the body into one
+independently routable site per host:
 
-## Not supported yet
+```caddyfile
+a.example.com, b.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
 
-- IPv6 literal addresses in site names or upstreams (`[::1]:8080`).
-- Shared multi-domain site blocks.
+Wildcard names match one left-most label only. An exact site takes precedence
+over a wildcard, and a wildcard never matches the apex or a multi-label name.
+
+## IPv6 site addresses
+
+IPv6 literal site names use brackets in both the Raddyfile and the HTTP Host
+header:
+
+```caddyfile
+[::1]:8080 {
+    tls internal
+    reverse_proxy [::1]:9000
+}
+```
+
+HTTP and TLS wildcard listeners are dual-stack, so IPv4 and IPv6 clients use
+the same site topology.
+
+## Fixed site-selection fallbacks
 - Configurable responses for the site-selection fallbacks (missing or unmatched
   Host → 400 / 404) — those two are fixed. Inside a site, the [`respond`](../directives/#respond)
   and [`error`](../directives/#error) terminals give you full control over

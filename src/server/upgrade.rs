@@ -27,6 +27,9 @@
 //! socket, then SIGQUIT the old process. Any failure aborts before the running
 //! instance is disturbed.
 
+use crate::config::ast::CompiledConfig;
+use crate::config::snapshot;
+use crate::layer4::udp::UdpProxy;
 use crate::server::startup::RunOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -60,6 +63,33 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
             pidfile.display()
         ));
     }
+    let snapshot = snapshot::build(config_path)
+        .map_err(|e| format!("cannot inspect config before upgrade: {e}"))?;
+    let topology_file = topology_path(pidfile);
+    let expected_topology = topology_signature(&snapshot);
+    let actual_topology = std::fs::read_to_string(&topology_file).map_err(|e| {
+        format!(
+            "cannot verify listener topology from {}: {e}; use a normal restart",
+            topology_file.display()
+        )
+    })?;
+    if actual_topology.trim() != expected_topology {
+        return Err(
+            "current config listener topology differs from the running instance; use a normal restart"
+                .to_string(),
+        );
+    }
+    if snapshot.layer4.iter().any(|listener| {
+        matches!(
+            listener,
+            crate::config::ast::Layer4Listener::Tcp(tcp) if tcp.transparent
+        )
+    }) {
+        return Err(
+            "transparent TCP listeners are not compatible with zero-downtime upgrade; use a restart"
+                .to_string(),
+        );
+    }
 
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot resolve own executable path: {e}"))?;
@@ -81,6 +111,7 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     // Drop any stale socket from a crashed upgrade so the readiness probe below
     // only ever observes the replacement's fresh socket.
     let _ = std::fs::remove_file(&opts.upgrade_sock);
+    cleanup_udp_handoff_files(&opts.upgrade_sock);
 
     eprintln!(
         "raddy: spawning replacement {} (waiting on {})",
@@ -105,6 +136,7 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     signal_quit(old_pid)?;
 
     wait_for_exit(old_pid, OLD_PROCESS_EXIT_TIMEOUT)?;
+    verify_udp_handoffs(&snapshot, &opts.upgrade_sock)?;
 
     // Confirm the replacement actually took over: the pidfile must now name a
     // different, live process. Without this check a race where the old process
@@ -118,6 +150,102 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
         ));
     }
     eprintln!("raddy: upgrade complete (now pid {new_pid})");
+    Ok(())
+}
+
+/// The sidecar file that records the immutable listener topology of a running
+/// process identified by pidfile.
+pub(crate) fn topology_path(pidfile: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.topology", pidfile.display()))
+}
+
+/// Compute a stable digest of HTTP, TLS, layer-4, and ACME listener topology.
+pub(crate) fn topology_signature(config: &CompiledConfig) -> String {
+    let mut input = String::new();
+    for key in crate::server::startup::http_listener_topology_keys(config) {
+        input.push_str(&key);
+        input.push('\n');
+    }
+    for key in crate::server::startup::l4_listener_topology_keys(config) {
+        input.push_str(&key);
+        input.push('\n');
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Persist the listener-topology digest next to the pidfile.
+pub(crate) fn write_topology_state(pidfile: &Path, config: &CompiledConfig) -> Result<(), String> {
+    let path = topology_path(pidfile);
+    std::fs::write(&path, topology_signature(config))
+        .map_err(|e| format!("failed to write topology state {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to protect topology state {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Remove exact UDP handoff artifacts from a previous interrupted upgrade.
+fn cleanup_udp_handoff_files(upgrade_sock: &str) {
+    let Some(parent) = Path::new(upgrade_sock).parent() else {
+        return;
+    };
+    let Some(prefix) = Path::new(upgrade_sock).file_name() else {
+        return;
+    };
+    let prefix = format!("{}.udp.", prefix.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Verify that every configured UDP listener completed its custom handoff.
+fn verify_udp_handoffs(config: &CompiledConfig, upgrade_sock: &str) -> Result<(), String> {
+    let udp_listeners: Vec<String> = config
+        .layer4
+        .iter()
+        .filter_map(|listener| match listener {
+            crate::config::ast::Layer4Listener::Udp(udp) => Some(udp.listen.display()),
+            _ => None,
+        })
+        .collect();
+    if udp_listeners.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for listener in udp_listeners {
+        let path = UdpProxy::status_path_for(upgrade_sock, &listener);
+        let status = loop {
+            if let Ok(status) = std::fs::read_to_string(&path) {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "UDP listener {listener} did not publish an upgrade status; use a normal restart"
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        if !status.trim().eq("ok") {
+            return Err(format!(
+                "UDP listener {listener} handoff failed: {}; use a normal restart",
+                status.trim()
+            ));
+        }
+    }
     Ok(())
 }
 

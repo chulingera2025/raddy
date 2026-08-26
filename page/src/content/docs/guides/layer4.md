@@ -1,13 +1,13 @@
 ---
 title: Layer 4 (TCP & UDP)
-description: Raw TCP and UDP proxying with the tcp and udp listeners — load balancing, timeouts, health checks, SNI routing, and DNS refresh.
+description: Raw TCP and UDP proxying with the tcp and udp listeners — load balancing, timeouts, health checks, wildcard SNI, TLS termination, transparent routing, and UDP handoff.
 ---
 
 Beyond HTTP, raddy can proxy raw TCP connections and UDP datagrams with the
 `tcp` and `udp` **top-level listeners** — peers of HTTP site blocks, not
 directives inside one. They own transport concepts only: upstream selection,
-timeouts, connection/flow limits, and relay. TLS is never terminated (a `tcp`
-listener with `sni` routes on the ClientHello and forwards it unchanged).
+timeouts, connection/flow limits, and relay. A plain TCP listener does not
+terminate TLS; an optional `tls` block can terminate TLS before the same relay.
 
 ## Raw TCP
 
@@ -56,10 +56,25 @@ tcp 0.0.0.0:443 {
 ```
 
 The ClientHello is inspected in a bounded prefix (never modified); the exact
-bytes are forwarded to the matched upstream. An unknown / absent / malformed
-SNI goes to `fallback` when set, otherwise the connection is closed. `sni` and
-`to` are mutually exclusive; wildcard names and `health_check` are not
-supported in SNI mode (v1).
+bytes are forwarded to the matched upstream. Exact names win over wildcards;
+wildcards match one left-most label only. An unknown / absent / malformed SNI
+goes to `fallback` when set, otherwise the connection is closed. `sni` and
+`to` are mutually exclusive; `health_check` is not supported in SNI mode.
+
+### Transparent TCP
+
+```caddyfile
+tcp :15000 {
+    transparent
+    to 127.0.0.1:8080
+}
+```
+
+On Linux, `transparent` enables `IP_TRANSPARENT`, uses the original destination
+from socket metadata when a TPROXY rule supplies it, and binds the outbound
+connection to the original client address. It requires `CAP_NET_ADMIN`,
+netfilter TPROXY rules, and policy routing. Transparent listeners are custom
+owned and therefore use a normal restart instead of `raddy upgrade`.
 
 ## UDP
 
@@ -81,9 +96,12 @@ udp :53 {
 - **Bounds** — `max_flows` caps the flow table (oldest-first eviction),
   `idle_timeout` evicts idle flows, `max_datagram_size` drops and counts
   oversized datagrams, `recv_buffer`/`send_buffer` size the sockets (0 = OS
-  default).
+  default). IPv4 and IPv6 upstreams are supported.
 - UDP and TCP may share an address and port.
 - Metrics: `raddy_l4_udp_*`.
-- **Zero-downtime upgrades do not apply to UDP**: the listener socket is bound
-  outside the fd-handoff mechanism, so `raddy upgrade` cannot serve a UDP
-  configuration — use a plain restart (flows reset).
+- **Zero-downtime upgrades preserve UDP flows on Linux**: raddy transfers the
+  listener fd, connected upstream flow fds, and bounded flow metadata before the
+  replacement starts receiving.
+- **QUIC passthrough** works through UDP because QUIC is carried in datagrams.
+  Pingora 0.8.1 does not provide QUIC/HTTP/3 termination, HTTP/3 routing, or
+  connection migration; use a dedicated QUIC/HTTP/3 sidecar for those.

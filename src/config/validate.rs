@@ -50,7 +50,51 @@ pub fn validate_and_compile(
                 format!("duplicate site '{}'", site.key.describe()),
             ));
         }
-        sites.push(compile_site(file, site)?);
+        let compiled = compile_site(file, site)?;
+        if let SiteKey::Named { host, port } = &compiled.key {
+            let acme = compiled
+                .tls
+                .as_ref()
+                .is_none_or(|tls| tls.source == TlsSource::Acme);
+            let tls_site = *port == 443 || compiled.tls.is_some();
+            if tls_site && acme && host.starts_with('[') {
+                return Err(validate_error(
+                    file,
+                    format!(
+                        "IP-literal site '{}' requires `tls internal` or a static certificate",
+                        compiled.key.describe()
+                    ),
+                ));
+            }
+            if tls_site
+                && acme
+                && host.starts_with("*.")
+                && raddyfile.global.dns_challenge.is_none()
+            {
+                return Err(validate_error(
+                    file,
+                    format!(
+                        "wildcard site '{}' requires the existing DNS-01 challenge configuration",
+                        compiled.key.describe()
+                    ),
+                ));
+            }
+        }
+        sites.push(compiled);
+    }
+    if raddyfile.global.tls_alpn_challenge
+        && sites.iter().any(|site| {
+            matches!(&site.key, SiteKey::Named { port, .. } if *port != 443)
+                && site
+                    .tls
+                    .as_ref()
+                    .is_none_or(|tls| tls.source == TlsSource::Acme)
+        })
+    {
+        return Err(validate_error(
+            file,
+            "TLS-ALPN-01 requires ACME sites to use the standard TLS port 443",
+        ));
     }
 
     let layer4 = validate_layer4(file, raddyfile)?;
@@ -108,6 +152,26 @@ fn validate_layer4(file: &str, raddyfile: &Raddyfile) -> Result<Vec<Layer4Listen
         }
         seen.push((transport, address.clone()));
     }
+    for listener in &raddyfile.layer4 {
+        let Layer4Listener::Tcp(tcp) = listener else {
+            continue;
+        };
+        if let Some(tls) = &tcp.tls {
+            if tls.source == TlsSource::Acme {
+                return Err(validate_error(
+                    file,
+                    "TCP TLS termination requires internal or a static certificate pair",
+                ));
+            }
+            validate_tls_config(file, tls)?;
+            if !tcp.sni_routes.is_empty() {
+                return Err(validate_error(
+                    file,
+                    "TCP TLS termination cannot be combined with SNI routing",
+                ));
+            }
+        }
+    }
     Ok(raddyfile.layer4.clone())
 }
 
@@ -122,6 +186,12 @@ fn binds_overlap(a: &ListenAddress, b: &ListenAddress) -> bool {
 }
 
 fn validate_global(file: &str, global: &GlobalConfig) -> Result<(), ConfigError> {
+    if global.dns_challenge.is_some() && global.tls_alpn_challenge {
+        return Err(validate_error(
+            file,
+            "dns_challenge and tls_alpn_challenge are mutually exclusive",
+        ));
+    }
     if let Some(email) = &global.acme_email {
         // Minimal shape check; full syntax validation belongs to the ACME
         // milestone (M4).
@@ -612,11 +682,15 @@ fn resolve_upstreams(
             // two hostnames resolving to the same IP:port each keep their scheme
             // and SNI (P2) — a TLS virtual host is not collapsed into the other.
             if !resolved.iter().any(|peer| {
-                peer.addr == addr && peer.tls == upstream.tls && peer.host == upstream.host
+                peer.addr == addr
+                    && peer.tls == upstream.tls
+                    && peer.http_version == upstream.http_version
+                    && peer.host == upstream.host
             }) {
                 resolved.push(UpstreamPeer {
                     addr,
                     tls: upstream.tls,
+                    http_version: upstream.http_version,
                     host: upstream.host.clone(),
                 });
             }
@@ -755,6 +829,35 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_acme_requires_dns_challenge_but_internal_is_allowed() {
+        let err = compile("*.example.com:443 {\n    reverse_proxy 127.0.0.1:1\n}\n").unwrap_err();
+        assert!(err.to_string().contains("requires the existing DNS-01"));
+
+        compile("*.example.com:443 {\n    tls internal\n    reverse_proxy 127.0.0.1:1\n}\n")
+            .expect("operator-supplied wildcard certificates do not need DNS-01");
+    }
+
+    #[test]
+    fn ip_literal_site_requires_operator_certificate_source() {
+        let err = compile("[::1]:443 {\n    reverse_proxy 127.0.0.1:1\n}\n").unwrap_err();
+        assert!(err.to_string().contains("IP-literal site"));
+        compile("[::1]:443 {\n    tls internal\n    reverse_proxy 127.0.0.1:1\n}\n")
+            .expect("internal certificates are valid for local IP sites");
+        compile("[::1]:8080 {\n    reverse_proxy 127.0.0.1:1\n}\n")
+            .expect("plain HTTP IP-literal sites do not need ACME");
+    }
+
+    #[test]
+    fn transparent_tcp_mode_cannot_use_tls_termination() {
+        let err = parse(
+            "test",
+            "tcp :15000 {\n    transparent\n    tls internal\n    to 127.0.0.1:9000\n}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("transparent mode"));
+    }
+
+    #[test]
     fn rejects_empty_sites() {
         let err = compile("").unwrap_err();
         assert!(err.to_string().contains("no sites"));
@@ -869,6 +972,7 @@ mod tests {
             host: host.to_string(),
             port,
             tls: false,
+            http_version: UpstreamHttpVersion::Auto,
             resolved: None,
         }
     }
@@ -879,6 +983,7 @@ mod tests {
             host: host.to_string(),
             port,
             tls: true,
+            http_version: UpstreamHttpVersion::Auto,
             resolved: None,
         }
     }

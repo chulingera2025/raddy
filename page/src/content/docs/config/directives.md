@@ -31,6 +31,7 @@ fit together.
 | [`access_log`](#access_log) | Configure access logging (global), or disable per site | config |
 | [`trusted_proxies`](#trusted_proxies) | Trusted networks for the real client IP | config |
 | [`dns_challenge`](#dns_challenge) | DNS-01 issuance via a DNS provider (Cloudflare) | config |
+| [`tls_alpn_challenge`](#tls_alpn_challenge) | TLS-ALPN-01 issuance on port 443 | config |
 | [`log_level`](#log_level) | Global log level | config |
 | [`acme_email`](#acme_email) | ACME registration email | config |
 | [`import` / `(name)`](#import-and-snippets) | Multi-file includes / reusable snippets | config (DX) |
@@ -113,8 +114,11 @@ reverse_proxy [<matcher>] {
   [health checks](#lb_policy-and-health_check).
 - `<matcher>` — an optional inline [matcher](#matchers).
 
-**Behavior.** Upstreams are HTTP/1.1 today (upstream HTTP/2 is future work).
-WebSocket and other HTTP `Upgrade` requests are forwarded transparently — see
+**Behavior.** Upstreams are HTTP/1.1 by default. Use `h2://host:port` for
+TLS HTTP/2 or `h2c://host:port` for cleartext prior-knowledge HTTP/2.
+The h2c form requires the upstream to accept the HTTP/2 connection preface
+directly; it does not use HTTP/1.1 Upgrade. WebSocket and other HTTP
+`Upgrade` requests are forwarded transparently — see
 [WebSocket and protocol upgrades](#websocket-and-protocol-upgrades).
 
 **Example.**
@@ -687,6 +691,25 @@ api.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
+
+## `tls_alpn_challenge`
+
+**Purpose.** Use ACME TLS-ALPN-01 instead of HTTP-01 when port 80 is
+unreachable.
+
+**Syntax.**
+
+```caddyfile
+{
+    tls_alpn_challenge
+}
+```
+
+**Behavior.** The challenge is served on the standard TLS port 443 with a
+temporary certificate containing the RFC 8737 `acmeIdentifier` extension and the
+`acme-tls/1` ALPN protocol. It is mutually exclusive with
+`dns_challenge` and requires ACME sites to use port 443. There is no
+HTTP-01 fallback.
 
 ## `log_level`
 

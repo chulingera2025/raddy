@@ -615,7 +615,7 @@ impl<'a> Parser<'a> {
                 // Layer-4 listener blocks (L4_PROXY_PLAN): peers of HTTP sites.
                 "tcp" => layer4.push(self.parse_layer4_tcp(&words, block_open)?),
                 "udp" => layer4.push(self.parse_layer4_udp(&words, block_open)?),
-                _ => sites.push(self.parse_site(&words, block_open)?),
+                _ => sites.extend(self.parse_site(&words, block_open)?),
             }
         }
         Ok(Raddyfile {
@@ -625,25 +625,86 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_site(&mut self, words: &[String], block_open: bool) -> Result<Site, ConfigError> {
-        if words.len() != 1 {
-            return Err(self.err("expected a site address such as ':8080' or 'example.com'"));
-        }
+    fn parse_site(&mut self, words: &[String], block_open: bool) -> Result<Vec<Site>, ConfigError> {
         if !block_open {
             return Err(self.err("expected '{' after site address"));
         }
-        let key = self.parse_site_key(&words[0])?;
+        let keys = self.parse_site_keys(words)?;
         let directives = self.parse_directive_block()?;
-        Ok(Site { key, directives })
+        Ok(keys
+            .into_iter()
+            .map(|key| Site {
+                key,
+                directives: directives.clone(),
+            })
+            .collect())
+    }
+
+    /// Parse one or more comma-separated site addresses. Commas may be
+    /// attached to an address (`a.example.com,`) or written as a standalone
+    /// token, but adjacent addresses without a comma are rejected.
+    fn parse_site_keys(&self, words: &[String]) -> Result<Vec<SiteKey>, ConfigError> {
+        if words.is_empty() {
+            return Err(self.err("expected a site address such as ':8080' or 'example.com'"));
+        }
+        let mut addresses = Vec::new();
+        let mut need_address = true;
+        for token in words {
+            if token == "," {
+                if need_address {
+                    return Err(self.err("empty site address in comma-separated list"));
+                }
+                need_address = true;
+                continue;
+            }
+            let mut remainder = token.as_str();
+            loop {
+                if remainder.is_empty() {
+                    break;
+                }
+                if !need_address {
+                    return Err(self.err("multiple site addresses must be separated by commas"));
+                }
+                if let Some((address, tail)) = remainder.split_once(',') {
+                    if address.is_empty() {
+                        return Err(self.err("empty site address in comma-separated list"));
+                    }
+                    addresses.push(address.to_string());
+                    need_address = true;
+                    remainder = tail;
+                } else {
+                    addresses.push(remainder.to_string());
+                    need_address = false;
+                    break;
+                }
+            }
+        }
+        if need_address {
+            return Err(self.err("site address list must not end with a comma"));
+        }
+        addresses
+            .iter()
+            .map(|address| self.parse_site_key(address))
+            .collect()
     }
 
     fn parse_site_key(&self, addr: &str) -> Result<SiteKey, ConfigError> {
-        if addr.starts_with('[') {
-            return Err(self.err("IPv6 listener addresses are not supported for HTTP sites"));
-        }
         if let Some(port_str) = addr.strip_prefix(':') {
             let port = self.parse_port(port_str)?;
             Ok(SiteKey::CatchAll { port })
+        } else if addr.starts_with('[') {
+            let (host, port) = if addr.ends_with(']') {
+                (&addr[1..addr.len() - 1], NAMED_SITE_DEFAULT_PORT)
+            } else {
+                split_host_port(addr).map_err(|m| self.err(m))?
+            };
+            let ip = host.parse::<std::net::Ipv6Addr>().map_err(|_| {
+                self.err("HTTP IPv6 site addresses must contain a valid IPv6 literal")
+            })?;
+            Ok(SiteKey::Named {
+                host: format!("[{ip}]"),
+                port,
+            })
         } else {
             match addr.rsplit_once(':') {
                 Some((host, port_str)) => {
@@ -979,6 +1040,8 @@ impl<'a> Parser<'a> {
         let mut health_check: Option<TcpHealthCheckSpec> = None;
         let mut sni_routes: Vec<SniRoute> = Vec::new();
         let mut sni_fallback: Option<L4Upstream> = None;
+        let mut tls: Option<TlsConfig> = None;
+        let mut transparent = false;
         loop {
             match self.peek() {
                 Some(Token {
@@ -1058,10 +1121,8 @@ impl<'a> Parser<'a> {
                     if line.len() != 3 {
                         return Err(self.err("sni requires: sni <name> <host:port>"));
                     }
-                    let name = line[1].to_ascii_lowercase();
-                    if name.is_empty() || name.contains('*') {
-                        return Err(self.err("invalid sni name (exact match only in v1)"));
-                    }
+                    let name =
+                        normalize_host_name(&line[1]).map_err(|_| self.err("invalid sni name"))?;
                     if sni_routes.iter().any(|r| r.name == name) {
                         return Err(self.err(format!("duplicate sni route for '{name}'")));
                     }
@@ -1080,6 +1141,21 @@ impl<'a> Parser<'a> {
                     }
                     sni_fallback = Some(parse_l4_upstream(&line[1]).map_err(|m| self.err(m))?);
                 }
+                "tls" => {
+                    let Directive::Tls { config } = self.parse_tls(&line, nested)? else {
+                        unreachable!("parse_tls always returns Directive::Tls");
+                    };
+                    Self::merge_tls_config(&mut tls, &config);
+                }
+                "transparent" => {
+                    if nested {
+                        return Err(self.err("unexpected '{' after transparent"));
+                    }
+                    if line.len() != 1 {
+                        return Err(self.err("transparent takes no arguments"));
+                    }
+                    transparent = true;
+                }
                 other => return Err(self.err(format!("unknown tcp directive '{other}'"))),
             }
         }
@@ -1088,6 +1164,9 @@ impl<'a> Parser<'a> {
         // only to `to` mode (per-route health is a P1 follow-up), so the
         // combination is rejected rather than silently ignored.
         if !sni_routes.is_empty() {
+            if tls.is_some() {
+                return Err(self.err("TLS termination cannot be combined with SNI routing"));
+            }
             if !upstreams.is_empty() {
                 return Err(self.err("sni routing cannot be combined with `to`"));
             }
@@ -1095,6 +1174,9 @@ impl<'a> Parser<'a> {
                 return Err(self.err(
                     "sni routing does not support health_check (per-route health is planned)",
                 ));
+            }
+            if transparent {
+                return Err(self.err("transparent mode cannot be combined with SNI routing"));
             }
         } else {
             if sni_fallback.is_some() {
@@ -1105,8 +1187,13 @@ impl<'a> Parser<'a> {
                     .err("tcp requires at least one upstream (to <host>:<port> ... or sni ...)"));
             }
         }
+        if transparent && tls.is_some() {
+            return Err(self.err("transparent mode cannot be combined with TLS termination"));
+        }
         let tcp = TcpProxyConfig {
             listen,
+            tls,
+            transparent,
             upstreams,
             lb_policy: lb_policy.unwrap_or(LbPolicy::RoundRobin),
             connect_timeout: connect_timeout.unwrap_or(Duration::from_secs(5)),
@@ -1122,6 +1209,28 @@ impl<'a> Parser<'a> {
             return Err(self.err("tcp connect_timeout and idle_timeout must be greater than zero"));
         }
         Ok(Layer4Listener::Tcp(tcp))
+    }
+
+    /// Merge one TCP listener TLS line into its accumulated settings.
+    /// Source and each option follow the same last-value-wins rules as HTTP
+    /// site TLS configuration.
+    fn merge_tls_config(target: &mut Option<TlsConfig>, config: &TlsConfig) {
+        let target = target.get_or_insert_with(TlsConfig::default);
+        if config.source != TlsSource::Acme {
+            target.source = config.source.clone();
+        }
+        if config.min_version.is_some() {
+            target.min_version = config.min_version;
+        }
+        if config.max_version.is_some() {
+            target.max_version = config.max_version;
+        }
+        if config.ciphers.is_some() {
+            target.ciphers = config.ciphers.clone();
+        }
+        if config.client_auth.is_some() {
+            target.client_auth = config.client_auth.clone();
+        }
     }
 
     /// Parse a `udp <address> { ... }` layer-4 listener block (L4 P2).
@@ -1323,23 +1432,33 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_upstream(&self, s: &str) -> Result<Upstream, ConfigError> {
-        // Optional scheme prefix decides whether the upstream connection is TLS
-        // (spec §5.4); a bare `host:port` stays plain HTTP.
-        let (tls, rest) = if let Some(r) = s.strip_prefix("https://") {
-            (true, r)
+        // The scheme chooses both transport security and HTTP version. Bare
+        // and `http://` targets preserve the existing HTTP/1.1 default;
+        // `h2://` uses TLS + ALPN h2, while `h2c://` uses cleartext prior-
+        // knowledge HTTP/2.
+        let (tls, http_version, rest) = if let Some(r) = s.strip_prefix("h2://") {
+            (true, UpstreamHttpVersion::H2, r)
+        } else if let Some(r) = s.strip_prefix("h2c://") {
+            (false, UpstreamHttpVersion::H2c, r)
+        } else if let Some(r) = s.strip_prefix("https://") {
+            (true, UpstreamHttpVersion::Auto, r)
         } else if let Some(r) = s.strip_prefix("http://") {
-            (false, r)
+            (false, UpstreamHttpVersion::Auto, r)
         } else {
-            (false, s)
+            (false, UpstreamHttpVersion::Auto, s)
         };
-        if rest.starts_with('[') {
-            return Err(
-                self.err("IPv6 upstream addresses are not supported for HTTP reverse_proxy")
-            );
-        }
-        let (host, port_str) = rest
-            .rsplit_once(':')
-            .ok_or_else(|| self.err(format!("upstream '{s}' must be host:port")))?;
+        let (host, port_str) = if let Some(rest) = rest.strip_prefix('[') {
+            let (host, port) = rest
+                .split_once("]:")
+                .ok_or_else(|| self.err(format!("upstream '{s}' must be [host]:port")))?;
+            if host.is_empty() || host.contains('[') || host.contains(']') {
+                return Err(self.err(format!("upstream '{s}' has an invalid IPv6 host")));
+            }
+            (host, port)
+        } else {
+            rest.rsplit_once(':')
+                .ok_or_else(|| self.err(format!("upstream '{s}' must be host:port")))?
+        };
         if host.is_empty() {
             return Err(self.err("empty host in upstream address"));
         }
@@ -1348,6 +1467,7 @@ impl<'a> Parser<'a> {
             host: host.to_string(),
             port,
             tls,
+            http_version,
             resolved: None,
         })
     }
@@ -1941,6 +2061,12 @@ impl<'a> Parser<'a> {
                     api_token: words[2].clone(),
                 });
             }
+            "tls_alpn_challenge" => {
+                if words.len() != 1 {
+                    return Err(self.err("tls_alpn_challenge takes no arguments"));
+                }
+                global.tls_alpn_challenge = true;
+            }
             "access_log" => {
                 global.access_log = Some(self.parse_access_log_directive(words)?);
             }
@@ -2021,11 +2147,10 @@ pub fn strip_matcher_wildcard(path: &str) -> &str {
 
 /// Normalize and validate a site hostname: an ASCII DNS hostname with non-empty
 /// labels of `[A-Za-z0-9-]`, no leading/trailing `-`, at most 253 chars total
-/// and 63 per label. One trailing dot (FQDN form) is stripped; single-label
-/// hosts such as `localhost` are allowed. Whitespace, slashes, backslashes,
-/// colons, empty labels, and non-ASCII characters are rejected — a host that
-/// cannot be a real DNS name could never match a request (and would make the
-/// config a footgun for SNI/ACME).
+/// and 63 per label. One leading `*.` is accepted as a one-label wildcard.
+/// One trailing dot (FQDN form) is stripped; single-label hosts such as
+/// `localhost` are allowed. Whitespace, slashes, backslashes, colons, empty
+/// labels, and non-ASCII characters are rejected.
 fn normalize_host_name(host: &str) -> Result<String, String> {
     if host.chars().any(char::is_whitespace) {
         return Err("site hostname must not contain whitespace".to_string());
@@ -2041,6 +2166,14 @@ fn normalize_host_name(host: &str) -> Result<String, String> {
     }
     if host.len() > 253 {
         return Err("site hostname is too long (max 253 chars)".to_string());
+    }
+    let (wildcard, host) = match host.strip_prefix("*.") {
+        Some(suffix) if !suffix.is_empty() => (true, suffix),
+        Some(_) => return Err("wildcard site hostname must include a suffix".to_string()),
+        None => (false, host),
+    };
+    if host.contains('*') {
+        return Err("wildcard is only allowed as the leading '*.' label".to_string());
     }
     for label in host.split('.') {
         if label.is_empty() {
@@ -2059,7 +2192,12 @@ fn normalize_host_name(host: &str) -> Result<String, String> {
             return Err("site hostname label must not start or end with '-'".to_string());
         }
     }
-    Ok(host.to_ascii_lowercase())
+    let normalized = host.to_ascii_lowercase();
+    Ok(if wildcard {
+        format!("*.{normalized}")
+    } else {
+        normalized
+    })
 }
 
 /// Parse a layer-4 listen address (L4_PROXY_PLAN): `:PORT` (IPv4 wildcard),
@@ -2192,12 +2330,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_multi_domain_site_block() {
+        let input = "a.example.com, b.example.com {\n    respond 200 shared\n}\n";
+        let rf = parse("test", input).unwrap();
+        assert_eq!(rf.sites.len(), 2);
+        assert!(matches!(
+            &rf.sites[0].key,
+            SiteKey::Named { host, port: 443 } if host == "a.example.com"
+        ));
+        assert!(matches!(
+            &rf.sites[1].key,
+            SiteKey::Named { host, port: 443 } if host == "b.example.com"
+        ));
+        assert_eq!(rf.sites[0].directives.len(), 1);
+        assert_eq!(rf.sites[1].directives.len(), 1);
+    }
+
+    #[test]
     fn parses_dns_challenge_cloudflare() {
         let input = "{ dns_challenge cloudflare abc123 }\napi.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
         let rf = parse("test", input).unwrap();
         let challenge = rf.global.dns_challenge.expect("dns_challenge parsed");
         assert_eq!(challenge.provider, DnsProviderKind::Cloudflare);
         assert_eq!(challenge.api_token, "abc123");
+    }
+
+    #[test]
+    fn parses_tls_alpn_challenge() {
+        let rf = parse("test", "{ tls_alpn_challenge }\napi.example.com {\n}\n").unwrap();
+        assert!(rf.global.tls_alpn_challenge);
+    }
+
+    #[test]
+    fn rejects_tls_alpn_challenge_arguments() {
+        let err = parse("test", "{ tls_alpn_challenge yes }\n").unwrap_err();
+        assert!(err.to_string().contains("takes no arguments"));
     }
 
     #[test]
@@ -2354,6 +2521,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_tcp_tls_termination() {
+        let rf = parse(
+            "test",
+            "tcp :3306 {\n    tls internal\n    tls min_version 1.3\n    to 127.0.0.1:9000\n}\n",
+        )
+        .unwrap();
+        let Layer4Listener::Tcp(tcp) = &rf.layer4[0] else {
+            panic!("expected a tcp listener");
+        };
+        let tls = tcp.tls.as_ref().expect("TCP TLS settings");
+        assert_eq!(tls.source, TlsSource::Internal);
+        assert_eq!(tls.min_version, Some(TlsVersion::Tls13));
+    }
+
+    #[test]
+    fn parses_transparent_tcp_mode() {
+        let rf = parse(
+            "test",
+            "tcp :15000 {\n    transparent\n    to 127.0.0.1:9000\n}\n",
+        )
+        .unwrap();
+        let Layer4Listener::Tcp(tcp) = &rf.layer4[0] else {
+            panic!("expected a tcp listener");
+        };
+        assert!(tcp.transparent);
+        assert_eq!(tcp.upstreams.len(), 1);
+    }
+
+    #[test]
     fn parses_ipv6_tcp_listener_and_upstream() {
         // L4 addresses accept bracketed IPv6 (the HTTP site parser rejects it).
         let rf = parse("test", "tcp [::1]:8080 {\n    to [::1]:9090\n}\n").unwrap();
@@ -2364,6 +2560,28 @@ mod tests {
         assert!(!tcp.listen.is_wildcard());
         assert_eq!(tcp.upstreams[0].host, "::1");
         assert_eq!(tcp.upstreams[0].port, 9090);
+    }
+
+    #[test]
+    fn parses_h2_and_h2c_upstream_schemes() {
+        let rf = parse(
+            "test",
+            ":8080 {\n    reverse_proxy h2://api.example.com:443\n}\n",
+        )
+        .unwrap();
+        let Directive::ReverseProxy { to, .. } = &rf.sites[0].directives[0] else {
+            panic!("expected reverse_proxy");
+        };
+        assert!(to[0].tls);
+        assert_eq!(to[0].http_version, UpstreamHttpVersion::H2);
+
+        let rf = parse("test", ":8080 {\n    reverse_proxy h2c://[::1]:9000\n}\n").unwrap();
+        let Directive::ReverseProxy { to, .. } = &rf.sites[0].directives[0] else {
+            panic!("expected reverse_proxy");
+        };
+        assert!(!to[0].tls);
+        assert_eq!(to[0].http_version, UpstreamHttpVersion::H2c);
+        assert_eq!(to[0].host, "::1");
     }
 
     #[test]
@@ -2479,10 +2697,19 @@ mod tests {
             message.contains("fallback requires sni routing"),
             "got: {message}"
         );
-        // Wildcard SNI is rejected (P1: exact match only).
-        let message = parse(
+        // One-label wildcard SNI is valid; malformed wildcard placement is not.
+        let rf = parse(
             "test",
             "tcp :443 {\n    sni *.example.com 10.0.0.1:9001\n}\n",
+        )
+        .unwrap();
+        let Layer4Listener::Tcp(tcp) = &rf.layer4[0] else {
+            panic!("expected tcp listener")
+        };
+        assert_eq!(tcp.sni_routes[0].name, "*.example.com");
+        let message = parse(
+            "test",
+            "tcp :443 {\n    sni api.*.example.com 10.0.0.1:9001\n}\n",
         )
         .unwrap_err()
         .to_string();
@@ -2630,6 +2857,7 @@ mod tests {
             ("sub-domain.example.com", "sub-domain.example.com"),
             ("xn--bcher-kva.example", "xn--bcher-kva.example"),
             ("a", "a"),
+            ("*.Example.COM.", "*.example.com"),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -2643,22 +2871,24 @@ mod tests {
     #[test]
     fn rejects_invalid_host_names() {
         let mut cases: Vec<String> = vec![
-            "".into(),                 // empty
-            ".".into(),                // only a trailing dot
-            "..".into(),               // double dot
-            "foo bar".into(),          // whitespace
-            "foo\tbar".into(),         // tab
-            "example.com:8080".into(), // colon (must be split as a port first)
-            "foo/bar.com".into(),      // slash
-            "foo\\bar.com".into(),     // backslash
-            "../../tmp/x".into(),      // path traversal
-            "foo..com".into(),         // empty label
-            ".com".into(),             // leading empty label
-            "example.com..".into(),    // trailing double dot
-            "-foo.com".into(),         // label leading hyphen
-            "foo-.com".into(),         // label trailing hyphen
-            "-foo-.com".into(),        // both
-            "例え.jp".into(),          // non-ASCII
+            "".into(),                  // empty
+            ".".into(),                 // only a trailing dot
+            "..".into(),                // double dot
+            "foo bar".into(),           // whitespace
+            "foo\tbar".into(),          // tab
+            "example.com:8080".into(),  // colon (must be split as a port first)
+            "foo/bar.com".into(),       // slash
+            "foo\\bar.com".into(),      // backslash
+            "../../tmp/x".into(),       // path traversal
+            "foo..com".into(),          // empty label
+            ".com".into(),              // leading empty label
+            "example.com..".into(),     // trailing double dot
+            "-foo.com".into(),          // label leading hyphen
+            "foo-.com".into(),          // label trailing hyphen
+            "-foo-.com".into(),         // both
+            "例え.jp".into(),           // non-ASCII
+            "api.*.example.com".into(), // wildcard in a non-leading label
+            "*".into(),                 // wildcard without a suffix
         ];
         // A label longer than 63 chars and a host longer than 253 chars.
         cases.push(format!("{}.com", "a".repeat(64)));
@@ -2710,6 +2940,8 @@ mod tests {
             (":0", false),                  // zero port
             ("foo.com:0", false),           // zero port
             ("foo:bar", false),             // non-numeric port
+            ("[::1]:8080", true),           // bracketed IPv6 literal
+            ("[::1]", true),                // IPv6 site with the default port
         ];
 
         for (addr, valid) in cases {

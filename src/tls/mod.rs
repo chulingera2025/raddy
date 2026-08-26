@@ -22,14 +22,18 @@
 //! Each stored certificate also records its `notAfter` (M8) so the renewal
 //! scheduler can re-issue before expiry.
 
-use crate::config::ast::{ClientAuthMode, SiteKey, TlsConfig, TlsVersion};
+use crate::config::ast::{
+    host_pattern_matches, wildcard_match_specificity, ClientAuthMode, SiteKey, TlsConfig,
+    TlsVersion,
+};
 use crate::config::snapshot::ConfigStore;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use openssl::ssl::{SslVerifyMode, SslVersion};
+use openssl::ex_data::Index;
+use openssl::ssl::{AlpnError, Ssl, SslRef, SslVerifyMode, SslVersion};
 use openssl::x509::store::{X509Store, X509StoreBuilder};
 use pingora::listeners::TlsAccept;
 use pingora::protocols::tls::TlsRef;
@@ -151,6 +155,134 @@ pub fn cert_store_key(host: &str, port: u16) -> String {
     }
 }
 
+/// Temporary certificate store for active ACME TLS-ALPN-01 challenges.
+/// Entries exist only for the lifetime of an issuance attempt and are never
+/// persisted or considered application certificates.
+#[derive(Debug, Default)]
+pub struct TlsAlpnChallengeStore {
+    certs: RwLock<HashMap<String, Arc<CertKey>>>,
+}
+
+impl TlsAlpnChallengeStore {
+    /// Create an empty TLS-ALPN-01 challenge store.
+    ///
+    /// Returns a store with no active challenge certificates.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Generate and register the RFC 8737 challenge certificate for host.
+    ///
+    /// Parameters: host is the validated ACME identifier; digest is the
+    /// 32-byte SHA-256 key-authorization digest.
+    ///
+    /// Errors are returned for invalid digest size, key generation,
+    /// certificate generation, or PEM conversion.
+    pub fn register(&self, host: &str, digest: &[u8]) -> Result<(), String> {
+        if digest.len() != 32 {
+            return Err("TLS-ALPN challenge digest must be 32 bytes".to_string());
+        }
+        let mut params = rcgen::CertificateParams::new(vec![host.to_string()])
+            .map_err(|e| format!("TLS-ALPN challenge certificate parameters: {e}"))?;
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::new_acme_identifier(digest));
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::minutes(5);
+        params.not_after = now + time::Duration::days(7);
+        let key = rcgen::KeyPair::generate()
+            .map_err(|e| format!("TLS-ALPN challenge key generation: {e}"))?;
+        let cert = params
+            .self_signed(&key)
+            .map_err(|e| format!("TLS-ALPN challenge certificate generation: {e}"))?;
+        let cert = cert_key_from_pem(&cert.pem(), &key.serialize_pem())?;
+        self.certs
+            .write()
+            .expect("TLS-ALPN challenge store lock poisoned")
+            .insert(host.to_ascii_lowercase(), Arc::new(cert));
+        Ok(())
+    }
+
+    /// Remove a challenge certificate for host after validation finishes.
+    ///
+    /// The host parameter is the ACME identifier to remove.
+    pub fn remove(&self, host: &str) {
+        self.certs
+            .write()
+            .expect("TLS-ALPN challenge store lock poisoned")
+            .remove(&host.to_ascii_lowercase());
+    }
+
+    /// Return the currently active challenge certificate for host.
+    ///
+    /// The host parameter is the requested SNI hostname. Returns the active
+    /// certificate, or no value when no challenge is registered.
+    pub fn get(&self, host: &str) -> Option<Arc<CertKey>> {
+        self.certs
+            .read()
+            .expect("TLS-ALPN challenge store lock poisoned")
+            .get(&host.to_ascii_lowercase())
+            .cloned()
+    }
+}
+
+/// Per-SSL marker set by the OpenSSL ClientHello callback when the client
+/// offered acme-tls/1 for an authorized active challenge.
+static ALPN_CHALLENGE_INDEX: OnceLock<Index<Ssl, bool>> = OnceLock::new();
+
+fn alpn_challenge_index() -> &'static Index<Ssl, bool> {
+    ALPN_CHALLENGE_INDEX.get_or_init(|| Ssl::new_ex_index::<bool>().expect("allocate SSL index"))
+}
+
+/// Configure a TLS listener to select acme-tls/1 for active TLS-ALPN-01
+/// challenges, while retaining the normal h2/http-1.1 selection.
+///
+/// The settings parameter is the Pingora OpenSSL TLS listener configuration;
+/// challenges is the process-local active challenge store.
+pub fn configure_http_alpn(
+    settings: &mut pingora::listeners::tls::TlsSettings,
+    challenges: Arc<TlsAlpnChallengeStore>,
+) {
+    configure_alpn_builder(&mut *settings, challenges);
+}
+
+/// Install the shared ALPN selector on an OpenSSL acceptor builder.
+fn configure_alpn_builder(
+    settings: &mut pingora::tls::ssl::SslAcceptorBuilder,
+    challenges: Arc<TlsAlpnChallengeStore>,
+) {
+    settings.set_alpn_select_callback(move |ssl: &mut SslRef, client| {
+        let host = ssl
+            .servername(NameType::HOST_NAME)
+            .map(str::to_ascii_lowercase);
+        let offered_challenge = host
+            .as_deref()
+            .is_some_and(|host| challenges.get(host).is_some())
+            && client_offers_alpn(client, b"acme-tls/1");
+        ssl.set_ex_data(*alpn_challenge_index(), offered_challenge);
+        if offered_challenge {
+            return openssl::ssl::select_next_proto(b"\x0aacme-tls/1", client)
+                .ok_or(AlpnError::NOACK);
+        }
+        openssl::ssl::select_next_proto(b"\x02h2\x08http/1.1", client).ok_or(AlpnError::NOACK)
+    });
+}
+
+/// Check whether a client ALPN wire list contains protocol.
+fn client_offers_alpn(mut client: &[u8], protocol: &[u8]) -> bool {
+    while let Some((&length, rest)) = client.split_first() {
+        let length = length as usize;
+        if rest.len() < length {
+            return false;
+        }
+        if &rest[..length] == protocol {
+            return true;
+        }
+        client = &rest[length..];
+    }
+    false
+}
+
 /// The `notAfter` of the leaf certificate as a `SystemTime`.
 fn leaf_not_after(cert: &CertKey) -> Option<SystemTime> {
     let not_after = cert.leaf().not_after();
@@ -192,17 +324,152 @@ pub struct SniCallback {
     /// handshake. (The `X509Store` itself is built per handshake — it is not
     /// `Clone`.)
     ca_cache: Mutex<HashMap<String, Arc<Vec<X509>>>>,
+    alpn_challenges: Arc<TlsAlpnChallengeStore>,
+}
+
+/// A TLS callback that serves one operator-selected certificate to every
+/// connection. It is used by raw TCP TLS termination, where there is no HTTP
+/// site snapshot to select an ACME certificate from.
+pub struct StaticCertCallback {
+    cert: Arc<CertKey>,
+    options: Option<TlsConfig>,
+    ca_cache: Mutex<HashMap<String, Arc<Vec<X509>>>>,
+}
+
+impl StaticCertCallback {
+    /// Create a callback that installs cert during each server handshake.
+    ///
+    /// The cert parameter is the certificate chain and private key. The
+    /// returned callback serves it without additional options.
+    pub fn new(cert: CertKey) -> Self {
+        Self::with_options(cert, None)
+    }
+
+    /// Create a callback that installs cert and applies the supplied TLS
+    /// version, cipher, and client-authentication options.
+    ///
+    /// The cert parameter is the certificate chain and private key; options
+    /// contains optional protocol, cipher, and client-auth settings. The
+    /// returned callback applies them during handshakes.
+    pub fn with_options(cert: CertKey, options: Option<TlsConfig>) -> Self {
+        Self {
+            cert: Arc::new(cert),
+            options,
+            ca_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Load and cache the CA certificates used for raw TCP mTLS.
+    fn ca_certs(&self, path: &str) -> Option<Arc<Vec<X509>>> {
+        if let Ok(cache) = self.ca_cache.lock() {
+            if let Some(certs) = cache.get(path) {
+                return Some(certs.clone());
+            }
+        }
+        let pem = match std::fs::read_to_string(path) {
+            Ok(pem) => pem,
+            Err(error) => {
+                tracing::error!("TCP TLS client-auth CA file {path} is unreadable: {error}");
+                return None;
+            }
+        };
+        let certs = match X509::stack_from_pem(pem.as_bytes()) {
+            Ok(certs) => Arc::new(certs),
+            Err(error) => {
+                tracing::error!("TCP TLS client-auth CA file {path} is invalid: {error}");
+                return None;
+            }
+        };
+        if let Ok(mut cache) = self.ca_cache.lock() {
+            cache.insert(path.to_string(), certs.clone());
+        }
+        Some(certs)
+    }
+
+    /// Build a trust store for raw TCP client certificates, failing closed.
+    fn ca_store(&self, path: &str) -> X509Store {
+        let certs = self.ca_certs(path).unwrap_or_default();
+        let mut builder = X509StoreBuilder::new().expect("X509StoreBuilder::new cannot fail");
+        for cert in certs.iter() {
+            let _ = builder.add_cert(cert.clone());
+        }
+        builder.build()
+    }
+
+    /// Apply raw TCP TLS options during the server handshake.
+    fn apply_options(&self, ssl: &mut TlsRef, options: &TlsConfig) {
+        if let Some(version) = options.min_version {
+            let _ = ssl.set_min_proto_version(Some(tls_ssl_version(version)));
+        }
+        if let Some(version) = options.max_version {
+            let _ = ssl.set_max_proto_version(Some(tls_ssl_version(version)));
+        }
+        if let Some(ciphers) = &options.ciphers {
+            let _ = ssl.set_cipher_list(ciphers);
+        }
+        if let Some(client_auth) = &options.client_auth {
+            let mode = match client_auth.mode {
+                ClientAuthMode::Require => {
+                    SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
+                }
+                ClientAuthMode::Optional => SslVerifyMode::PEER,
+            };
+            ssl.set_verify(mode);
+            let _ = ssl.set_verify_cert_store(self.ca_store(&client_auth.ca_file));
+        }
+    }
+}
+
+#[async_trait]
+impl TlsAccept for StaticCertCallback {
+    async fn certificate_callback(&self, ssl: &mut TlsRef) {
+        if let Err(e) = ext::ssl_use_certificate(ssl, self.cert.leaf()) {
+            tracing::warn!("failed to set TCP TLS certificate: {e}");
+            return;
+        }
+        for intermediate in self.cert.intermediates() {
+            let _ = ext::ssl_add_chain_cert(ssl, intermediate);
+        }
+        if let Err(e) = ext::ssl_use_private_key(ssl, self.cert.key()) {
+            tracing::warn!("failed to set TCP TLS private key: {e}");
+        }
+        if let Some(options) = &self.options {
+            self.apply_options(ssl, options);
+        }
+    }
 }
 
 impl SniCallback {
     /// Create a callback backed by `store`; `on_miss` fires for unknown SNI.
     /// `config` supplies the per-site `tls` options applied on the handshake;
     /// `port` is this TLS listener's local port (cert/options keying).
+    /// Returns a callback that selects certificates for this listener.
     pub fn new(
         store: Arc<CertStore>,
         config: Arc<ConfigStore>,
         port: u16,
         on_miss: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        Self::new_with_alpn(
+            store,
+            config,
+            port,
+            on_miss,
+            Arc::new(TlsAlpnChallengeStore::new()),
+        )
+    }
+
+    /// Create a callback with a shared TLS-ALPN-01 challenge store.
+    /// The store parameter is the application certificate store; config is
+    /// the reloadable site configuration; port is the listener port; on_miss
+    /// handles authorized certificate misses; alpn_challenges contains
+    /// temporary challenge certificates. Returns a callback or no error.
+    pub fn new_with_alpn(
+        store: Arc<CertStore>,
+        config: Arc<ConfigStore>,
+        port: u16,
+        on_miss: Arc<dyn Fn(&str) + Send + Sync>,
+        alpn_challenges: Arc<TlsAlpnChallengeStore>,
     ) -> Self {
         Self {
             store,
@@ -210,6 +477,7 @@ impl SniCallback {
             config,
             port,
             ca_cache: Mutex::new(HashMap::new()),
+            alpn_challenges,
         }
     }
 
@@ -265,13 +533,68 @@ impl SniCallback {
     /// (spec §5.7, P2).
     fn site_tls(&self, host: &str) -> Option<TlsConfig> {
         let config = self.config.load();
+        let mut wildcard = None;
+        let mut wildcard_suffix_len = 0;
+        for site in &config.sites {
+            let SiteKey::Named {
+                host: pattern,
+                port,
+            } = &site.key
+            else {
+                continue;
+            };
+            if *port != self.port {
+                continue;
+            }
+            if pattern == host {
+                return site.tls.clone();
+            }
+            if let Some(suffix_len) = wildcard_match_specificity(pattern, host) {
+                if suffix_len > wildcard_suffix_len {
+                    wildcard = site.tls.clone();
+                    wildcard_suffix_len = suffix_len;
+                }
+            }
+        }
+        wildcard
+    }
+
+    /// Find the certificate-store key for an SNI, preferring an exact stored
+    /// certificate and then the most specific matching wildcard site.
+    fn lookup_key(&self, host: &str) -> String {
+        let exact = self.cert_key(host);
+        let config = self.config.load();
+        if config.sites.iter().any(|site| {
+            matches!(
+                &site.key,
+                SiteKey::Named {
+                    host: pattern,
+                    port
+                } if *port == self.port && pattern == host
+            )
+        }) || self.store.has(&exact)
+        {
+            return exact;
+        }
         config
             .sites
             .iter()
-            .find(|site| {
-                matches!(&site.key, SiteKey::Named { host: h, port } if h == host && *port == self.port)
+            .filter_map(|site| {
+                let SiteKey::Named {
+                    host: pattern,
+                    port,
+                } = &site.key
+                else {
+                    return None;
+                };
+                (*port == self.port
+                    && pattern.starts_with("*.")
+                    && host_pattern_matches(pattern, host))
+                .then_some((wildcard_match_specificity(pattern, host)?, pattern))
             })
-            .and_then(|site| site.tls.clone())
+            .max_by_key(|(suffix_len, _)| *suffix_len)
+            .map(|(_, pattern)| self.cert_key(pattern))
+            .unwrap_or(exact)
     }
 
     /// Parse (and cache) an mTLS CA PEM file into its certificates. A missing or
@@ -340,8 +663,14 @@ impl TlsAccept for SniCallback {
             // without a certificate.
             return;
         };
-        let cert_key = self.cert_key(&sni);
-        match self.store.get(&cert_key) {
+        let cert_key = self.lookup_key(&sni);
+        let challenge_cert = ssl
+            .ex_data(*alpn_challenge_index())
+            .copied()
+            .unwrap_or(false)
+            .then(|| self.alpn_challenges.get(&sni))
+            .flatten();
+        match challenge_cert.or_else(|| self.store.get(&cert_key)) {
             Some(cert) => {
                 if let Err(e) = ext::ssl_use_certificate(ssl, cert.leaf()) {
                     tracing::warn!("failed to set certificate for {sni}: {e}");
@@ -396,6 +725,18 @@ mod tests {
         assert!(store.has("example.com"));
         assert!(store.get("example.com").is_some());
         assert!(store.get("other.com").is_none());
+    }
+
+    #[test]
+    fn tls_alpn_challenge_store_validates_and_cleans_entries() {
+        let store = TlsAlpnChallengeStore::new();
+        assert!(store.register("example.test", &[1u8; 31]).is_err());
+        store
+            .register("Example.Test", &[1u8; 32])
+            .expect("register valid challenge");
+        assert!(store.get("example.test").is_some());
+        store.remove("EXAMPLE.TEST");
+        assert!(store.get("example.test").is_none());
     }
 
     #[test]
@@ -555,6 +896,87 @@ mod tests {
             .await
             .unwrap()
             .expect("server handshake should succeed");
+    }
+
+    #[tokio::test]
+    async fn sni_serves_active_tls_alpn_challenge_certificate() {
+        use pingora::listeners::TlsAcceptCallbacks;
+        use pingora::protocols::tls::server::handshake_with_callback;
+        use pingora::protocols::tls::SslStream;
+        use pingora::tls::ssl::{self, SslAcceptor, SslMethod};
+        use std::pin::Pin;
+
+        let challenge_store = Arc::new(TlsAlpnChallengeStore::new());
+        challenge_store
+            .register("example.test", &[7u8; 32])
+            .expect("register challenge certificate");
+        let selector_challenges = challenge_store.clone();
+        let expected = String::from_utf8(
+            challenge_store
+                .get("example.test")
+                .expect("challenge certificate")
+                .leaf()
+                .to_pem()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = Arc::new(ConfigStore::new(crate::config::ast::CompiledConfig {
+            global: crate::config::ast::GlobalConfig::default(),
+            sites: vec![crate::config::ast::CompiledSite {
+                key: SiteKey::Named {
+                    host: "example.test".into(),
+                    port: 443,
+                },
+                terminals: vec![],
+                modifiers: vec![],
+                trusted_proxies: None,
+                tls: None,
+                access_log_off: false,
+            }],
+            layer4: vec![],
+        }));
+        let callbacks: TlsAcceptCallbacks = Box::new(SniCallback::new_with_alpn(
+            Arc::new(CertStore::new()),
+            config,
+            443,
+            Arc::new(|_| {}),
+            challenge_store,
+        ));
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
+            .expect("create challenge acceptor");
+        configure_alpn_builder(&mut builder, selector_challenges);
+        let acceptor = builder.build();
+        let (client, server) = tokio::io::duplex(8192);
+        let server_task =
+            tokio::spawn(
+                async move { handshake_with_callback(&acceptor, server, &callbacks).await },
+            );
+
+        let ssl_context = ssl::SslContext::builder(SslMethod::tls()).unwrap().build();
+        let mut ssl = ssl::Ssl::new(&ssl_context).unwrap();
+        ssl.set_hostname("example.test").unwrap();
+        ssl.set_alpn_protos(b"\x0aacme-tls/1").unwrap();
+        ssl.set_verify(ssl::SslVerifyMode::NONE);
+        let mut client_stream = SslStream::new(ssl, client).unwrap();
+        Pin::new(&mut client_stream).connect().await.unwrap();
+        let served = String::from_utf8(
+            client_stream
+                .ssl()
+                .peer_certificate()
+                .unwrap()
+                .to_pem()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(served.trim(), expected.trim());
+        assert_eq!(
+            client_stream.ssl().selected_alpn_protocol(),
+            Some(&b"acme-tls/1"[..])
+        );
+        server_task
+            .await
+            .unwrap()
+            .expect("TLS-ALPN handshake should succeed");
     }
 
     #[test]

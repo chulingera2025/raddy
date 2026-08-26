@@ -19,7 +19,7 @@
 //! matches. A missing or malformed Host is a 400; a valid but unmatched Host
 //! (with no catch-all) is a 404.
 
-use crate::config::ast::{CompiledConfig, CompiledSite, SiteKey};
+use crate::config::ast::{wildcard_match_specificity, CompiledConfig, CompiledSite, SiteKey};
 
 /// The outcome of selecting a site for a request.
 #[derive(Debug)]
@@ -42,15 +42,40 @@ enum Normalized {
     NonAscii,
     /// The `:port` part was not a valid port number → 400 (RFC 9112 §3.2).
     InvalidPort,
+    /// The host used an invalid or unbracketed IPv6 form → 400.
+    InvalidHost,
 }
 
 /// Normalize a Host header value for site matching: strip `:port` (validating
 /// it — `example.com:notaport` must not silently match `example.com`), strip a
 /// trailing dot, ASCII-lowercase.
 fn normalize_host(raw: &[u8]) -> Normalized {
-    let (host, port) = match raw.iter().rposition(|&b| b == b':') {
-        Some(idx) => (&raw[..idx], Some(&raw[idx + 1..])),
-        None => (raw, None),
+    let (host, port) = if raw.first() == Some(&b'[') {
+        let Some(close) = raw.iter().position(|&b| b == b']') else {
+            return Normalized::InvalidHost;
+        };
+        let inner = &raw[1..close];
+        if inner.is_empty()
+            || std::str::from_utf8(inner)
+                .ok()
+                .and_then(|s| s.parse::<std::net::Ipv6Addr>().ok())
+                .is_none()
+        {
+            return Normalized::InvalidHost;
+        }
+        let suffix = &raw[close + 1..];
+        if suffix.is_empty() {
+            (&raw[..=close], None)
+        } else if let Some(port) = suffix.strip_prefix(b":") {
+            (&raw[..=close], Some(port))
+        } else {
+            return Normalized::InvalidHost;
+        }
+    } else {
+        match raw.iter().rposition(|&b| b == b':') {
+            Some(idx) => (&raw[..idx], Some(&raw[idx + 1..])),
+            None => (raw, None),
+        }
     };
     if let Some(port) = port {
         if !is_valid_port(port) {
@@ -63,6 +88,9 @@ fn normalize_host(raw: &[u8]) -> Normalized {
     };
     if host.is_empty() {
         return Normalized::Empty;
+    }
+    if host.contains(&b':') && !(host.first() == Some(&b'[') && host.last() == Some(&b']')) {
+        return Normalized::InvalidHost;
     }
     let mut out = String::new();
     for &b in host {
@@ -95,13 +123,17 @@ pub fn select<'a>(config: &'a CompiledConfig, port: u16, host: Option<&[u8]>) ->
     let normalized = match host {
         None => return Selection::BadRequest,
         Some(raw) => match normalize_host(raw) {
-            Normalized::Empty | Normalized::InvalidPort => return Selection::BadRequest,
+            Normalized::Empty | Normalized::InvalidPort | Normalized::InvalidHost => {
+                return Selection::BadRequest;
+            }
             Normalized::NonAscii => None,
             Normalized::Matchable(h) => Some(h),
         },
     };
 
     let mut catch_all = None;
+    let mut wildcard = None;
+    let mut wildcard_suffix_len = 0;
     for site in &config.sites {
         if site.key.port() != port {
             continue;
@@ -111,11 +143,19 @@ pub fn select<'a>(config: &'a CompiledConfig, port: u16, host: Option<&[u8]>) ->
                 if normalized.as_deref() == Some(named.as_str()) {
                     return Selection::Site(site);
                 }
+                if let Some(host) = normalized.as_deref() {
+                    if let Some(suffix_len) = wildcard_match_specificity(named, host) {
+                        if suffix_len > wildcard_suffix_len {
+                            wildcard = Some(site);
+                            wildcard_suffix_len = suffix_len;
+                        }
+                    }
+                }
             }
             SiteKey::CatchAll { .. } => catch_all = Some(site),
         }
     }
-    match catch_all {
+    match wildcard.or(catch_all) {
         Some(site) => Selection::Site(site),
         None => Selection::NotFound,
     }
@@ -181,6 +221,54 @@ mod tests {
         assert!(matches!(
             select(&config, 8080, Some(b"other.example.com")),
             Selection::Site(site) if matches!(site.key, SiteKey::CatchAll { .. })
+        ));
+    }
+
+    #[test]
+    fn wildcard_matches_one_label_and_prefers_specific_suffix() {
+        let config = CompiledConfig {
+            global: Default::default(),
+            sites: vec![
+                named("*.example.com", 8080),
+                named("*.sub.example.com", 8080),
+                catch_all(8080),
+            ],
+            layer4: vec![],
+        };
+        assert!(matches!(
+            select(&config, 8080, Some(b"api.example.com")),
+            Selection::Site(site)
+                if matches!(&site.key, SiteKey::Named { host, .. } if host == "*.example.com")
+        ));
+        assert!(matches!(
+            select(&config, 8080, Some(b"api.sub.example.com")),
+            Selection::Site(site)
+                if matches!(&site.key, SiteKey::Named { host, .. } if host == "*.sub.example.com")
+        ));
+        assert!(matches!(
+            select(&config, 8080, Some(b"deep.api.example.com")),
+            Selection::Site(site) if matches!(site.key, SiteKey::CatchAll { .. })
+        ));
+        assert!(matches!(
+            select(&config, 8080, Some(b"example.com")),
+            Selection::Site(site) if matches!(site.key, SiteKey::CatchAll { .. })
+        ));
+    }
+
+    #[test]
+    fn bracketed_ipv6_host_matches_with_or_without_port() {
+        let config = CompiledConfig {
+            global: Default::default(),
+            sites: vec![named("[::1]", 8080)],
+            layer4: vec![],
+        };
+        assert!(matches!(
+            select(&config, 8080, Some(b"[::1]:8080")),
+            Selection::Site(_)
+        ));
+        assert!(matches!(
+            select(&config, 8080, Some(b"[::1]")),
+            Selection::Site(_)
         ));
     }
 
