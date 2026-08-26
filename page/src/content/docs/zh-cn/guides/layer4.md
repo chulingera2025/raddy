@@ -1,12 +1,12 @@
 ---
 title: 四层代理（TCP 与 UDP）
-description: 用 tcp 与 udp 监听器做裸 TCP 与 UDP 代理——负载均衡、超时、健康检查、SNI 路由与 DNS 刷新。
+description: 用 tcp 与 udp 监听器做裸 TCP 与 UDP 代理——负载均衡、超时、健康检查、通配符 SNI、TLS 终止、透明路由与 UDP 交接。
 ---
 
 除 HTTP 之外，raddy 可用 `tcp` 与 `udp` **顶级监听器**代理裸 TCP 连接与 UDP
 数据报——它们是 HTTP 站点块的平级，而非其内部指令。它们只拥有传输概念：
-上游选择、超时、连接/流上限与中继。TLS 从不被终止（带 `sni` 的 `tcp` 监听器
-按 ClientHello 路由并原样转发）。
+上游选择、超时、连接/流上限与中继。普通 TCP 不终止 TLS；可选的 `tls` 配置
+会在同一中继前先终止 TLS。
 
 ## 裸 TCP
 
@@ -50,8 +50,22 @@ tcp 0.0.0.0:443 {
 ```
 
 ClientHello 在有界前缀内检查（从不修改），原始字节原样转发到匹配的上游。
-未知/缺失/畸形的 SNI 在设置 `fallback` 时走 fallback，否则关闭连接。`sni`
-与 `to` 互斥；v1 的 SNI 模式不支持通配符名称与 `health_check`。
+未知/缺失/畸形的 SNI 在设置 `fallback` 时走 fallback，否则关闭连接。精确名称
+优先，通配符只匹配一个最左标签。`sni` 与 `to` 互斥；SNI 模式不支持
+`health_check`。
+
+### 透明 TCP
+
+```caddyfile
+tcp :15000 {
+    transparent
+    to 127.0.0.1:8080
+}
+```
+
+Linux 下 `transparent` 启用 `IP_TRANSPARENT`，在 TPROXY 规则提供元数据时使用
+原始目的地址，并用原始客户端地址建立出站连接。需要 `CAP_NET_ADMIN`、TPROXY
+规则和策略路由。透明监听器由自定义服务持有，升级时必须普通重启。
 
 ## UDP
 
@@ -75,5 +89,7 @@ udp :53 {
   设置 socket 缓冲（0 = 系统默认）。
 - UDP 与 TCP 可共享同一地址端口。
 - 指标：`raddy_l4_udp_*`。
-- **零停机升级不适用于 UDP**：监听 socket 在 fd 移交机制之外绑定，`raddy
-  upgrade` 无法服务 UDP 配置——请用普通重启（flow 会重置）。
+- **Linux UDP 支持零停机升级**：raddy 在替代进程开始接收前交接监听 fd、已连接
+  上游 flow fd 和有界 flow 元数据。
+- **QUIC 透传**通过 UDP 可用，因为 QUIC 承载于数据报。Pingora 0.8.1 不提供
+  QUIC/HTTP/3 终止、HTTP/3 路由或连接迁移；这些需要独立的 QUIC/HTTP/3 sidecar。

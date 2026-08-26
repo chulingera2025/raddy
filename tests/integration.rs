@@ -135,6 +135,61 @@ impl Drop for EchoUpstream {
     }
 }
 
+/// A minimal HTTP/1.1 upstream bound to IPv6 loopback.
+struct Ipv6EchoUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Ipv6EchoUpstream {
+    fn spawn(label: &str) -> (u16, Ipv6EchoUpstream) {
+        let listener = TcpListener::bind("[::1]:0").expect("bind IPv6 upstream");
+        let port = listener.local_addr().expect("IPv6 upstream address").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let label = label.to_string();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                let label = label.clone();
+                thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = format!("label={label}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        (
+            port,
+            Ipv6EchoUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for Ipv6EchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("::1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// A minimal HTTPS upstream (spec §5.4): accepts TCP connections, wraps them in
 /// TLS with a self-signed certificate for `localhost`, and answers
 /// `label=secure`. The certificate is deliberately untrusted by system roots,
@@ -422,6 +477,183 @@ impl Drop for TcpHalfCloseUpstream {
     }
 }
 
+/// A cleartext HTTP/2 prior-knowledge upstream used to verify `h2c://` peers.
+struct H2EchoUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+/// A TLS HTTP/2 upstream used to verify `h2://` peers, including ALPN
+/// negotiation and the upstream TLS verification options.
+struct H2TlsEchoUpstream {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl H2TlsEchoUpstream {
+    fn spawn() -> (u16, H2TlsEchoUpstream) {
+        use openssl::ssl::{AlpnError, Ssl, SslAcceptor, SslMethod};
+        let (port, listener) = bind_listener();
+        listener.set_nonblocking(true).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        let x509 = openssl::x509::X509::from_pem(cert_pem.as_bytes()).unwrap();
+        let pkey = openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).unwrap();
+        builder.set_certificate(&x509).unwrap();
+        builder.set_private_key(&pkey).unwrap();
+        builder.set_alpn_select_callback(|_, client| {
+            openssl::ssl::select_next_proto(b"\x02h2", client).ok_or(AlpnError::NOACK)
+        });
+        let acceptor = builder.build();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build TLS h2 upstream runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("convert TLS h2 upstream listener");
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                            if stop_thread.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                        accepted = listener.accept() => {
+                            let Ok((stream, _)) = accepted else { continue };
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                let ssl = Ssl::new(acceptor.context()).expect("create TLS state");
+                                let mut tls = tokio_openssl::SslStream::new(ssl, stream)
+                                    .expect("wrap TLS stream");
+                                if std::pin::Pin::new(&mut tls).accept().await.is_err() {
+                                    return;
+                                }
+                                let Ok(mut connection) = h2::server::handshake(tls).await else {
+                                    return;
+                                };
+                                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                                    let _ = request;
+                                    let response = http::Response::builder()
+                                        .status(200)
+                                        .header("content-length", "6")
+                                        .body(())
+                                        .expect("build TLS h2 response");
+                                    let Ok(mut send) = respond.send_response(response, false) else {
+                                        break;
+                                    };
+                                    if send
+                                        .send_data(bytes::Bytes::from_static(b"h2-tls"), true)
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        });
+        (
+            port,
+            H2TlsEchoUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for H2TlsEchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl H2EchoUpstream {
+    fn spawn() -> (u16, H2EchoUpstream) {
+        let (port, listener) = bind_listener();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build h2 upstream runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("convert h2 upstream listener");
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                            if stop_thread.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                        accepted = listener.accept() => {
+                            let Ok((stream, _)) = accepted else { continue };
+                            tokio::spawn(async move {
+                                let Ok(mut connection) = h2::server::handshake(stream).await else {
+                                    return;
+                                };
+                                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                                    let _ = request;
+                                    let response = http::Response::builder()
+                                        .status(200)
+                                        .header("content-length", "5")
+                                        .body(())
+                                        .expect("build h2 response");
+                                    let Ok(mut send) = respond.send_response(response, false) else {
+                                        break;
+                                    };
+                                    if send
+                                        .send_data(bytes::Bytes::from_static(b"h2-ok"), true)
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        });
+        (
+            port,
+            H2EchoUpstream {
+                port,
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+}
+
+impl Drop for H2EchoUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// A raw UDP echo upstream: returns each received datagram prefixed with its
 /// label (`<label>:<data>`), so tests can tell which upstream served a client.
 struct UdpEchoUpstream {
@@ -484,6 +716,14 @@ impl Drop for UdpEchoUpstream {
 fn udp_roundtrip(port: u16, msg: &str) -> Option<String> {
     let client = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
     client.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    client.send_to(msg.as_bytes(), ("127.0.0.1", port)).ok()?;
+    let mut buf = [0u8; 256];
+    let (n, _) = client.recv_from(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// Send a datagram from a caller-owned UDP socket and read one reply.
+fn udp_roundtrip_on(client: &UdpSocket, port: u16, msg: &str) -> Option<String> {
     client.send_to(msg.as_bytes(), ("127.0.0.1", port)).ok()?;
     let mut buf = [0u8; 256];
     let (n, _) = client.recv_from(&mut buf).ok()?;
@@ -1028,6 +1268,20 @@ fn try_request_hdr(
 
 fn send_request(port: u16, host: Option<&str>, path: &str) -> Response {
     try_request(port, host, path).expect("request failed")
+}
+
+/// Send a GET over the IPv6 loopback address and parse its response.
+fn send_request_ipv6(port: u16, host: Option<&str>, path: &str) -> Response {
+    let mut stream = TcpStream::connect(("::1", port)).expect("IPv6 request connect failed");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set IPv6 request timeout");
+    let host_line = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+    let request = format!("GET {path} HTTP/1.1\r\n{host_line}Connection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write IPv6 request");
+    read_one_response(&mut stream)
 }
 
 /// Send a GET over TLS (spec §5.7) and return the parsed response. The server
@@ -1877,6 +2131,75 @@ fn unknown_host_returns_404_and_named_host_works() {
     assert_eq!(unknown.status, 404);
     let known = send_request(raddy.port(), Some("api.example.com"), "/");
     assert_eq!(known.status, 200);
+}
+
+#[test]
+fn multi_domain_site_block_routes_all_domains() {
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            "a.example.com:{port}, b.example.com:{port} {{\n    respond 200 shared-domain\n}}\n"
+        )
+    });
+    for host in ["a.example.com", "b.example.com"] {
+        let response = send_request(raddy.port(), Some(host), "/");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "shared-domain");
+    }
+}
+
+#[test]
+fn h2c_upstream_is_proxied() {
+    let (upstream_port, _upstream) = H2EchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(":{port} {{\n    reverse_proxy h2c://127.0.0.1:{upstream_port}\n}}\n")
+    });
+    let response = send_request(raddy.port(), Some("localhost"), "/h2c");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "h2-ok");
+}
+
+#[test]
+fn h2_tls_upstream_is_proxied() {
+    let (upstream_port, _upstream) = H2TlsEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn(|port| {
+        format!(
+            ":{port} {{\n    reverse_proxy {{\n        to h2://127.0.0.1:{upstream_port}\n        tls_skip_verify\n    }}\n}}\n"
+        )
+    });
+    let response = send_request(raddy.port(), Some("localhost"), "/h2");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "h2-tls");
+}
+
+#[test]
+fn http_listener_accepts_ipv6_clients() {
+    let raddy = RadRaddy::spawn(|port| format!(":{port} {{\n    respond 200 ipv6-ok\n}}\n"));
+    let response = send_request_ipv6(raddy.port(), Some("localhost"), "/v6");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "ipv6-ok");
+}
+
+#[test]
+fn http_proxy_connects_to_an_ipv6_upstream() {
+    let (upstream_port, _upstream) = Ipv6EchoUpstream::spawn("ipv6-upstream");
+    let raddy = RadRaddy::spawn(|port| {
+        format!(":{port} {{\n    reverse_proxy [::1]:{upstream_port}\n}}\n")
+    });
+    let response = send_request_ipv6(raddy.port(), Some("localhost"), "/upstream-v6");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "label=ipv6-upstream");
+}
+
+#[test]
+fn wildcard_site_routes_http_and_tls_sni() {
+    let raddy = RadRaddy::spawn_tls(|port| {
+        format!(
+            "*.example.com:{port}, localhost:{port} {{\n    tls internal\n    respond 200 wildcard-ok\n}}\n"
+        )
+    });
+    let response = tls_request(raddy.port(), "api.example.com", "/wildcard", &[]).unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "wildcard-ok");
 }
 
 #[test]
@@ -3054,6 +3377,76 @@ fn zero_downtime_upgrade_hands_off_listeners() {
 }
 
 #[test]
+fn zero_downtime_upgrade_hands_off_udp_listener_and_flow() {
+    let tag = format!(
+        "{}_{}",
+        std::process::id(),
+        UPGRADE_TAG.fetch_add(1, Ordering::Relaxed)
+    );
+    let (pidfile, upgrade_sock, cert_dir) = upgrade_paths(&tag);
+    let extra = vec![
+        format!("--pidfile={}", pidfile.display()),
+        format!("--upgrade-sock={}", upgrade_sock.display()),
+        format!("--cert-dir={}", cert_dir.display()),
+    ];
+    let (up_port, _upstream) = UdpEchoUpstream::spawn("upgrade");
+    let raddy = RadRaddy::spawn_udp_with_args(
+        |port| format!("udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{up_port}\n}}\n"),
+        &extra,
+    );
+    let client = UdpSocket::bind("127.0.0.1:0").expect("bind persistent UDP client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set persistent UDP timeout");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut before = None;
+    while Instant::now() < deadline {
+        before = udp_roundtrip_on(&client, raddy.port(), "before");
+        if before.as_deref() == Some("upgrade:before") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(before.as_deref(), Some("upgrade:before"));
+    let old_pid = read_pid_file(&pidfile);
+
+    let mut cmd = Command::new(BIN);
+    cmd.args(["upgrade", "-c"]).arg(&raddy.config_path);
+    cmd.args(&extra);
+    cmd.env("RUST_LOG", "error");
+    let status = cmd.status().expect("failed to spawn UDP upgrade");
+    assert!(status.success(), "UDP upgrade should succeed: {status:?}");
+
+    assert_eq!(
+        udp_roundtrip_on(&client, raddy.port(), "after").as_deref(),
+        Some("upgrade:after"),
+        "the persistent client flow must continue after upgrade"
+    );
+    assert!(
+        !process_alive(old_pid),
+        "old UDP process should have exited"
+    );
+    let new_pid = read_pid_file(&pidfile);
+    assert_ne!(new_pid, old_pid, "UDP upgrade should replace the process");
+    assert!(process_alive(new_pid), "replacement UDP process should run");
+    // SAFETY: new_pid is the replacement process written by the test instance.
+    unsafe {
+        libc::kill(new_pid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && process_alive(new_pid) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_alive(new_pid),
+        "replacement UDP process should stop"
+    );
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = std::fs::remove_file(&upgrade_sock);
+    let _ = std::fs::remove_dir_all(&cert_dir);
+}
+
+#[test]
 fn upgrade_aborts_on_broken_config_without_disturbing_instance() {
     let tag = format!(
         "{}_{}",
@@ -3942,6 +4335,32 @@ fn send_sni(port: u16, name: &str) {
     );
 }
 
+/// Send raw bytes through a TLS-terminated TCP listener and read the relayed
+/// response. Verification is disabled because the internal test certificate is
+/// intentionally self-signed.
+fn tls_raw_roundtrip(port: u16, payload: &[u8]) -> Vec<u8> {
+    let connector = tls_connector(None);
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect TLS TCP listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set TLS TCP read timeout");
+    let mut tls = connector
+        .connect("localhost", stream)
+        .expect("TLS TCP handshake");
+    tls.write_all(payload).expect("write TLS TCP payload");
+    let mut response = vec![0u8; payload.len() + 5];
+    let mut read = 0;
+    while read < response.len() {
+        match tls.read(&mut response[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(_) => break,
+        }
+    }
+    response.truncate(read);
+    response
+}
+
 #[test]
 fn raw_tcp_proxy_sni_routes_by_hostname() {
     // A `sni`-routing listener forwards a ClientHello to the upstream matching
@@ -3957,6 +4376,44 @@ fn raw_tcp_proxy_sni_routes_by_hostname() {
     send_sni(raddy.port(), "b.test");
     assert!(a.hit_count() >= 1, "SNI a.test must route to A");
     assert!(b.hit_count() >= 1, "SNI b.test must route to B");
+}
+
+#[test]
+fn raw_tcp_proxy_can_terminate_tls_before_relaying() {
+    let (upstream_port, _upstream) = TcpEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!("tcp 127.0.0.1:{port} {{\n    tls internal\n    to 127.0.0.1:{upstream_port}\n}}\n")
+    });
+    assert_eq!(tls_raw_roundtrip(raddy.port(), b"hello"), b"echo:hello");
+}
+
+#[test]
+fn raw_tcp_proxy_sni_routes_one_label_wildcards() {
+    let (wildcard_port, wildcard) = TcpEchoUpstream::spawn();
+    let (specific_port, specific) = TcpEchoUpstream::spawn();
+    let (fallback_port, fallback) = TcpEchoUpstream::spawn();
+    let raddy = RadRaddy::spawn_tcp(|port| {
+        format!(
+            "tcp 127.0.0.1:{port} {{\n    sni *.example.com 127.0.0.1:{wildcard_port}\n    sni *.sub.example.com 127.0.0.1:{specific_port}\n    fallback 127.0.0.1:{fallback_port}\n}}\n"
+        )
+    });
+    send_sni(raddy.port(), "api.example.com");
+    send_sni(raddy.port(), "api.sub.example.com");
+    send_sni(raddy.port(), "deep.api.example.com");
+    assert!(wildcard.hit_count() >= 1, "one-label wildcard must route");
+    assert!(
+        specific.hit_count() >= 1,
+        "more-specific wildcard must route"
+    );
+    assert!(
+        fallback.hit_count() >= 1,
+        "multi-label names must use fallback"
+    );
+    assert_eq!(
+        wildcard.hit_count(),
+        1,
+        "a multi-label name must not match the less-specific wildcard"
+    );
 }
 
 #[test]

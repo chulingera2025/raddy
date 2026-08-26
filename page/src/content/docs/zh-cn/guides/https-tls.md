@@ -19,7 +19,8 @@ example.com {
 
 raddy 向 ACME 目录注册,证明域名控制权——默认在其纯 HTTP 监听器上用
 **HTTP-01**,当 80 端口不可达时经 [`dns_challenge`](../../config/directives/#dns_challenge)
-用 **DNS-01**——并在到期前 30 天内自动续期。在[全局块](../../config/sites/#the-global-block)
+用 **DNS-01**,或者设置 `tls_alpn_challenge` 使用 TLS-ALPN-01——并在到期前
+30 天内自动续期。在[全局块](../../config/sites/#the-global-block)
 设置联系邮箱;如需把 80 端口访客引向安全站点,再补一个 HTTP→HTTPS 重定向。
 完整的匹配模型见[站点 · 端口 · HTTPS](../../config/sites/)。
 
@@ -128,8 +129,22 @@ api.example.com {
 ## 下游 HTTP/2
 
 TLS 监听器通过 ALPN 宣告 HTTP/2(`h2`),为支持的客户端提供 HTTP/2,否则回退
-HTTP/1.1——无需任何配置。纯 HTTP 监听器保持 HTTP/1.1(不支持明文 h2c),
-raddy 目前对上游说 HTTP/1.1。
+HTTP/1.1——无需任何配置。纯 HTTP 监听器保持 HTTP/1.1。上游 HTTP/2 需显式
+指定：`h2://host:port` 表示 TLS HTTP/2，`h2c://host:port` 表示明文先验
+HTTP/2。
+
+## TLS-ALPN-01
+
+80 端口不可用时，在全局块启用：
+
+```caddyfile
+{
+    tls_alpn_challenge
+}
+```
+
+挑战在 TCP 443 上提供带 RFC 8737 `acmeIdentifier` 扩展和 `acme-tls/1`
+ALPN 的临时证书。它与 DNS-01 互斥，并且只适用于 443 端口的 ACME 站点。
 
 ## 基于 TLS 的 WebSocket
 

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml/badge.svg)](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/chulingera2025/raddy)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v0.3.0-blue)]()
+[![Version](https://img.shields.io/badge/version-v0.3.5-blue)]()
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)]()
 [English](README.md)
 
@@ -19,14 +19,14 @@ Rust 网关生态的现状大致两类：直接手写 Pingora 代码，或者使
 ## 功能特性
 
 - **显式书写顺序 DSL**（Raddyfile）：终端指令 vs 修饰指令、`handle` 互斥匹配块、无隐藏排序规则。见 [Raddyfile 规范](docs/RADDYFILE_SPEC.zh_CN.md)。
-- **自动 HTTPS**：具名站点通过 ACME 自动签发（默认 HTTP-01，或经 `dns_challenge cloudflare <token>` 走 DNS-01），SNI 动态证书，含 On-Demand `ask` 授权回调。
+- **自动 HTTPS**：具名站点通过 ACME 自动签发（默认 HTTP-01，也支持 `dns_challenge cloudflare <token>` 的 DNS-01 和 `tls_alpn_challenge` 的 TLS-ALPN-01），支持 SNI 动态/通配符证书，含 On-Demand `ask` 授权回调。
 - **配置热重载**：SIGHUP 原子替换路由快照；上游连接池跨重载存活（零中断）。
 - **静态托管 + 压缩**：`file_server` 带目录穿越防护；`encode` 支持 gzip/zstd 并按 `Accept-Encoding` 选择。
 - **可观测性**：结构化 JSON 访问日志 + Prometheus `/metrics` 端点（QPS + 延迟）。
-- **转发**：`reverse_proxy` 支持 `to` 多目标轮询、头改写、重定向、干净的 400/404 兜底。
+- **转发**：`reverse_proxy` 支持 `to` 多目标轮询、上游 HTTP/2/h2c、多域名共享站点块、IPv6 监听、头改写、重定向、干净的 400/404 兜底。
 - **边缘防护**：`rate_limit remote_ip` 单机令牌桶限流，配合 `trusted_proxies` 解析真实客户端 IP。
 - **迁移**：`raddy import caddyfile|nginx <file>` 将常见 Caddyfile / nginx.conf 子集转换为 Raddyfile（独立转换器，永不改动 Raddyfile 文法）。
-- **四层代理**：`tcp <address> { ... }` 与 `udp <address> { ... }` 监听器代理裸 TCP 连接和 UDP 数据报（不做 HTTP 解析），支持负载均衡、SNI 透传路由、空闲/连接超时、连接/flow 上限、健康检查、DNS 刷新与指标。
+- **四层代理**：`tcp <address> { ... }` 与 `udp <address> { ... }` 监听器代理裸 TCP 连接和 UDP 数据报（不做 HTTP 解析），支持负载均衡、通配符 SNI 透传、TLS 终止、Linux 透明路由、空闲/连接超时、连接/flow 上限、健康检查、DNS 刷新、Linux UDP flow 无损交接与指标。
 
 ## 快速开始
 
@@ -88,7 +88,7 @@ raddy run -c Raddyfile --acme-directory https://acme-v02.api.letsencrypt.org/dir
 
 ## 开发状态
 
-核心实现已完成：转发 + 热重载、Raddyfile 解析器（fuzz 验证、带行列号错误）、ACME 自动 HTTPS（已用本地 Pebble 测试 CA 验证，HTTP-01 + DNS-01，自动续期）、站点级 TLS（静态/internal 证书、mTLS、上游 TLS）、健康检查与负载均衡策略、单机限流与可信客户端 IP 模型、gzip/zstd/brotli 压缩（流式、感知 Range）、结构化 JSON 与 common 格式访问日志、Caddyfile/nginx 迁移工具、零停机二进制升级，以及已通过集成测试的 L4 TCP/SNI/UDP 代理。UDP 升级仍采用普通重启路径。发布工具链提供 Linux x86_64/aarch64 的校验和安装脚本与 Docker。
+核心实现已完成：转发 + 热重载、Raddyfile 解析器（fuzz 验证、带行列号错误）、ACME 自动 HTTPS（HTTP-01、DNS-01、TLS-ALPN-01，自动续期）、站点级 TLS（静态/internal 证书、mTLS、上游 TLS）、上游 HTTP/2/h2c、多域名与通配符路由、IPv6 监听、健康检查与负载均衡策略、单机限流与可信客户端 IP 模型、gzip/zstd/brotli 压缩（流式、感知 Range）、结构化 JSON 与 common 格式访问日志、Caddyfile/nginx 迁移工具、零停机二进制升级，以及已通过集成测试的 L4 TCP/SNI/UDP 代理（含 TLS 终止、Linux 透明路由与 UDP flow 交接）。QUIC/HTTP/3 终止因 Pingora 0.8.1 没有 QUIC transport，仍保持为独立 sidecar 边界。发布工具链提供 Linux x86_64/aarch64 的校验和安装脚本与 Docker。
 
 ## License
 

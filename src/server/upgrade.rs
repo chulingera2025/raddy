@@ -27,6 +27,8 @@
 //! socket, then SIGQUIT the old process. Any failure aborts before the running
 //! instance is disturbed.
 
+use crate::config::snapshot;
+use crate::layer4::udp::UdpProxy;
 use crate::server::startup::RunOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -60,6 +62,19 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
             pidfile.display()
         ));
     }
+    let snapshot = snapshot::build(config_path)
+        .map_err(|e| format!("cannot inspect config before upgrade: {e}"))?;
+    if snapshot.layer4.iter().any(|listener| {
+        matches!(
+            listener,
+            crate::config::ast::Layer4Listener::Tcp(tcp) if tcp.transparent
+        )
+    }) {
+        return Err(
+            "transparent TCP listeners are not compatible with zero-downtime upgrade; use a restart"
+                .to_string(),
+        );
+    }
 
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot resolve own executable path: {e}"))?;
@@ -81,6 +96,7 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     // Drop any stale socket from a crashed upgrade so the readiness probe below
     // only ever observes the replacement's fresh socket.
     let _ = std::fs::remove_file(&opts.upgrade_sock);
+    cleanup_udp_handoff_files(&opts.upgrade_sock);
 
     eprintln!(
         "raddy: spawning replacement {} (waiting on {})",
@@ -119,6 +135,28 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     }
     eprintln!("raddy: upgrade complete (now pid {new_pid})");
     Ok(())
+}
+
+/// Remove exact UDP handoff artifacts from a previous interrupted upgrade.
+fn cleanup_udp_handoff_files(upgrade_sock: &str) {
+    let manifest = UdpProxy::handoff_manifest_path(upgrade_sock);
+    let _ = std::fs::remove_file(&manifest);
+    let Some(parent) = Path::new(upgrade_sock).parent() else {
+        return;
+    };
+    let Some(prefix) = Path::new(upgrade_sock).file_name() else {
+        return;
+    };
+    let prefix = format!("{}.udp.", prefix.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Build the `raddy run` argument list for a sub-invocation of this same binary

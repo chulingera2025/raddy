@@ -85,7 +85,7 @@ api.example.com {
 | `rate_limit` | `rate_limit <key> <rate> [burst=<n>]`（**单机**限流；见 第 5.2 节）；key 为 `remote_ip` 或 `header <name>` | 可用 |
 | `trusted_proxies` | 受信网段列表（见 第 4 节） | 可用 |
 | `dns_challenge` | `dns_challenge cloudflare <api_token>` —— 经 DNS 服务商（Cloudflare）做 DNS-01 签发（见 第 5.3 节） | 可用 |
-| `tls_alpn_challenge` | 在 443 端口上以 TLS-ALPN-01 代替 HTTP-01 证明域名控制权（见 第 5.8 节） | 推迟 |
+| `tls_alpn_challenge` | 在 443 端口上以 TLS-ALPN-01 代替 HTTP-01 证明域名控制权（见 第 5.8 节） | 可用 |
 | `tls` | 站点级 TLS 来源与选项：`tls [<cert> <key> \| internal]`、`min_version`、`max_version`、`ciphers`、`client_auth`（见 第 5.7 节） | 可用 |
 | `rewrite` | `rewrite <to>` —— 转发前改写请求 URI；不带 matcher，始终生效（修饰指令；见 第 5.9 节） | 可用 |
 | `handle_path` | 类似 `handle`，但从 URI 中去掉命中的路径前缀（见 第 5.9 节） | 可用 |
@@ -172,10 +172,13 @@ api.example.com {
 
 **状态：可用。**
 
-上游默认走明文 HTTP。给上游加 `https://` 前缀即对后端走 TLS：
+上游默认走明文 HTTP/1.1。`https://` 前缀表示到后端使用 TLS HTTP/1.1；
+`h2://` 表示 TLS HTTP/2，`h2c://` 表示明文先验 HTTP/2：
 
 ```caddyfile
 reverse_proxy https://127.0.0.1:8443
+reverse_proxy h2://127.0.0.1:9443
+reverse_proxy h2c://127.0.0.1:9080
 
 reverse_proxy {
     to https://10.0.0.1:8443 https://10.0.0.2:8443
@@ -216,8 +219,12 @@ reverse_proxy {
 
 - **下游**：TLS 监听器（443 端口）通过 ALPN 通告 `h2`，对支持的客户端提供
   HTTP/2，其余回退到 HTTP/1.1。这是默认行为。
-- **明文（h2c）**：不支持——纯 HTTP 监听器保持 HTTP/1.1。
-- **上游**：raddy 目前向上游走 HTTP/1.1；上游 HTTP/2 属后续工作。
+- **明文（h2c）**：下游纯 HTTP 监听器仍提供 HTTP/1.1；上游可用显式的
+  `h2c://` 方案启用先验 HTTP/2。
+- **上游**：`h2://host:port` 表示带 TLS、使用 ALPN `h2` 的 HTTP/2；
+  `h2c://host:port` 表示明文先验 HTTP/2；`https://` 与裸地址仍保持
+  原有 HTTP/1.1 行为。`h2c://` 不使用过时的 HTTP/1.1 Upgrade，
+  上游必须直接接受 HTTP/2 connection preface。
 - 所有 TLS 监听器通告的 ALPN 集合固定为（优先 `h2`，回退 `http/1.1`），
   不可按站点配置。
 
@@ -268,19 +275,17 @@ secure.example.com {
 
 ### 5.8 TLS-ALPN-01 挑战
 
-**状态：推迟。** `tls_alpn_challenge` 无法基于当前依赖实现：instant-acme
-0.8.5 将账户密钥留在内部，Pingora 0.8 的 `TlsSettings` 也没有能换入
-`acme-tls/1` 校验证书的动态 ALPN 回调——构建它需要 fork 一个依赖。HTTP-01
-与 DNS-01 已覆盖其余可达性场景。
+**状态：可用。** `tls_alpn_challenge` 使用 OpenSSL 监听器的底层
+ClientHello/ALPN 回调和临时 RFC 8737 challenge 证书。它与
+`dns_challenge` 互斥，并要求 ACME 站点使用标准 TLS 端口 443。
 
 否则，当 HTTP-01（80 端口）被屏蔽但 443 端口可达时，本可通过在 443 端口的
 `acme-tls/1` ALPN 协议上应答 ACME 挑战来证明域名控制权：
 
 - **语法**：`tls_alpn_challenge`，位于**全局块**。
 - **语义**：设置后，证书签发使用 **TLS-ALPN-01**：ACME 服务器向 443 端口
-  发起携带 `acme-tls/1` ALPN 的 TLS 连接，raddy 用密钥与 key authorization
-  匹配的校验证书应答。当 ACME 服务器不支持 TLS-ALPN-01 时，HTTP-01 仍作为
-  回退可用。
+  发起只携带 `acme-tls/1` 的 TLS 连接，raddy 返回带有
+  `acmeIdentifier` 扩展的短期校验证书。不会回退到 HTTP-01。
 
 ### 5.9 Matchers、`rewrite`、`handle_path`、`respond`、`error`
 
@@ -416,13 +421,14 @@ api.example.com {
 ## 6. 站点选择、端口、catch-all 与多站点
 
 - **站点选择按监听器收敛**：请求到达某监听器后，仅在该监听器的候选站点集合内匹配——TLS 监听器按 SNI、纯 HTTP 监听器按规范化 Host（去端口、去尾点、ASCII 小写）。候选集合 = 地址落在该端口的具名站点 + 该端口的 `:port` 兜底块。
-- **具名站点默认端口 443**：`api.example.com`（不带端口）默认绑 443（TLS）。自动 HTTPS 生效：具名站点通过 ACME 签发证书——默认 HTTP-01，配置 `dns_challenge` 后走 DNS-01（见 第 5.3 节）。TLS-ALPN-01（`tls_alpn_challenge`）已推迟（见 第 5.8 节）。`tls` 来源为静态或 internal 证书的站点（见 第 5.7 节）被排除在 ACME 之外。SNI 按域名返回对应证书；端口 443 监听器使用 SNI 动态证书（`raddy_certs/` 目录缓存，重启复用）。证书在到期前 30 天内自动续期。
+- **具名站点默认端口 443**：`api.example.com`（不带端口）默认绑 443（TLS）。自动 HTTPS 生效：具名站点通过 ACME 签发证书——默认 HTTP-01，配置 `dns_challenge` 后走 DNS-01（见 第 5.3 节），配置 `tls_alpn_challenge` 后走 TLS-ALPN-01（见 第 5.8 节）。`tls` 来源为静态或 internal 证书的站点（见 第 5.7 节）被排除在 ACME 之外。SNI 按域名返回对应证书；端口 443 监听器使用 SNI 动态证书（`raddy_certs/` 目录缓存，重启复用）。证书在到期前 30 天内自动续期。
 - **隐式 HTTP-01 监听器（:80）**：HTTP-01 挑战在明文 HTTP 监听器上应答，因此当配置含具名站点但没有任何站点绑定端口 80 时，raddy 会隐式绑定一个仅服务 ACME 挑战的明文 `:80` 监听器（其余请求返回 404）。没有它，ACME 服务器永远无法触达挑战，签发会一直挂起。配置 `dns_challenge`（DNS-01）时跳过该隐式监听器——选择 DNS 部署正是因为端口 80 不可用。显式配置 `:80` catch-all 已能应答挑战，因此不会重复绑定。
-- **具名站点显式端口**：`api.example.com:8081 { ... }` 将具名站点绑定到非标端口（用于本地多端口部署与测试）；省略端口时默认 443。IPv6 字面量地址（`[::1]:8080`）暂不支持。带 `tls` 指令的具名站点（见 第 5.7 节）即使端口不是 443 也以 TLS 提供。
+- **具名站点显式端口**：`api.example.com:8081 { ... }` 将具名站点绑定到非标端口（用于本地多端口部署与测试）；省略端口时默认 443。IPv6 字面量地址（`[::1]:8080`）已支持，Host 头也必须使用方括号形式。带 `tls` 指令的具名站点（见 第 5.7 节）即使端口不是 443 也以 TLS 提供。
 - **选不中兜底**：Host 缺失或畸形 → `400 Bad Request`；Host 合法但不匹配任何站点、且无兜底块 → `404 Not Found`。不提供可配置错误页。
 - **非标端口**：`:8443`。
 - **Catch-all**：`:80` 捕获该监听器上所有未匹配到具名站点的请求，常用于 HTTP→HTTPS 跳转（自动 HTTPS UX 的组成部分）。
-- **多域名共享站点块**（`a.example.com, b.example.com { ... }`）：推迟到首个真实用例。
+- **多域名共享站点块**（`a.example.com, b.example.com { ... }`）：已可用。块体会复制为每个主机一个独立站点，重复的主机/端口组合会被拒绝。
+- **通配符站点名**（`*.example.com`）：只匹配一个最左标签，不匹配顶级域名本身或多级前缀。精确名称优先于通配符，更具体的通配符后缀优先。
 
 ## 7. 示例（完整配置）
 
@@ -454,15 +460,16 @@ api.example.com {
 
 > 注：`header_up` 写在 `reverse_proxy` 之后仍对请求头生效——它是修饰指令，作用于本块服务的终端（此处为 `reverse_proxy`）。`encode zstd gzip` 位于 `handle` 块内，只作用于该块的 `file_server`。`rate_limit` 是声明式守卫（修饰指令）：作用于本块服务的任意终端。
 
-> 推迟与远期指令（`tls_alpn_challenge` 等）不在示例中出现，避免读者照抄无法解析的配置。
+> 示例保持默认的 HTTP-01。端口 80 不可用时，可在全局块启用
+> `tls_alpn_challenge`。
 
 ## 8. 四层监听器（TCP、SNI 透传与 UDP）
 
-**状态：可用（TCP/SNI/UDP），已包含在 `v0.3.0`。** UDP 不支持
-零停机升级，这是刻意保留的限制；请使用普通重启。
+**状态：可用（TCP/SNI/UDP/TLS 终止/透明 TCP），包含在
+`v0.3.5`。**
 
 `tcp` 块是**顶级监听器**，与 HTTP 站点块平级。它将裸 TCP 连接（不做 HTTP
-解析、不终止 TLS）转发到一个或多个上游：
+解析）转发到一个或多个上游。默认透传 TLS；配置可选的 `tls` 指令后会在中继前终止 TLS：
 
 ```caddyfile
 tcp :3306 {
@@ -478,6 +485,11 @@ tcp :3306 {
         consecutive_successes 2
     }
 }
+
+tcp :8443 {
+    tls internal
+    to 127.0.0.1:9443
+}
 ```
 
 - **监听地址**：IP 字面量，或 `:port` 表示所有接口；IPv6 需加方括号
@@ -489,11 +501,19 @@ tcp :3306 {
   最后可用地址（`raddy_l4_tcp_dns_refresh_failures_total` 计数）。启动时无法
   解析的上游是错误。
 - **SNI 路由**（`sni <name> <host:port>` + 可选 `fallback <host:port>`，L4 P1）：
-  含 `sni` 行的 `tcp` 监听器按 ClientHello 的精确 SNI 路由 TLS 连接——不终止
-  TLS（在有界前缀内检查 ClientHello 并原样转发）。每个 `sni` 将精确（小写）
-  名称映射到其专属上游；未知/缺失/畸形/超大的 SNI 在设置 `fallback` 时走
-  fallback，否则关闭连接。`sni` 与 `to` 互斥，v1 不支持通配符名称，且
-  `health_check` 不适用于 SNI 模式。
+  含 `sni` 行的 `tcp` 监听器按 ClientHello 的精确或单标签通配符 SNI 路由
+  TLS 连接——不终止 TLS（在有界前缀内检查 ClientHello 并原样转发）。精确名称优先，
+  通配符只匹配一个最左标签；未知/缺失/畸形/超大的 SNI 在设置 `fallback` 时走
+  fallback，否则关闭连接。`sni` 与 `to` 互斥，`health_check` 不适用于
+  SNI 模式。
+- **L4 TLS 终止**：在 `tcp` 块内加入 `tls internal` 或
+  `tls <cert-file> <key-file>`。Pingora 完成 TLS 握手，应用收到解密后的裸字节流；
+  该模式使用共享的 `to` 上游，不能与 SNI 透传或 `transparent` 同时使用。
+- **透明 TCP**：在 `tcp` 块内加入 `transparent` 并保留 `to` 兜底。
+  Linux 下监听 socket 设置 `IP_TRANSPARENT`，从 Pingora socket digest 读取原始目的地址，
+  并用原始客户端地址建立出站连接。需要 `CAP_NET_ADMIN`、TPROXY 规则和策略路由，
+  Windows 不支持。由于监听器由自定义服务持有，透明 TCP 配置必须使用普通重启，
+  不能使用 `raddy upgrade`。
 - **`lb_policy`** 复用 HTTP 策略：`round_robin`（默认）、`random`、`ip_hash`
   （源 IP 粘滞——同一客户端固定到同一上游）。
 - **`connect_timeout`** 限制单次上游连接的时长（默认 `5s`）；**`idle_timeout`**
@@ -512,9 +532,12 @@ tcp :3306 {
   *IP* 钉住，flow 身份仍含端口。上限：`max_flows` 限制表大小（最旧优先驱逐）、
   `idle_timeout` 驱逐空闲 flow、`max_datagram_size` 丢弃并计数超大报文、
   `recv_buffer`/`send_buffer` 设置 socket 缓冲（0 = 系统默认）。UDP 与 TCP 可
-  共享同一地址端口。指标：`raddy_l4_udp_*`。**零停机升级不适用于 UDP**：监听
-  socket 在 fd 移交机制之外绑定，`raddy upgrade` 无法服务 UDP 配置——请用普通
-  重启（flow 会重置）。
+  共享同一地址端口。指标：`raddy_l4_udp_*`。Linux 下 UDP 支持零停机升级：
+  raddy 通过私有 handoff manifest 交接监听 fd、每个已连接上游 flow fd 以及有界的 flow 元数据，
+  因而内核接收队列不会因重新 bind 而丢失。交接失败时升级不会报告成功。
+- **QUIC 透传**：UDP 代理可以把 QUIC 包当作普通数据报转发，但 Pingora 0.8.1 没有原生
+  QUIC/HTTP/3 协议栈。这不提供 QUIC 终止、HTTP/3 请求路由或 QUIC 连接迁移；这些功能
+  需要独立的 QUIC/HTTP/3 sidecar。
 - **重载语义**：SIGHUP 重载会把新的上游集合、策略、限制与超时应用到*新*连接；
   已有连接保持其选定的上游。修改监听器的绑定地址属于**拓扑变更**，会被拒绝
   并提示改用重启或 `raddy upgrade`。
@@ -523,5 +546,4 @@ tcp :3306 {
 
 - 任何本规范未覆盖的语法细节，实现时**先补文档再动手**。
 - Cloudflare 之外的 DNS-01 服务商**推迟**——每个服务商开一个 GitHub issue（欢迎社区贡献）。
-- 上游 HTTP/2 属后续工作（见 第 5.6 节）；明文 h2c 不在计划内。
-- **TLS-ALPN-01（见 第 5.8 节）推迟**：instant-acme 0.8.5 将账户密钥留在内部，Pingora 0.8 的 `TlsSettings` 也没有能换入 `acme-tls/1` 校验证书的动态 ALPN 回调，不 fork 一个依赖就无法实现。HTTP-01 与 DNS-01 已覆盖其余可达性场景。
+- QUIC/HTTP-3 终止仍是独立 sidecar 边界，因为 Pingora 0.8.1 没有 QUIC transport。

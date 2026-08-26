@@ -1,6 +1,6 @@
 # Layer 4 Proxy Implementation Plan
 
-Status: Implemented in `v0.3.0`
+Status: Implemented in `v0.3.5`
 
 This document is the implementation and acceptance record for TCP and UDP layer
 4 proxying in raddy. It records the architecture, configuration boundary,
@@ -8,10 +8,11 @@ runtime semantics, delivery order, and post-release follow-up work.
 
 The P0 raw-TCP, P1 SNI passthrough, and P2 bounded-UDP runtime paths are present
 in the released tree. Integration coverage includes TCP admission, half-close
-and failed-upstream paths, plus UDP oversize drops, capacity eviction, reload,
-IPv6, and typed flow access records. Post-release work is limited to independent
-security/operations review and reproducible direct-versus-proxy benchmarks;
-neither changes the documented UDP upgrade limitation.
+and failed-upstream paths, SNI wildcard routing, TLS termination, plus UDP
+oversize drops, capacity eviction, reload, IPv6, typed flow access records, and
+UDP listener/flow handoff during upgrade. Transparent TCP is implemented as a
+Linux listener/connector shim around Pingora's ServerApp; QUIC/HTTP/3
+termination remains a separate protocol service.
 
 ## Decision summary
 
@@ -445,15 +446,17 @@ the client port. A selected upstream remains stable for the flow's lifetime.
 Graceful shutdown stops accepting new client datagrams, allows a short bounded
 response-drain period, then closes all flows and records their outcomes.
 
-The first UDP release must not claim lossless zero-downtime upgrade. A Pingora
-background service does not automatically transfer its Tokio UDP listener, and
-transferring only the listener would not preserve connected upstream sockets or
-flow ownership. `SO_REUSEPORT` alone is not a flow-state handoff mechanism.
+Pingora's background service does not automatically transfer its Tokio UDP
+listener, so raddy adds an isolated handoff protocol. On the upgrade phase it
+stops the receive loop, writes a bounded manifest, and transfers the listener
+fd plus every connected upstream flow fd through bounded SCM_RIGHTS chunks. The
+replacement adopts those descriptors and reconstructs the flow table before it
+starts receiving. `SO_REUSEPORT` is not used as a substitute for this
+protocol.
 
-Until listener and flow-state transfer is designed, UDP-enabled configurations
-must use a documented restart path for upgrades, with an explicit warning that
-active flows are reset. A later milestone may add coordinated UDP file descriptor
-and flow handoff; it is not part of P2 acceptance.
+If any manifest or descriptor chunk cannot be transferred, the replacement does
+not claim a successful UDP takeover. The operator can retry the upgrade or
+perform a normal restart.
 
 ### UDP observability
 
@@ -473,7 +476,7 @@ upstream, duration, packets, bytes, and outcome. Required metrics include:
 3. Implement the connected-upstream flow object and response path.
 4. Implement the bounded flow table, deadline management, and eviction policy.
 5. Integrate backend selection once per new flow.
-6. Add shutdown behavior, explicit upgrade limitations, metrics, and flow logs.
+6. Add shutdown behavior, the UDP fd/flow handoff, metrics, and flow logs.
 7. Add concurrency, resource-bound, and packet-loss-path tests.
 
 ## Reload semantics
@@ -561,16 +564,13 @@ QPS value a CI gate.
 The following features require separate designs and are not hidden requirements
 of P0-P2:
 
-- Layer 4 TLS termination or ACME integration.
+- ACME integration for raw L4 listeners without an HTTP site identity.
 - Generic protocol inspection beyond TLS ClientHello SNI.
-- Transparent proxying and original-destination recovery.
-- QUIC-aware proxying.
+- QUIC/HTTP/3 termination and HTTP/3 request routing.
 - Protocol-specific UDP active health checks.
-- Lossless UDP process upgrades.
 - Dynamic listener topology changes through SIGHUP.
 - Unix datagram sockets.
 - PROXY protocol v1/v2 ingress or egress.
-- Wildcard SNI routing.
 
 ## Definition of done
 
@@ -582,7 +582,8 @@ The layer 4 initiative is complete when:
   demonstrated by automated tests.
 - TLS inspection is bounded, fuzzed, and forwards the original ClientHello bytes.
 - UDP memory, tasks, file descriptors, queues, and flow lifetime are all bounded.
-- UDP upgrade limitations are explicit in CLI output and operations docs.
+- UDP upgrade handoff and failure behavior are explicit in CLI output and
+  operations docs.
 - Metrics and structured logs explain every rejection, timeout, eviction, and
   abnormal relay termination without recording payload data.
 - English and Chinese user documentation describe only behavior that the tests

@@ -20,23 +20,28 @@
 //! ephemeral local port demultiplexes upstream responses, plus a reader task
 //! that sends those responses back to the client.
 //!
-//! Resources are bounded: the flow table is capped (`max_flows`, with
+//! Resources are bounded: the flow table is capped (max_flows, with
 //! deterministic oldest-first eviction), oversized datagrams are dropped and
-//! counted, and a flow idle for `idle_timeout` is evicted (its upstream socket
+//! counted, and a flow idle for idle_timeout is evicted (its upstream socket
 //! released). Selection (source-IP hash / round-robin / random) happens once
-//! per new flow. A SIGHUP reload updates the upstream set for *new* flows
-//! (existing flows keep their socket). Lossless zero-downtime upgrades are not
-//! supported for UDP (the plan defers flow-state handoff); the CLI/ops docs
-//! state the restart path.
+//! per new flow. A SIGHUP reload updates the upstream set for new flows
+//! (existing flows keep their socket). On Linux, zero-downtime upgrades transfer
+//! the listener, connected upstream sockets, and bounded flow metadata through
+//! a dedicated handoff protocol.
 
 use crate::config::ast::{L4Upstream, Layer4Listener, LbPolicy, ListenAddress, UdpProxyConfig};
 use crate::config::snapshot::ConfigStore;
 use crate::layer4::tcp::resolve_upstream;
 use async_trait::async_trait;
 use pingora::server::ShutdownWatch;
+#[cfg(unix)]
+use pingora::server::{ExecutionPhase, Fds};
 use pingora::services::background::BackgroundService;
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,6 +56,31 @@ struct UdpFlow {
     /// Datagrams relayed client -> upstream (updated by the datagram loop).
     c2u_packets: u64,
 }
+
+/// The serializable part of one UDP flow transferred across a process upgrade.
+#[cfg(unix)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct UdpHandoffFlow {
+    client: SocketAddr,
+    upstream: SocketAddr,
+    client_packets: u64,
+}
+
+/// The manifest accompanying the transferred UDP listener and flow sockets.
+#[cfg(unix)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct UdpHandoffManifest {
+    chunks: usize,
+    flows: Vec<UdpHandoffFlow>,
+}
+
+#[cfg(unix)]
+type UdpHandoffState = (std::net::UdpSocket, Vec<(UdpHandoffFlow, Arc<UdpSocket>)>);
+
+/// Keep the number of descriptors in every SCM_RIGHTS message below Pingora's
+/// receiver limit, leaving room for the listener descriptor in chunk zero.
+#[cfg(unix)]
+const HANDOFF_FLOWS_PER_CHUNK: usize = 30;
 
 /// The selection state of one listener, reload-updatable: a SIGHUP reload swaps
 /// the resolved upstream set and policy for *new* flows.
@@ -192,9 +222,17 @@ type AccessLogSink = dyn Fn(&UdpFlowRecord) + Send + Sync;
 /// The UDP proxy background service for one listener.
 pub struct UdpProxy {
     listener: String,
-    /// The bound std socket. Converted to tokio in `start` (where a runtime
-    /// exists); bound in `new` so a failed bind is a startup error.
-    std_socket: std::net::UdpSocket,
+    /// The bound std socket. Converted to tokio in start (where a runtime
+    /// exists); normal processes bind in new, while upgrade replacements
+    /// receive the socket during startup.
+    std_socket: Mutex<Option<std::net::UdpSocket>>,
+    /// True when this process must receive the UDP socket and flow table from
+    /// the old process during a Pingora upgrade.
+    upgrade: bool,
+    #[cfg(unix)]
+    upgrade_sock: String,
+    #[cfg(unix)]
+    phase_watch: Mutex<Option<tokio::sync::broadcast::Receiver<ExecutionPhase>>>,
     listen: ListenAddress,
     config_store: Arc<ConfigStore>,
     /// Reload-updatable selection state.
@@ -218,27 +256,38 @@ impl UdpProxy {
         udp: &UdpProxyConfig,
         config_store: Arc<ConfigStore>,
         access_log: Option<Arc<AccessLogSink>>,
+        upgrade: bool,
+        #[cfg(unix)] upgrade_sock: String,
+        #[cfg(unix)] phase_watch: Option<tokio::sync::broadcast::Receiver<ExecutionPhase>>,
     ) -> Result<Self, String> {
         let listener = format!("udp/{}", udp.listen.display());
-        let mut socket = std::net::UdpSocket::bind(udp.listen.display())
-            .map_err(|e| format!("failed to bind udp listener {}: {e}", udp.listen.display()))?;
-        socket.set_nonblocking(true).map_err(|e| {
-            format!(
-                "failed to set udp listener {} non-blocking: {e}",
-                udp.listen.display()
-            )
-        })?;
+        let mut socket = if upgrade {
+            None
+        } else {
+            let socket = std::net::UdpSocket::bind(udp.listen.display()).map_err(|e| {
+                format!("failed to bind udp listener {}: {e}", udp.listen.display())
+            })?;
+            socket.set_nonblocking(true).map_err(|e| {
+                format!(
+                    "failed to set udp listener {} non-blocking: {e}",
+                    udp.listen.display()
+                )
+            })?;
+            Some(socket)
+        };
         // Configure socket buffers via socket2 (0 = OS default); `std::net`
         // no longer exposes the buffer setters directly.
         if udp.recv_buffer > 0 || udp.send_buffer > 0 {
-            let sock = socket2::Socket::from(socket);
-            if udp.recv_buffer > 0 {
-                let _ = sock.set_recv_buffer_size(udp.recv_buffer);
+            if let Some(bound) = socket.take() {
+                let sock = socket2::Socket::from(bound);
+                if udp.recv_buffer > 0 {
+                    let _ = sock.set_recv_buffer_size(udp.recv_buffer);
+                }
+                if udp.send_buffer > 0 {
+                    let _ = sock.set_send_buffer_size(udp.send_buffer);
+                }
+                socket = Some(sock.into());
             }
-            if udp.send_buffer > 0 {
-                let _ = sock.set_send_buffer_size(udp.send_buffer);
-            }
-            socket = sock.into();
         }
         let upstreams = resolve_udp_upstreams(udp)?;
         let state = Mutex::new(UdpState {
@@ -252,7 +301,12 @@ impl UdpProxy {
         Ok(Self {
             cursor: AtomicUsize::new(0),
             listener,
-            std_socket: socket,
+            std_socket: Mutex::new(socket),
+            upgrade,
+            #[cfg(unix)]
+            upgrade_sock,
+            #[cfg(unix)]
+            phase_watch: Mutex::new(phase_watch),
             listen: udp.listen.clone(),
             config_store,
             state,
@@ -261,6 +315,16 @@ impl UdpProxy {
             metrics: UdpMetrics::register(&format!("udp/{}", udp.listen.display())),
             access_log,
         })
+    }
+
+    /// Return the manifest path used by the UDP upgrade handoff.
+    pub fn handoff_manifest_path(upgrade_sock: &str) -> String {
+        format!("{upgrade_sock}.udp.manifest")
+    }
+
+    /// Return the Unix socket path used for one UDP handoff descriptor chunk.
+    pub fn handoff_part_path(upgrade_sock: &str, chunk: usize) -> String {
+        format!("{upgrade_sock}.udp.part.{chunk}")
     }
 
     /// The current selection state, rebuilt on reload when the upstream set or
@@ -302,6 +366,79 @@ impl UdpProxy {
             max_flows: state.max_flows,
             max_datagram_size: state.max_datagram_size,
         }
+    }
+
+    #[cfg(unix)]
+    /// Transfer the listener and all connected upstream flow sockets to the
+    /// replacement process. The manifest is written before descriptor chunks,
+    /// so the receiver knows exactly how many bounded SCM_RIGHTS messages to
+    /// await.
+    async fn send_handoff(&self) -> Result<(), String> {
+        let (listener_fd, flow_fds, manifest) = {
+            let socket_guard = self.std_socket.lock().expect("UDP socket lock poisoned");
+            let socket = socket_guard
+                .as_ref()
+                .ok_or("UDP listener socket is unavailable")?;
+            let flows = self.flows.lock().expect("UDP flows lock poisoned");
+            let mut metadata = Vec::with_capacity(flows.len());
+            let mut fds = Vec::with_capacity(flows.len());
+            for (client, flow) in flows.iter() {
+                let upstream = flow
+                    .upstream
+                    .peer_addr()
+                    .map_err(|e| format!("read UDP upstream peer: {e}"))?;
+                metadata.push(UdpHandoffFlow {
+                    client: *client,
+                    upstream,
+                    client_packets: flow.c2u_packets,
+                });
+                fds.push(flow.upstream.as_raw_fd());
+            }
+            let chunks = metadata.len().div_ceil(HANDOFF_FLOWS_PER_CHUNK);
+            (
+                socket.as_raw_fd(),
+                fds,
+                UdpHandoffManifest {
+                    chunks: chunks.max(1),
+                    flows: metadata,
+                },
+            )
+        };
+        let manifest_path = Self::handoff_manifest_path(&self.upgrade_sock);
+        let payload = serde_json::to_vec(&manifest)
+            .map_err(|e| format!("serialize UDP handoff manifest: {e}"))?;
+        write_handoff_manifest(&manifest_path, &payload)?;
+
+        let upgrade_sock = self.upgrade_sock.clone();
+        tokio::task::spawn_blocking(move || {
+            for chunk in 0..manifest.chunks {
+                let start = chunk * HANDOFF_FLOWS_PER_CHUNK;
+                let end = (start + HANDOFF_FLOWS_PER_CHUNK).min(manifest.flows.len());
+                let mut fds = Fds::new();
+                if chunk == 0 {
+                    fds.add("listener".to_string(), listener_fd);
+                }
+                for (index, fd) in flow_fds.iter().enumerate().take(end).skip(start) {
+                    fds.add(format!("flow-{index}"), *fd);
+                }
+                let path = Self::handoff_part_path(&upgrade_sock, chunk);
+                fds.send_to_sock(path.as_str())
+                    .map_err(|e| format!("send UDP handoff chunk {chunk}: {e}"))?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("UDP handoff worker failed: {e}"))??;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    /// Receive the inherited UDP listener and connected flow sockets.
+    async fn receive_handoff(&self) -> Result<UdpHandoffState, String> {
+        let upgrade_sock = self.upgrade_sock.clone();
+        tokio::task::spawn_blocking(move || receive_udp_handoff(&upgrade_sock))
+            .await
+            .map_err(|e| format!("UDP handoff receiver failed: {e}"))?
     }
 
     /// Select the upstream address for a new flow, per the policy (source-IP
@@ -519,7 +656,128 @@ impl UdpProxy {
     }
 }
 
-/// A deterministic (FNV-1a) hash of `bytes` for source-IP stickiness.
+#[cfg(unix)]
+/// Atomically publish a bounded handoff manifest with private permissions.
+fn write_handoff_manifest(path: &str, payload: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let temp = format!("{path}.tmp.{}", std::process::id());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(|e| format!("create UDP handoff manifest: {e}"))?;
+    file.write_all(payload)
+        .map_err(|e| format!("write UDP handoff manifest: {e}"))?;
+    file.sync_data()
+        .map_err(|e| format!("sync UDP handoff manifest: {e}"))?;
+    std::fs::rename(&temp, path).map_err(|e| format!("publish UDP handoff manifest: {e}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+/// Receive one complete UDP handoff transaction from the old process.
+fn receive_udp_handoff(upgrade_sock: &str) -> Result<UdpHandoffState, String> {
+    let manifest_path = UdpProxy::handoff_manifest_path(upgrade_sock);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let manifest = loop {
+        if let Ok(bytes) = std::fs::read(&manifest_path) {
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("UDP handoff manifest exceeds 16 MiB".to_string());
+            }
+            break serde_json::from_slice::<UdpHandoffManifest>(&bytes)
+                .map_err(|e| format!("parse UDP handoff manifest: {e}"))?;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "UDP handoff manifest {} did not arrive",
+                manifest_path
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if manifest.chunks == 0 || manifest.chunks > 1_000_000 {
+        return Err(format!(
+            "invalid UDP handoff chunk count {}",
+            manifest.chunks
+        ));
+    }
+    if manifest.flows.len() > 30_000_000 {
+        return Err("UDP handoff flow count exceeds the safety limit".to_string());
+    }
+    let expected_chunks = manifest
+        .flows
+        .len()
+        .div_ceil(HANDOFF_FLOWS_PER_CHUNK)
+        .max(1);
+    if manifest.chunks != expected_chunks {
+        return Err(format!(
+            "UDP handoff chunk count {} does not match {} flows",
+            manifest.chunks,
+            manifest.flows.len()
+        ));
+    }
+    let mut sockets: Vec<Option<Arc<UdpSocket>>> =
+        (0..manifest.flows.len()).map(|_| None).collect();
+    let mut listener_fd = None;
+    for chunk in 0..manifest.chunks {
+        let path = UdpProxy::handoff_part_path(upgrade_sock, chunk);
+        let mut fds = Fds::new();
+        fds.get_from_sock(path.as_str())
+            .map_err(|e| format!("receive UDP handoff chunk {chunk}: {e}"))?;
+        if chunk == 0 {
+            listener_fd = fds.get("listener").copied();
+        }
+        let start = chunk * HANDOFF_FLOWS_PER_CHUNK;
+        let end = (start + HANDOFF_FLOWS_PER_CHUNK).min(manifest.flows.len());
+        for (index, slot) in sockets.iter_mut().enumerate().take(end).skip(start) {
+            let fd = fds
+                .get(&format!("flow-{index}"))
+                .copied()
+                .ok_or_else(|| format!("UDP handoff is missing flow fd {index}"))?;
+            // SAFETY: the fd was transferred through SCM_RIGHTS and is now
+            // owned by this process.
+            let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+            std_socket
+                .set_nonblocking(true)
+                .map_err(|e| format!("set inherited UDP flow nonblocking: {e}"))?;
+            let socket = UdpSocket::from_std(std_socket)
+                .map_err(|e| format!("adopt inherited UDP flow socket: {e}"))?;
+            let actual_upstream = socket
+                .peer_addr()
+                .map_err(|e| format!("read inherited UDP flow peer: {e}"))?;
+            if actual_upstream != manifest.flows[index].upstream {
+                return Err(format!(
+                    "UDP handoff flow {index} points to {actual_upstream}, expected {}",
+                    manifest.flows[index].upstream
+                ));
+            }
+            *slot = Some(Arc::new(socket));
+        }
+    }
+    let listener_fd = listener_fd.ok_or("UDP handoff is missing the listener fd")?;
+    // SAFETY: the listener fd was transferred through SCM_RIGHTS and is now
+    // owned by this process.
+    let listener = unsafe { std::net::UdpSocket::from_raw_fd(listener_fd) };
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set inherited UDP listener nonblocking: {e}"))?;
+    let flows = manifest
+        .flows
+        .into_iter()
+        .enumerate()
+        .map(|(index, flow)| {
+            let socket = sockets[index]
+                .take()
+                .ok_or_else(|| format!("UDP handoff flow {index} was not received"))?;
+            Ok((flow, socket))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let _ = std::fs::remove_file(&manifest_path);
+    Ok((listener, flows))
+}
+
+/// A deterministic (FNV-1a) hash of bytes for source-IP stickiness.
 fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -556,23 +814,102 @@ fn resolve_udp_upstreams(udp: &UdpProxyConfig) -> Result<Vec<SocketAddr>, String
 #[async_trait]
 impl BackgroundService for UdpProxy {
     async fn start(&self, mut shutdown: ShutdownWatch) {
+        #[cfg(unix)]
+        let inherited = if self.upgrade {
+            match self.receive_handoff().await {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::error!(
+                        "udp {}: failed to receive upgrade handoff: {error}",
+                        self.listener
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let inherited = None;
+
+        #[cfg(unix)]
+        if let Some((listener, flows)) = inherited {
+            *self.std_socket.lock().expect("UDP socket lock poisoned") = Some(listener);
+            let mut guard = self.flows.lock().expect("UDP flows lock poisoned");
+            for (flow, upstream) in flows {
+                guard.insert(
+                    flow.client,
+                    UdpFlow {
+                        upstream,
+                        last_active: Instant::now(),
+                        c2u_packets: flow.client_packets,
+                    },
+                );
+            }
+        }
+
         // Convert the bound std socket to tokio here, where a runtime exists.
-        let socket = match self.std_socket.try_clone() {
-            Ok(s) => match UdpSocket::from_std(s) {
+        let std_socket = self
+            .std_socket
+            .lock()
+            .expect("UDP socket lock poisoned")
+            .as_ref()
+            .and_then(|socket| socket.try_clone().ok());
+        let socket = match std_socket {
+            Some(s) => match UdpSocket::from_std(s) {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     tracing::error!("udp {}: failed to wrap listener socket: {e}", self.listener);
                     return;
                 }
             },
-            Err(e) => {
-                tracing::error!(
-                    "udp {}: failed to clone listener socket: {e}",
-                    self.listener
-                );
+            None => {
+                tracing::error!("udp {}: listener socket is unavailable", self.listener);
                 return;
             }
         };
+        let inherited_clients: Vec<SocketAddr> = self
+            .flows
+            .lock()
+            .expect("UDP flows lock poisoned")
+            .keys()
+            .copied()
+            .collect();
+        for client in inherited_clients {
+            let upstream = self
+                .flows
+                .lock()
+                .expect("UDP flows lock poisoned")
+                .get(&client)
+                .map(|flow| flow.upstream.clone());
+            if let Some(upstream) = upstream {
+                self.spawn_flow_reader(
+                    socket.clone(),
+                    client,
+                    upstream,
+                    self.current_state().idle_timeout,
+                );
+            }
+        }
+
+        let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        #[cfg(unix)]
+        if let Some(mut phase) = self
+            .phase_watch
+            .lock()
+            .expect("UDP phase watch lock poisoned")
+            .take()
+        {
+            let handoff_tx = handoff_tx.clone();
+            tokio::spawn(async move {
+                while let Ok(phase_value) = phase.recv().await {
+                    if matches!(phase_value, ExecutionPhase::GracefulUpgradeTransferringFds) {
+                        let _ = handoff_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
         let mut max = self.current_state().max_datagram_size;
         // Buffer one byte larger than the cap so an oversized datagram is
         // detectable (a full read means it was truncated / too big).
@@ -587,7 +924,21 @@ impl BackgroundService for UdpProxy {
                 buf.resize(max.saturating_add(1), 0);
             }
             tokio::select! {
-                _ = shutdown.changed() => break,
+                signal = shutdown.changed() => {
+                    if signal.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                signal = handoff_rx.recv() => {
+                    if signal.is_some() {
+                        self.stop.store(true, Ordering::Relaxed);
+                        #[cfg(unix)]
+                        if let Err(error) = self.send_handoff().await {
+                            tracing::error!("udp {}: failed to send upgrade handoff: {error}", self.listener);
+                        }
+                        break;
+                    }
+                }
                 r = socket.recv_from(&mut buf) => {
                     let (n, client) = match r {
                         Ok(x) => x,

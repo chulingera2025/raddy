@@ -70,8 +70,8 @@ impl DnsRecord for RecordHandle {
 }
 
 impl DnsProvider for Cloudflare {
-    fn present(&self, host: &str, key_authorization: &str) -> Result<Box<dyn DnsRecord>, String> {
-        Ok(Box::new(self.present_txt(host, key_authorization)?))
+    fn present(&self, host: &str, dns_value: &str) -> Result<Box<dyn DnsRecord>, String> {
+        Ok(Box::new(self.present_txt(host, dns_value)?))
     }
 }
 
@@ -130,10 +130,14 @@ impl Cloudflare {
     /// Publish the DNS-01 challenge: create a `_acme-challenge.<host>` TXT
     /// record whose content is the key authorization. Returns a handle that
     /// carries the client and removes the record via [`DnsRecord::cleanup`].
-    fn present_txt(&self, host: &str, key_authorization: &str) -> Result<RecordHandle, String> {
-        let zone_id = self.find_zone_id(host)?;
-        let record_name = format!("_acme-challenge.{host}");
-        let record_id = self.create_txt(&zone_id, &record_name, key_authorization)?;
+    fn present_txt(&self, host: &str, dns_value: &str) -> Result<RecordHandle, String> {
+        // ACME represents wildcard identifiers with a leading `*.`; DNS-01
+        // proves the base domain, so the wildcard label must not enter either
+        // zone discovery or the TXT record name.
+        let dns_host = host.strip_prefix("*.").unwrap_or(host);
+        let zone_id = self.find_zone_id(dns_host)?;
+        let record_name = format!("_acme-challenge.{dns_host}");
+        let record_id = self.create_txt(&zone_id, &record_name, dns_value)?;
         Ok(RecordHandle {
             client: self.clone(),
             zone_id,
@@ -436,6 +440,17 @@ mod tests {
 
         let records = created.lock().unwrap();
         assert_eq!(records[0]["name"], "_acme-challenge.sub.example.com");
+    }
+
+    #[test]
+    fn wildcard_dns01_uses_the_base_domain_record_name() {
+        let (base, created) = MockApi::start();
+        let client = Cloudflare::with_base("test-token", &base);
+
+        client.present_txt("*.example.com", "ka").unwrap();
+
+        let records = created.lock().unwrap();
+        assert_eq!(records[0]["name"], "_acme-challenge.example.com");
     }
 
     #[test]

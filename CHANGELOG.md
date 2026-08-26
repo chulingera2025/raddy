@@ -9,6 +9,41 @@ section short.
 
 No unreleased changes yet.
 
+## [v0.3.5] — 2026-08-26
+
+### Added
+
+- Upstream HTTP/2 and cleartext prior-knowledge h2c via `h2://` and
+  `h2c://`.
+- Shared multi-domain site blocks, IPv6 HTTP listeners and site addresses, and
+  exact-plus-one-label wildcard matching for HTTP, TLS, and L4 SNI.
+- ACME TLS-ALPN-01 with temporary RFC 8737 challenge certificates and mixed
+  `acme-tls/1` / HTTP ALPN selection.
+- Raw TCP TLS termination with `tls internal` or a static certificate pair.
+- Linux transparent TCP routing with original-destination lookup and
+  source-preserving outbound sockets.
+- Linux UDP zero-downtime upgrades: listener fd, connected flow fds, and
+  bounded flow metadata are transferred through an isolated handoff protocol.
+- QUIC datagram passthrough remains available through the UDP proxy; HTTP/3
+  termination is explicitly documented as a separate sidecar boundary because
+  Pingora 0.8.1 has no native QUIC transport.
+
+### Changed
+
+- HTTP and TLS listeners bind the IPv6 wildcard with dual-stack behavior,
+  keeping IPv4 and IPv6 clients on the same listener topology.
+- Wildcard ACME identifiers use DNS-01's base-domain TXT record name when the
+  existing Cloudflare DNS-01 provider is selected.
+- The release and capability documentation now records the Pingora-native,
+  application, and custom-integration boundaries for each transport.
+
+### Fixed
+
+- Upstream peer identity and load-balancer reuse now include the selected HTTP
+  protocol version, so H1 and H2 peers sharing an address cannot be conflated.
+- UDP upgrades no longer reset active flows or rebind the listener, preserving
+  the kernel receive queue across a replacement process.
+
 ## [v0.3.0] — 2026-08-26
 
 ### Added
@@ -132,7 +167,8 @@ No unreleased changes yet.
   `redir`, SIGHUP hot reload, ACME automatic HTTPS (HTTP-01, verified against
   Pebble), structured access log, Prometheus metrics, release installer.
 
-[Unreleased]: https://github.com/chulingera2025/raddy/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/chulingera2025/raddy/compare/v0.3.5...HEAD
+[v0.3.5]: https://github.com/chulingera2025/raddy/compare/v0.3.0...v0.3.5
 [v0.3.0]: https://github.com/chulingera2025/raddy/compare/v0.2.10...v0.3.0
 [v0.2.10]: https://github.com/chulingera2025/raddy/compare/v0.2.1...v0.2.10
 [v0.2.1]: https://github.com/chulingera2025/raddy/compare/v0.1.2...v0.2.1

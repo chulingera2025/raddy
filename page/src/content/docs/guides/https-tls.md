@@ -22,7 +22,8 @@ example.com {
 raddy registers with the ACME directory, proves control of the domain — with
 **HTTP-01** on its plain-HTTP listener by default, or **DNS-01** via
 [`dns_challenge`](../../config/directives/#dns_challenge) when port 80 is
-unreachable — and renews the certificate within 30 days of expiry. Set your
+unreachable, or TLS-ALPN-01 via the tls_alpn_challenge directive when port 80 is
+unavailable — and renews the certificate within 30 days of expiry. Set your
 contact email in the [global block](../../config/sites/#the-global-block), and add
 an HTTP→HTTPS redirect if you want port 80 visitors pointed at the secure site.
 The full matching model is on [Sites, ports & HTTPS](../../config/sites/).
@@ -139,8 +140,23 @@ mismatched `tls_servername` or missing `tls_ca` is loud, not silent.
 
 TLS listeners advertise HTTP/2 (`h2`) via ALPN and serve HTTP/2 to clients that
 support it, falling back to HTTP/1.1 otherwise — no configuration needed. Plain
-HTTP listeners stay HTTP/1.1 (cleartext h2c is not supported), and raddy talks
-HTTP/1.1 to upstreams today.
+HTTP listeners stay HTTP/1.1. Upstream HTTP/2 is explicit: use
+`h2://host:port` for TLS HTTP/2 or `h2c://host:port` for cleartext
+prior-knowledge HTTP/2.
+
+## TLS-ALPN-01
+
+Enable the challenge in the global block when port 80 cannot be used:
+
+```caddyfile
+{
+    tls_alpn_challenge
+}
+```
+
+The challenge is served on TCP port 443 with a temporary certificate carrying
+the RFC 8737 `acmeIdentifier` extension and `acme-tls/1` ALPN. It is
+mutually exclusive with DNS-01 and applies only to ACME sites on port 443.
 
 ## WebSockets over TLS
 

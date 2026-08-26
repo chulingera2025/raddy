@@ -120,7 +120,7 @@ trusted, so the default must be pinned down:
 | `rate_limit` | `rate_limit <key> <rate> [burst=<n>]` (**single-instance** rate limit; see Section 5.2); key is `remote_ip` or `header <name>` | Available |
 | `trusted_proxies` | trusted network list (see Section 4) | Available |
 | `dns_challenge` | `dns_challenge cloudflare <api_token>` — DNS-01 issuance via a DNS provider (Cloudflare today; see Section 5.3) | Available |
-| `tls_alpn_challenge` | prove control via TLS-ALPN-01 on port 443 instead of HTTP-01 (see Section 5.8) | Deferred |
+| `tls_alpn_challenge` | prove control via TLS-ALPN-01 on port 443 instead of HTTP-01 (see Section 5.8) | Available |
 | `tls` | per-site TLS source and options: `tls [<cert> <key> \| internal]`, `min_version`, `max_version`, `ciphers`, `client_auth` (see Section 5.7) | Available |
 | `rewrite` | `rewrite <to>` — rewrite the request URI before forwarding; takes no matcher, always applied (modifier; see Section 5.9) | Available |
 | `handle_path` | like `handle`, but strips the matched path prefix from the URI (see Section 5.9) | Available |
@@ -242,11 +242,14 @@ api.example.com {
 
 **Status: Available.**
 
-Upstreams are plain HTTP by default. Prefix an upstream with `https://` to talk
-TLS to the backend:
+Upstreams are plain HTTP/1.1 by default. Prefix an upstream with `https://` to
+talk TLS HTTP/1.1 to the backend. Use `h2://` for TLS HTTP/2 or `h2c://` for
+cleartext prior-knowledge HTTP/2:
 
 ```caddyfile
 reverse_proxy https://127.0.0.1:8443
+reverse_proxy h2://127.0.0.1:9443
+reverse_proxy h2c://127.0.0.1:9080
 
 reverse_proxy {
     to https://10.0.0.1:8443 https://10.0.0.2:8443
@@ -298,9 +301,13 @@ tunnels the connection bidirectionally.
 - **Downstream**: TLS listeners (port 443) advertise `h2` via ALPN and serve
   HTTP/2 to clients that support it, falling back to HTTP/1.1 otherwise. This is
   the default.
-- **Cleartext (h2c)**: not supported — a plain-HTTP listener stays HTTP/1.1.
-- **Upstream**: raddy talks HTTP/1.1 to upstreams today; upstream HTTP/2 is
-  future work.
+- **Cleartext (h2c)**: a plain listener remains HTTP/1.1 for clients; upstream
+  prior-knowledge h2c is available with the explicit `h2c://` scheme.
+- **Upstream**: use `h2://host:port` for TLS HTTP/2 with ALPN `h2`,
+  or `h2c://host:port` for cleartext prior-knowledge HTTP/2.
+  `https://` and bare targets retain their existing HTTP/1.1 behavior.
+- The `h2c://` form does not use the obsolete HTTP/1.1 Upgrade
+  mechanism; the upstream must accept the HTTP/2 connection preface directly.
 - The advertised ALPN set is fixed (`h2` preferred, `http/1.1` fallback) on
   every TLS listener; it is not configurable per site.
 
@@ -353,11 +360,10 @@ secure.example.com {
 
 ### 5.8 TLS-ALPN-01 challenge
 
-**Status: Deferred.** `tls_alpn_challenge` cannot be implemented against the
-current dependencies: instant-acme 0.8.5 keeps the account key internal, and
-Pingora 0.8's `TlsSettings` has no dynamic ALPN callback that can swap in the
-`acme-tls/1` validation certificate — building it needs a dependency fork.
-HTTP-01 and DNS-01 cover the reachability cases otherwise.
+**Status: Available.** `tls_alpn_challenge` uses the OpenSSL listener's
+low-level ClientHello and ALPN callbacks together with a temporary RFC 8737
+challenge certificate. It is mutually exclusive with `dns_challenge` and
+requires ACME sites to use the standard TLS port 443.
 
 Domain control could otherwise be proven by answering an ACME challenge over the
 `acme-tls/1` ALPN protocol on port 443, when HTTP-01 (port 80) is blocked but
@@ -365,10 +371,9 @@ port 443 is reachable:
 
 - **Syntax**: `tls_alpn_challenge`, in the **global block**.
 - **Semantics**: when set, certificate issuance uses **TLS-ALPN-01**: the ACME
-  server opens a TLS connection to port 443 offering the `acme-tls/1` ALPN, and
-  raddy answers with a validation certificate whose key matches the key
-  authorization. HTTP-01 remains available as a fallback when the ACME server
-  does not support TLS-ALPN-01.
+  server opens a TLS connection to port 443 offering only `acme-tls/1`, and
+  raddy answers with a short-lived validation certificate containing the
+  `acmeIdentifier` extension. HTTP-01 is not enabled as a fallback.
 
 ### 5.9 Matchers, `rewrite`, `handle_path`, `respond`, `error`
 
@@ -527,8 +532,8 @@ configure access logging more precisely:
   `:port` catch-all.
 - **Named sites default to port 443**: `api.example.com` (no port) binds 443
   (TLS). Automatic HTTPS is active: named sites obtain certificates via ACME —
-  HTTP-01 by default, DNS-01 when `dns_challenge` is configured (Section 5.3).
-  TLS-ALPN-01 (`tls_alpn_challenge`) is deferred (Section 5.8). A `tls` source
+  HTTP-01 by default, DNS-01 when `dns_challenge` is configured (Section 5.3),
+  or TLS-ALPN-01 when `tls_alpn_challenge` is configured (Section 5.8). A `tls` source
   of static or internal certs (Section 5.7) opts a site out of ACME. SNI returns
   the matching certificate, and the 443 listener uses SNI dynamic certificates
   (cached in `raddy_certs/`, reused on restart). Certificates are renewed
@@ -544,7 +549,7 @@ configure access logging more precisely:
 - **Explicit named-site ports**: `api.example.com:8081 { ... }` binds a named
   site to a non-standard port (for local multi-port deployment and testing);
   the default is 443 when the port is omitted. IPv6 literal addresses
-  (`[::1]:8080`) are not yet supported. A named site with a `tls` directive
+  (`[::1]:8080`) are supported; the Host header uses the bracketed form. A named site with a `tls` directive
   (Section 5.7) serves its port over TLS even when it is not 443.
 - **Fallbacks**: a missing or malformed Host → `400 Bad Request`; a valid but
   unmatched Host (with no catch-all) → `404 Not Found`. There are no
@@ -554,7 +559,11 @@ configure access logging more precisely:
   named site — commonly used for HTTP→HTTPS redirects (part of the auto-HTTPS
   UX).
 - **Shared site block for multiple domains** (`a.example.com, b.example.com { ... }`):
-  deferred until the first real use case.
+  available. The body is cloned into one independently addressable named site
+  per host; duplicate host/port pairs are rejected.
+- **Wildcard site names** (`*.example.com`) match exactly one left-most
+  label, never the apex or a multi-label prefix. Exact names take precedence
+  over wildcards, and a more-specific wildcard suffix wins.
 
 ## 7. Example (a complete configuration)
 
@@ -591,17 +600,17 @@ api.example.com {
 > declarative guard (modifier): it applies to whichever terminal serves the
 > site.
 
-> Deferred and future directives (`tls_alpn_challenge`, …) do not appear in the
-> example, so readers never copy an unparseable config.
+> The example keeps ACME on its default HTTP-01 path. Set
+> `tls_alpn_challenge` in the global block when port 80 is unavailable.
 
 ## 8. Layer-4 listeners (TCP, SNI passthrough, and UDP)
 
-**Status: Available (TCP/SNI/UDP) in `v0.3.0`.** UDP
-zero-downtime upgrade remains intentionally unsupported; use a plain restart.
+**Status: Available (TCP/SNI/UDP/TLS termination/transparent TCP) in
+`v0.3.5`.**
 
 A `tcp` block is a **top-level listener**, a peer of an HTTP site block. It
-proxies raw TCP connections (no HTTP parsing, no TLS termination) to one or
-more upstreams:
+proxies raw TCP connections (no HTTP parsing) to one or more upstreams. TLS is
+passed through by default; an optional `tls` line terminates it before relay.
 
 ```caddyfile
 tcp :3306 {
@@ -617,6 +626,11 @@ tcp :3306 {
         consecutive_successes 2
     }
 }
+
+tcp :8443 {
+    tls internal
+    to 127.0.0.1:9443
+}
 ```
 
 - **Listen address**: an IP literal, or `:port` for all interfaces; IPv6 is
@@ -630,13 +644,26 @@ tcp :3306 {
   it). An unresolvable upstream at startup is an error.
 - **SNI routing** (`sni <name> <host:port>` + optional
   `fallback <host:port>`, L4 P1): a `tcp` listener with `sni` lines routes TLS
-  connections by the ClientHello's exact SNI — without terminating TLS (the
-  ClientHello is inspected in a bounded prefix and forwarded unchanged). Each
-  `sni` maps an exact (lowercased) name to its own upstream; an
+  connections by the ClientHello's exact or one-label wildcard SNI — without
+  terminating TLS (the ClientHello is inspected in a bounded prefix and
+  forwarded unchanged). Each `sni` maps a name to its own upstream; an
   unknown/absent/malformed/oversized SNI goes to `fallback` when set, otherwise
-  the connection is closed. `sni` and `to` are mutually exclusive, wildcard
-  names are not supported in v1, and `health_check` does not apply to SNI
-  mode.
+  the connection is closed. Exact names win over wildcards, and `sni` and
+  `to` are mutually exclusive. `health_check` does not apply to SNI mode.
+- **L4 TLS termination**: add `tls internal` or
+  `tls <cert-file> <key-file>` inside a `tcp` block. Pingora completes
+  the TLS handshake and the app receives the decrypted byte stream; this mode
+  uses the shared `to` upstream set and cannot be combined with SNI
+  passthrough or `transparent`.
+- **Transparent TCP mode**: add `transparent` to a `tcp` block together
+  with a `to` fallback. On Linux, raddy binds a socket with
+  `IP_TRANSPARENT`, reads the original destination from the Pingora socket
+  digest, and binds outbound connections to the original client address. It
+  requires `CAP_NET_ADMIN` (or an equivalent service capability),
+  netfilter TPROXY rules, and policy routing. It is custom Linux integration
+  and is not available on Windows. Because the listener is custom-owned, a
+  transparent TCP configuration must use a normal restart rather than
+  `raddy upgrade`.
 - **`lb_policy`** reuses the HTTP policies: `round_robin` (default), `random`,
   and `ip_hash` (source-IP stickiness — the same client stays on the same
   upstream).
@@ -661,9 +688,16 @@ tcp :3306 {
   eviction), `idle_timeout` evicts idle flows, `max_datagram_size` drops and
   counts oversized datagrams, and `recv_buffer`/`send_buffer` size the sockets
   (0 = OS default). UDP and TCP may share an address and port. Metrics:
-  `raddy_l4_udp_*`. **Zero-downtime upgrades do not apply to UDP**: the listener
-  socket is bound outside the fd-handoff mechanism, so `raddy upgrade` cannot
-  serve a UDP configuration — use a plain restart (flows reset).
+  `raddy_l4_udp_*`. UDP zero-downtime upgrades are available on Linux:
+  raddy transfers the listener fd, every connected upstream flow fd, and
+  bounded flow metadata through a private handoff manifest. The kernel receive
+  queue remains attached to the transferred listener, so flows continue without
+  a rebind gap. If the handoff fails, the upgrade fails closed rather than
+  claiming success.
+- **QUIC passthrough**: the UDP proxy can forward QUIC packets as ordinary
+  datagrams, but Pingora 0.8.1 has no native QUIC/HTTP/3 stack. This does not
+  terminate QUIC, route HTTP/3 requests, or support QUIC connection migration;
+  use a dedicated QUIC/HTTP/3 sidecar for those functions.
 - **Reload semantics**: a SIGHUP reload applies the new upstream set, policy,
   limits, and timeouts to *new* connections; existing connections keep their
   selected upstream. Changing a listener's bind address is a **topology
@@ -675,9 +709,5 @@ tcp :3306 {
 - Any syntax detail not covered here: **document it before implementing**.
 - DNS-01 providers beyond Cloudflare are **deferred** — one GitHub issue per
   provider (community contributions welcome).
-- Upstream HTTP/2 is future work (Section 5.6); cleartext h2c is not planned.
-- **TLS-ALPN-01 (Section 5.8) is deferred**: instant-acme 0.8.5 keeps the account
-  key internal and Pingora 0.8's `TlsSettings` has no dynamic ALPN callback that
-  can swap in the `acme-tls/1` validation certificate, so it cannot be built
-  without forking a dependency. HTTP-01 and DNS-01 cover the reachability cases
-  otherwise.
+- QUIC/HTTP-3 termination remains a separate sidecar boundary because Pingora
+  0.8.1 does not expose a QUIC transport.

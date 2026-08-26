@@ -257,6 +257,8 @@ pub struct GlobalConfig {
     /// DNS-01 challenge credentials (spec §5.3); when set, certificate
     /// issuance uses DNS-01 instead of HTTP-01.
     pub dns_challenge: Option<DnsChallenge>,
+    /// Use ACME TLS-ALPN-01 on the TLS listener instead of HTTP-01.
+    pub tls_alpn_challenge: bool,
     /// Access-log configuration (spec §5.13); `None` = disabled unless the
     /// `--access-log` CLI flag is given.
     pub access_log: Option<AccessLogDirective>,
@@ -356,6 +358,25 @@ impl SiteKey {
     }
 }
 
+/// Match a normalized host name against an exact name or a one-label wildcard
+/// pattern such as `*.example.com`. Wildcards never match the apex or more
+/// than one label, which keeps HTTP Host and TLS SNI routing consistent.
+pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    if pattern == host {
+        return true;
+    }
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let Some(prefix) = host.strip_suffix(suffix) else {
+        return false;
+    };
+    let Some(label) = prefix.strip_suffix('.') else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
+}
+
 /// One directive in a site or block, in source form.
 #[derive(Debug, Clone)]
 pub enum Directive {
@@ -444,14 +465,31 @@ pub enum Directive {
     },
 }
 
+/// The HTTP protocol version used for an upstream connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpstreamHttpVersion {
+    /// Use the current default (HTTP/1.1 for a new peer).
+    #[default]
+    Auto,
+    /// Force HTTP/1.1.
+    H1,
+    /// Force TLS HTTP/2 with ALPN `h2`.
+    H2,
+    /// Force cleartext HTTP/2 prior knowledge (h2c).
+    H2c,
+}
+
 /// An upstream target. The host is resolved to an address during validation;
 /// `resolved` is `None` until then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstream {
     pub host: String,
     pub port: u16,
-    /// `https://` scheme prefix → the upstream connection is TLS (spec §5.4).
+    /// `https://` or `h2://` scheme prefix → the upstream connection is TLS.
     pub tls: bool,
+    /// The protocol selected by the `http://`, `https://`, `h2://`, or `h2c://`
+    /// scheme. `Auto` preserves the existing HTTP/1.1 default.
+    pub http_version: UpstreamHttpVersion,
     pub resolved: Option<SocketAddr>,
 }
 
@@ -708,12 +746,12 @@ pub struct TcpHealthCheckSpec {
     pub consecutive_successes: usize,
 }
 
-/// An exact-SNI route (L4 P1): when a client's TLS ClientHello carries this
-/// server name, the raw connection is proxied to `upstream` (instead of the
-/// shared `to` set, which is unused in SNI mode).
+/// An SNI route (L4 P1): when a client's TLS ClientHello carries this exact or
+/// one-label wildcard server name, the raw connection is proxied to upstream
+/// instead of the shared to set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SniRoute {
-    /// The exact SNI to match (lowercased; no wildcards in P1).
+    /// The exact or one-label wildcard SNI pattern to match (lowercased).
     pub name: String,
     /// The single upstream this SNI is proxied to.
     pub upstream: L4Upstream,
@@ -727,6 +765,13 @@ pub struct SniRoute {
 #[derive(Debug, Clone)]
 pub struct TcpProxyConfig {
     pub listen: ListenAddress,
+    /// Optional TLS termination for the accepted raw stream. ACME is not
+    /// available here because a raw TCP listener has no HTTP site identity;
+    /// use internal or a static certificate pair.
+    pub tls: Option<TlsConfig>,
+    /// Read the original destination from Linux transparent-proxy metadata
+    /// and use it as the upstream target when present.
+    pub transparent: bool,
     pub upstreams: Vec<L4Upstream>,
     /// Load-balancing over the resolved upstreams (reuses `LbPolicy`;
     /// `IpHash` is source-IP stickiness).
@@ -771,6 +816,7 @@ pub struct UdpProxyConfig {
 
 /// A top-level layer-4 listener block (`tcp` / `udp`), a peer of an HTTP site
 /// block (L4_PROXY_PLAN).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Layer4Listener {
     Tcp(TcpProxyConfig),
@@ -812,13 +858,15 @@ pub struct Terminal {
 }
 
 /// A compiled upstream: the resolved address plus the peer metadata needed to
-/// build the pingora `HttpPeer` (the original host for the default SNI, and the
-/// `https://` scheme).
+/// build the pingora `HttpPeer` (the original host for the default SNI, the
+/// TLS scheme, and the selected HTTP protocol version).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamPeer {
     pub addr: SocketAddr,
-    /// `https://` scheme → TLS to this upstream (spec §5.4).
+    /// `https://` or `h2://` scheme → TLS to this upstream (spec §5.4).
     pub tls: bool,
+    /// The protocol selected for this upstream connection.
+    pub http_version: UpstreamHttpVersion,
     /// The original upstream host — the default SNI for TLS (empty for plain
     /// HTTP, or when the operator overrides it with `tls_servername`).
     pub host: String,
