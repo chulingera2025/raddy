@@ -19,7 +19,7 @@
 //! matches. A missing or malformed Host is a 400; a valid but unmatched Host
 //! (with no catch-all) is a 404.
 
-use crate::config::ast::{host_pattern_matches, CompiledConfig, CompiledSite, SiteKey};
+use crate::config::ast::{wildcard_match_specificity, CompiledConfig, CompiledSite, SiteKey};
 
 /// The outcome of selecting a site for a request.
 #[derive(Debug)]
@@ -144,8 +144,7 @@ pub fn select<'a>(config: &'a CompiledConfig, port: u16, host: Option<&[u8]>) ->
                     return Selection::Site(site);
                 }
                 if let Some(host) = normalized.as_deref() {
-                    if host_pattern_matches(named, host) {
-                        let suffix_len = named.strip_prefix("*.").map_or(0, str::len);
+                    if let Some(suffix_len) = wildcard_match_specificity(named, host) {
                         if suffix_len > wildcard_suffix_len {
                             wildcard = Some(site);
                             wildcard_suffix_len = suffix_len;

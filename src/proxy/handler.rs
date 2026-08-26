@@ -495,7 +495,6 @@ impl ProxyHttp for ProxyHandler {
         };
         match lb_spec.upstreams[index].http_version {
             UpstreamHttpVersion::Auto => {}
-            UpstreamHttpVersion::H1 => peer.options.set_http_version(1, 1),
             UpstreamHttpVersion::H2 | UpstreamHttpVersion::H2c => {
                 // Pingora's connector uses ALPN for TLS H2. For plaintext, a
                 // minimum version of 2 selects the prior-knowledge h2c path.

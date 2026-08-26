@@ -170,6 +170,11 @@ pub struct AcmeManager {
 
 impl AcmeManager {
     /// Create a manager bound to one directory/account/cert dir.
+    ///
+    /// The certificate and challenge stores are process-local; the directory,
+    /// root PEM, certificate directory, email, DNS challenge, and
+    /// TLS-ALPN-01 flag select the ACME behavior. Returns a manager ready for
+    /// worker startup; validation errors are reported when issuance begins.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<CertStore>,
@@ -280,8 +285,10 @@ impl AcmeManager {
     /// finds the certificate (P2, A1).
     ///
     /// Domain control is proven via HTTP-01 by default, or via DNS-01 when
-    /// `dns_challenge` is configured. With `force` (renewal) the existing
-    /// certificate, if any, is replaced.
+    /// dns_challenge is configured, or via TLS-ALPN-01 when the corresponding
+    /// global flag is enabled. With force (renewal) the existing certificate,
+    /// if any, is replaced. Errors include ACME, challenge setup, polling,
+    /// finalization, persistence, and cleanup failures.
     pub async fn issue_for(&self, store_key: &str, force: bool) -> Result<(), String> {
         if !force && self.store.has(store_key) {
             return Ok(());

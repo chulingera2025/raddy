@@ -416,7 +416,7 @@ fn ipv6_dual_stack_options() -> TcpSocketOptions {
 /// precisely because port 80 is unavailable. An explicit :80 catch-all already
 /// covers the challenge (it is served before site selection), so it is never
 /// duplicated.
-fn listeners_to_serve(snapshot: &CompiledConfig) -> BTreeSet<u16> {
+pub(crate) fn listeners_to_serve(snapshot: &CompiledConfig) -> BTreeSet<u16> {
     let mut ports = snapshot.listeners();
     if snapshot.global.dns_challenge.is_none()
         && !snapshot.global.tls_alpn_challenge
@@ -426,6 +426,52 @@ fn listeners_to_serve(snapshot: &CompiledConfig) -> BTreeSet<u16> {
         ports.insert(80);
     }
     ports
+}
+
+/// The HTTP listener topology and immutable challenge mode used by reload
+/// validation. TLS source/config changes are included because static/internal
+/// certificates are loaded only when the listener is constructed.
+pub(crate) fn http_listener_topology_keys(snapshot: &CompiledConfig) -> BTreeSet<String> {
+    let tls_ports = tls_listener_ports(snapshot);
+    let challenge_mode = format!(
+        "dns={} alpn={}",
+        snapshot.global.dns_challenge.is_some(),
+        snapshot.global.tls_alpn_challenge
+    );
+    let mut keys = listeners_to_serve(snapshot)
+        .into_iter()
+        .map(|port| {
+            format!(
+                "Http:{port}:tls={}:{}",
+                tls_ports.contains(&port),
+                challenge_mode
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    keys.extend(snapshot.sites.iter().filter_map(|site| {
+        site.tls
+            .as_ref()
+            .map(|tls| format!("SiteTls:{}:{tls:?}", site.key.describe()))
+    }));
+    keys
+}
+
+/// The layer-4 listener topology, including whether each TCP endpoint is
+/// Pingora-owned, TLS-terminated, or custom transparent TCP.
+pub(crate) fn l4_listener_topology_keys(snapshot: &CompiledConfig) -> BTreeSet<String> {
+    snapshot
+        .layer4
+        .iter()
+        .map(|listener| match listener {
+            Layer4Listener::Tcp(tcp) => format!(
+                "Tcp:{}:tls={:?}:transparent={}",
+                tcp.listen.display(),
+                tcp.tls,
+                tcp.transparent
+            ),
+            Layer4Listener::Udp(udp) => format!("Udp:{}", udp.listen.display()),
+        })
+        .collect()
 }
 
 /// Certificate-store keys that need an ACME certificate up front: named sites
@@ -702,5 +748,24 @@ mod tests {
             "no named sites, no implicit :80: {ports:?}"
         );
         assert_eq!(ports, BTreeSet::from([8080]));
+    }
+
+    #[test]
+    fn http_topology_allows_site_routing_changes_on_an_existing_listener() {
+        let old = build_snapshot("topology-old", ":8080 {\n    respond 200 old\n}\n");
+        let new = build_snapshot(
+            "topology-new",
+            ":8080 {\n    respond 200 old\n}\napi.example.com:8080 {\n    respond 200 new\n}\n",
+        );
+        assert_eq!(
+            http_listener_topology_keys(&old),
+            http_listener_topology_keys(&new),
+            "adding routing on an existing plain listener must be reloadable"
+        );
+        let changed = build_snapshot("topology-port", ":8081 {\n    respond 200 changed\n}\n");
+        assert_ne!(
+            http_listener_topology_keys(&old),
+            http_listener_topology_keys(&changed)
+        );
     }
 }

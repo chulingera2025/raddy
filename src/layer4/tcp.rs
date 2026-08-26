@@ -23,7 +23,7 @@
 //! metrics and an access record on close.
 
 use crate::config::ast::{
-    host_pattern_matches, L4Upstream, Layer4Listener, ListenAddress, TcpHealthCheckSpec,
+    wildcard_match_specificity, L4Upstream, Layer4Listener, ListenAddress, TcpHealthCheckSpec,
     TcpProxyConfig,
 };
 use crate::config::snapshot::ConfigStore;
@@ -588,6 +588,11 @@ pub struct TransparentTcpProxy {
 
 impl TransparentTcpProxy {
     /// Bind a transparent TCP listener and build its Pingora-backed proxy app.
+    ///
+    /// The tcp parameter supplies the listener and routing configuration;
+    /// config_store supplies reloadable upstream state; access_log is the
+    /// optional typed access-log sink. Returns the service on success, or an
+    /// error when the Linux transparent socket or proxy app cannot be built.
     pub fn new(
         tcp: &TcpProxyConfig,
         config_store: Arc<ConfigStore>,
@@ -913,8 +918,7 @@ fn select_sni_route(routes: &HashMap<String, SocketAddr>, name: &str) -> Option<
     routes
         .iter()
         .filter_map(|(pattern, addr)| {
-            host_pattern_matches(pattern, name)
-                .then_some((pattern.strip_prefix("*.").map_or(0, str::len), *addr))
+            wildcard_match_specificity(pattern, name).map(|specificity| (specificity, *addr))
         })
         .max_by_key(|(suffix_len, _)| *suffix_len)
         .map(|(_, addr)| addr)

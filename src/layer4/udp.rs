@@ -250,8 +250,11 @@ pub struct UdpProxy {
 }
 
 impl UdpProxy {
-    /// Bind the listener socket and build the proxy. The socket is bound here
-    /// (at startup) so a failed bind is a startup error, like TCP listeners.
+    /// Bind the listener socket and build the proxy. Normal processes bind the
+    /// socket here; upgrade replacements receive it during background startup.
+    ///
+    /// Returns the proxy on success. Errors include bind, socket-option, and
+    /// upstream-resolution failures.
     pub fn new(
         udp: &UdpProxyConfig,
         config_store: Arc<ConfigStore>,
@@ -318,11 +321,17 @@ impl UdpProxy {
     }
 
     /// Return the manifest path used by the UDP upgrade handoff.
+    ///
+    /// The upgrade_sock parameter is the Pingora upgrade socket path.
+    /// Returns the deterministic manifest path beside it.
     pub fn handoff_manifest_path(upgrade_sock: &str) -> String {
         format!("{upgrade_sock}.udp.manifest")
     }
 
     /// Return the Unix socket path used for one UDP handoff descriptor chunk.
+    ///
+    /// The upgrade_sock parameter is the Pingora upgrade socket path and chunk
+    /// is the zero-based descriptor batch. Returns the deterministic path.
     pub fn handoff_part_path(upgrade_sock: &str, chunk: usize) -> String {
         format!("{upgrade_sock}.udp.part.{chunk}")
     }

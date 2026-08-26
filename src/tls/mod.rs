@@ -22,7 +22,10 @@
 //! Each stored certificate also records its `notAfter` (M8) so the renewal
 //! scheduler can re-issue before expiry.
 
-use crate::config::ast::{host_pattern_matches, ClientAuthMode, SiteKey, TlsConfig, TlsVersion};
+use crate::config::ast::{
+    host_pattern_matches, wildcard_match_specificity, ClientAuthMode, SiteKey, TlsConfig,
+    TlsVersion,
+};
 use crate::config::snapshot::ConfigStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -162,11 +165,19 @@ pub struct TlsAlpnChallengeStore {
 
 impl TlsAlpnChallengeStore {
     /// Create an empty TLS-ALPN-01 challenge store.
+    ///
+    /// Returns a store with no active challenge certificates.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Generate and register the RFC 8737 challenge certificate for host.
+    ///
+    /// Parameters: host is the validated ACME identifier; digest is the
+    /// 32-byte SHA-256 key-authorization digest.
+    ///
+    /// Errors are returned for invalid digest size, key generation,
+    /// certificate generation, or PEM conversion.
     pub fn register(&self, host: &str, digest: &[u8]) -> Result<(), String> {
         if digest.len() != 32 {
             return Err("TLS-ALPN challenge digest must be 32 bytes".to_string());
@@ -193,6 +204,8 @@ impl TlsAlpnChallengeStore {
     }
 
     /// Remove a challenge certificate for host after validation finishes.
+    ///
+    /// The host parameter is the ACME identifier to remove.
     pub fn remove(&self, host: &str) {
         self.certs
             .write()
@@ -201,6 +214,9 @@ impl TlsAlpnChallengeStore {
     }
 
     /// Return the currently active challenge certificate for host.
+    ///
+    /// The host parameter is the requested SNI hostname. Returns the active
+    /// certificate, or no value when no challenge is registered.
     pub fn get(&self, host: &str) -> Option<Arc<CertKey>> {
         self.certs
             .read()
@@ -220,6 +236,9 @@ fn alpn_challenge_index() -> &'static Index<Ssl, bool> {
 
 /// Configure a TLS listener to select acme-tls/1 for active TLS-ALPN-01
 /// challenges, while retaining the normal h2/http-1.1 selection.
+///
+/// The settings parameter is the Pingora OpenSSL TLS listener configuration;
+/// challenges is the process-local active challenge store.
 pub fn configure_http_alpn(
     settings: &mut pingora::listeners::tls::TlsSettings,
     challenges: Arc<TlsAlpnChallengeStore>,
@@ -319,12 +338,19 @@ pub struct StaticCertCallback {
 
 impl StaticCertCallback {
     /// Create a callback that installs cert during each server handshake.
+    ///
+    /// The cert parameter is the certificate chain and private key. The
+    /// returned callback serves it without additional options.
     pub fn new(cert: CertKey) -> Self {
         Self::with_options(cert, None)
     }
 
     /// Create a callback that installs cert and applies the supplied TLS
     /// version, cipher, and client-authentication options.
+    ///
+    /// The cert parameter is the certificate chain and private key; options
+    /// contains optional protocol, cipher, and client-auth settings. The
+    /// returned callback applies them during handshakes.
     pub fn with_options(cert: CertKey, options: Option<TlsConfig>) -> Self {
         Self {
             cert: Arc::new(cert),
@@ -417,6 +443,7 @@ impl SniCallback {
     /// Create a callback backed by `store`; `on_miss` fires for unknown SNI.
     /// `config` supplies the per-site `tls` options applied on the handshake;
     /// `port` is this TLS listener's local port (cert/options keying).
+    /// Returns a callback that selects certificates for this listener.
     pub fn new(
         store: Arc<CertStore>,
         config: Arc<ConfigStore>,
@@ -433,6 +460,10 @@ impl SniCallback {
     }
 
     /// Create a callback with a shared TLS-ALPN-01 challenge store.
+    /// The store parameter is the application certificate store; config is
+    /// the reloadable site configuration; port is the listener port; on_miss
+    /// handles authorized certificate misses; alpn_challenges contains
+    /// temporary challenge certificates. Returns a callback or no error.
     pub fn new_with_alpn(
         store: Arc<CertStore>,
         config: Arc<ConfigStore>,
@@ -518,8 +549,7 @@ impl SniCallback {
             if pattern == host {
                 return site.tls.clone();
             }
-            if host_pattern_matches(pattern, host) {
-                let suffix_len = pattern.strip_prefix("*.").map_or(0, str::len);
+            if let Some(suffix_len) = wildcard_match_specificity(pattern, host) {
                 if suffix_len > wildcard_suffix_len {
                     wildcard = site.tls.clone();
                     wildcard_suffix_len = suffix_len;
@@ -560,7 +590,7 @@ impl SniCallback {
                 (*port == self.port
                     && pattern.starts_with("*.")
                     && host_pattern_matches(pattern, host))
-                .then_some((pattern.strip_prefix("*.").map_or(0, str::len), pattern))
+                .then_some((wildcard_match_specificity(pattern, host)?, pattern))
             })
             .max_by_key(|(suffix_len, _)| *suffix_len)
             .map(|(_, pattern)| self.cert_key(pattern))
@@ -698,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_alpn_challenge_store_is_bounded_to_active_entries() {
+    fn tls_alpn_challenge_store_validates_and_cleans_entries() {
         let store = TlsAlpnChallengeStore::new();
         assert!(store.register("example.test", &[1u8; 31]).is_err());
         store

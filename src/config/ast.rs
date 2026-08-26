@@ -358,23 +358,38 @@ impl SiteKey {
     }
 }
 
+/// Return the suffix length when a normalized host matches a one-label wildcard
+/// pattern such as `*.example.com`.
+///
+/// # Parameters
+///
+/// * `pattern` is a normalized exact or wildcard site pattern.
+/// * `host` is a normalized concrete hostname.
+///
+/// # Returns
+///
+/// `Some(suffix_length)` for a valid one-label wildcard match, otherwise `None`.
+pub(crate) fn wildcard_match_specificity(pattern: &str, host: &str) -> Option<usize> {
+    let suffix = pattern.strip_prefix("*.")?;
+    let prefix = host.strip_suffix(suffix)?;
+    let label = prefix.strip_suffix('.')?;
+    (!label.is_empty() && !label.contains('.')).then_some(suffix.len())
+}
+
 /// Match a normalized host name against an exact name or a one-label wildcard
-/// pattern such as `*.example.com`. Wildcards never match the apex or more
-/// than one label, which keeps HTTP Host and TLS SNI routing consistent.
+/// pattern. Wildcards never match the apex or more than one label, which keeps
+/// HTTP Host and TLS SNI routing consistent.
+///
+/// # Parameters
+///
+/// * `pattern` is a normalized configured site pattern.
+/// * `host` is a normalized request or SNI hostname.
+///
+/// # Returns
+///
+/// `true` when the pattern matches `host`, otherwise `false`.
 pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
-    if pattern == host {
-        return true;
-    }
-    let Some(suffix) = pattern.strip_prefix("*.") else {
-        return false;
-    };
-    let Some(prefix) = host.strip_suffix(suffix) else {
-        return false;
-    };
-    let Some(label) = prefix.strip_suffix('.') else {
-        return false;
-    };
-    !label.is_empty() && !label.contains('.')
+    pattern == host || wildcard_match_specificity(pattern, host).is_some()
 }
 
 /// One directive in a site or block, in source form.
@@ -471,8 +486,6 @@ pub enum UpstreamHttpVersion {
     /// Use the current default (HTTP/1.1 for a new peer).
     #[default]
     Auto,
-    /// Force HTTP/1.1.
-    H1,
     /// Force TLS HTTP/2 with ALPN `h2`.
     H2,
     /// Force cleartext HTTP/2 prior knowledge (h2c).
