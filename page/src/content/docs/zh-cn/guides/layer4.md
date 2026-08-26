@@ -86,7 +86,7 @@ udp :53 {
   `ip_hash` 按客户端 *IP* 钉住。
 - **上限** —— `max_flows` 限制流表大小（最旧优先驱逐）、`idle_timeout` 驱逐
   空闲 flow、`max_datagram_size` 丢弃并计数超大报文、`recv_buffer`/`send_buffer`
-  设置 socket 缓冲（0 = 系统默认）。
+  设置 socket 缓冲（0 = 系统默认）。IPv4 与 IPv6 上游均支持。
 - UDP 与 TCP 可共享同一地址端口。
 - 指标：`raddy_l4_udp_*`。
 - **Linux UDP 支持零停机升级**：raddy 在替代进程开始接收前交接监听 fd、已连接

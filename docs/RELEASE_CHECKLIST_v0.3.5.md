@@ -30,6 +30,7 @@
 - [x] TLS-ALPN challenge certificate and ALPN-selection handshake tests pass.
 - [x] `tests/pebble/tls-alpn-e2e.sh` passes against local Pebble.
 - [x] UDP upgrade transfers a persistent client flow without rebinding.
+- [x] UDP IPv6 upstream round-trip passes.
 - [x] Documentation links and generated site build pass.
 
 ## Release

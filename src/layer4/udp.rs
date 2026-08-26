@@ -499,7 +499,12 @@ impl UdpProxy {
             self.metrics.no_upstream_drops.inc();
             return;
         };
-        let usock = match UdpSocket::bind(("0.0.0.0", 0)).await {
+        let local_addr = if upstream_addr.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0))
+        };
+        let usock = match UdpSocket::bind(local_addr).await {
             Ok(s) => s,
             Err(_) => {
                 self.metrics.socket_errors.inc();

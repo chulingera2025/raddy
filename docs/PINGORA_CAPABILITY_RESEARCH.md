@@ -23,6 +23,7 @@ QUIC/HTTP/3 termination remains outside Pingora 0.8.1. The existing UDP proxy
 can provide datagram passthrough, while a terminating HTTP/3 deployment needs a
 separate QUIC service or sidecar.
 
+
 Verdicts use three boundaries: **native** means Pingora 0.8.1 exposes the
 needed transport/protocol primitive; **application** means it can be built
 above Pingora without changing Pingora; **custom integration** means it needs

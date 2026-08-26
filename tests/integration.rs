@@ -658,13 +658,22 @@ impl Drop for H2EchoUpstream {
 /// label (`<label>:<data>`), so tests can tell which upstream served a client.
 struct UdpEchoUpstream {
     port: u16,
+    ipv6: bool,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl UdpEchoUpstream {
     fn spawn(label: &str) -> (u16, UdpEchoUpstream) {
-        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        Self::spawn_on(label, "127.0.0.1:0", false)
+    }
+
+    fn spawn_ipv6(label: &str) -> (u16, UdpEchoUpstream) {
+        Self::spawn_on(label, "[::1]:0", true)
+    }
+
+    fn spawn_on(label: &str, bind: &str, ipv6: bool) -> (u16, UdpEchoUpstream) {
+        let sock = std::net::UdpSocket::bind(bind).unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let port = sock.local_addr().unwrap().port();
@@ -692,6 +701,7 @@ impl UdpEchoUpstream {
             port,
             UdpEchoUpstream {
                 port,
+                ipv6,
                 stop,
                 handle: Some(handle),
             },
@@ -703,8 +713,13 @@ impl Drop for UdpEchoUpstream {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         // Wake the blocking recv so the thread can check stop and exit.
-        let _ = std::net::UdpSocket::bind("127.0.0.1:0")
-            .and_then(|s| s.send_to(b"x", ("127.0.0.1", self.port)));
+        let wake_addr = if self.ipv6 {
+            SocketAddr::new("::1".parse().unwrap(), self.port)
+        } else {
+            SocketAddr::new("127.0.0.1".parse().unwrap(), self.port)
+        };
+        let bind_addr = if self.ipv6 { "[::1]:0" } else { "127.0.0.1:0" };
+        let _ = std::net::UdpSocket::bind(bind_addr).and_then(|s| s.send_to(b"x", wake_addr));
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -4480,6 +4495,18 @@ fn raw_udp_proxy_supports_ipv6_listeners() {
     wait_until(
         || udp_roundtrip_ipv6(raddy.port(), "v6").as_deref() == Some("v6:v6"),
         "the IPv6 UDP listener to relay a datagram",
+    );
+}
+
+#[test]
+fn raw_udp_proxy_supports_ipv6_upstreams() {
+    let (echo_port, _echo) = UdpEchoUpstream::spawn_ipv6("v6-upstream");
+    let raddy = RadRaddy::spawn_udp(|port| {
+        format!("udp 127.0.0.1:{port} {{\n    to [::1]:{echo_port}\n}}\n")
+    });
+    wait_until(
+        || udp_roundtrip(raddy.port(), "v6-upstream").as_deref() == Some("v6-upstream:v6-upstream"),
+        "UDP IPv6 upstream to reply",
     );
 }
 

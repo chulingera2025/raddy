@@ -687,7 +687,8 @@ tcp :8443 {
   includes the port. Bounds: `max_flows` caps the table (oldest-first
   eviction), `idle_timeout` evicts idle flows, `max_datagram_size` drops and
   counts oversized datagrams, and `recv_buffer`/`send_buffer` size the sockets
-  (0 = OS default). UDP and TCP may share an address and port. Metrics:
+  (0 = OS default). IPv4 and IPv6 upstreams are supported. UDP and TCP may
+  share an address and port. Metrics:
   `raddy_l4_udp_*`. UDP zero-downtime upgrades are available on Linux:
   raddy transfers the listener fd, every connected upstream flow fd, and
   bounded flow metadata through a private handoff manifest. The kernel receive

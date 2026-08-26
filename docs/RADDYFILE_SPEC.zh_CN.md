@@ -531,8 +531,9 @@ tcp :8443 {
   临时端口负责响应多路复用）。选择每个 flow 只发生一次——`ip_hash` 按客户端
   *IP* 钉住，flow 身份仍含端口。上限：`max_flows` 限制表大小（最旧优先驱逐）、
   `idle_timeout` 驱逐空闲 flow、`max_datagram_size` 丢弃并计数超大报文、
-  `recv_buffer`/`send_buffer` 设置 socket 缓冲（0 = 系统默认）。UDP 与 TCP 可
-  共享同一地址端口。指标：`raddy_l4_udp_*`。Linux 下 UDP 支持零停机升级：
+  `recv_buffer`/`send_buffer` 设置 socket 缓冲（0 = 系统默认）。IPv4 与 IPv6
+  上游均支持。UDP 与 TCP 可共享同一地址端口。指标：`raddy_l4_udp_*`。Linux
+  下 UDP 支持零停机升级：
   raddy 通过私有 handoff manifest 交接监听 fd、每个已连接上游 flow fd 以及有界的 flow 元数据，
   因而内核接收队列不会因重新 bind 而丢失。交接失败时升级不会报告成功。
 - **QUIC 透传**：UDP 代理可以把 QUIC 包当作普通数据报转发，但 Pingora 0.8.1 没有原生

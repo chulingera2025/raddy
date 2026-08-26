@@ -96,7 +96,7 @@ udp :53 {
 - **Bounds** — `max_flows` caps the flow table (oldest-first eviction),
   `idle_timeout` evicts idle flows, `max_datagram_size` drops and counts
   oversized datagrams, `recv_buffer`/`send_buffer` size the sockets (0 = OS
-  default).
+  default). IPv4 and IPv6 upstreams are supported.
 - UDP and TCP may share an address and port.
 - Metrics: `raddy_l4_udp_*`.
 - **Zero-downtime upgrades preserve UDP flows on Linux**: raddy transfers the
