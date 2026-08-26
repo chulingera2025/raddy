@@ -1,18 +1,17 @@
 # Layer 4 Proxy Implementation Plan
 
-Status: Implemented in the `v0.3.0` release candidate
+Status: Implemented in `v0.3.0`
 
 This document is the implementation and acceptance record for TCP and UDP layer
 4 proxying in raddy. It records the architecture, configuration boundary,
-runtime semantics, delivery order, and remaining release gates.
+runtime semantics, delivery order, and post-release follow-up work.
 
 The P0 raw-TCP, P1 SNI passthrough, and P2 bounded-UDP runtime paths are present
-in the current worktree. Integration coverage now includes TCP admission,
-half-close and failed-upstream paths, plus UDP oversize drops, capacity
-eviction, reload, IPv6, and typed flow access records. The remaining release
-gates are an actual `cargo-fuzz` run in an environment that has the toolchain
-installed and reproducible direct-versus-proxy benchmarks; neither changes the
-documented UDP upgrade limitation.
+in the released tree. Integration coverage includes TCP admission, half-close
+and failed-upstream paths, plus UDP oversize drops, capacity eviction, reload,
+IPv6, and typed flow access records. Post-release work is limited to independent
+security/operations review and reproducible direct-versus-proxy benchmarks;
+neither changes the documented UDP upgrade limitation.
 
 ## Decision summary
 

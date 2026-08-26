@@ -7,8 +7,9 @@ section short.
 
 ## [Unreleased]
 
-> Target release: `v0.3.0`. The current worktree contains the implementation
-> and release-candidate tests; no tag has been created yet.
+No unreleased changes yet.
+
+## [v0.3.0] — 2026-08-26
 
 ### Added
 
@@ -131,7 +132,8 @@ section short.
   `redir`, SIGHUP hot reload, ACME automatic HTTPS (HTTP-01, verified against
   Pebble), structured access log, Prometheus metrics, release installer.
 
-[Unreleased]: https://github.com/chulingera2025/raddy/compare/v0.2.10...HEAD
+[Unreleased]: https://github.com/chulingera2025/raddy/compare/v0.3.0...HEAD
+[v0.3.0]: https://github.com/chulingera2025/raddy/compare/v0.2.10...v0.3.0
 [v0.2.10]: https://github.com/chulingera2025/raddy/compare/v0.2.1...v0.2.10
 [v0.2.1]: https://github.com/chulingera2025/raddy/compare/v0.1.2...v0.2.1
 [v0.1.2]: https://github.com/chulingera2025/raddy/compare/v0.1.0...v0.1.2

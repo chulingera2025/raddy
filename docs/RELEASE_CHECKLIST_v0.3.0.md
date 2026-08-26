@@ -1,7 +1,6 @@
 # Raddy v0.3.0 Release Checklist
 
-Status: release candidate in the working tree. No commit, tag, or GitHub
-release has been created by this task.
+Status: released on 2026-08-26.
 
 ## Completed
 
@@ -18,16 +17,16 @@ release has been created by this task.
 - [x] Pebble ACME e2e passes, including non-443 TLS and renewal.
 - [x] Documentation link check passes for 41 pages.
 - [x] Astro documentation production build passes.
+- [x] Release scope reviewed and merged through PR #20.
+- [x] `v0.3.0` tag created and pushed.
+- [x] GitHub release assets and installer checksums verified.
 
-## Before tagging
+## Post-release follow-up
 
-- [ ] Review the complete diff and split unrelated changes if needed.
 - [ ] Run direct-versus-proxy TCP and UDP benchmarks and record results.
 - [ ] Perform an independent security and operations review.
-- [ ] Confirm the release notes and upgrade instructions.
-- [ ] Commit the release candidate.
-- [ ] Create and push the `v0.3.0` tag.
-- [ ] Verify the GitHub release artifacts and installer checksums.
+- [ ] Update GitHub Actions dependencies after the Node.js 20 deprecation warning
+      is actionable for the pinned action versions.
 
 ## Known limitations
 

@@ -458,7 +458,7 @@ api.example.com {
 
 ## 8. 四层监听器（TCP、SNI 透传与 UDP）
 
-**状态：可用（TCP/SNI/UDP），属于 `v0.3.0` release candidate。** UDP 不支持
+**状态：可用（TCP/SNI/UDP），已包含在 `v0.3.0`。** UDP 不支持
 零停机升级，这是刻意保留的限制；请使用普通重启。
 
 `tcp` 块是**顶级监听器**，与 HTTP 站点块平级。它将裸 TCP 连接（不做 HTTP
