@@ -27,6 +27,7 @@
 //! socket, then SIGQUIT the old process. Any failure aborts before the running
 //! instance is disturbed.
 
+use crate::config::ast::CompiledConfig;
 use crate::config::snapshot;
 use crate::layer4::udp::UdpProxy;
 use crate::server::startup::RunOptions;
@@ -64,6 +65,20 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     }
     let snapshot = snapshot::build(config_path)
         .map_err(|e| format!("cannot inspect config before upgrade: {e}"))?;
+    let topology_file = topology_path(pidfile);
+    let expected_topology = topology_signature(&snapshot);
+    let actual_topology = std::fs::read_to_string(&topology_file).map_err(|e| {
+        format!(
+            "cannot verify listener topology from {}: {e}; use a normal restart",
+            topology_file.display()
+        )
+    })?;
+    if actual_topology.trim() != expected_topology {
+        return Err(
+            "current config listener topology differs from the running instance; use a normal restart"
+                .to_string(),
+        );
+    }
     if snapshot.layer4.iter().any(|listener| {
         matches!(
             listener,
@@ -134,6 +149,45 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
         ));
     }
     eprintln!("raddy: upgrade complete (now pid {new_pid})");
+    Ok(())
+}
+
+/// The sidecar file that records the immutable listener topology of a running
+/// process identified by pidfile.
+pub(crate) fn topology_path(pidfile: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.topology", pidfile.display()))
+}
+
+/// Compute a stable digest of HTTP, TLS, layer-4, and ACME listener topology.
+pub(crate) fn topology_signature(config: &CompiledConfig) -> String {
+    let mut input = String::new();
+    for key in crate::server::startup::http_listener_topology_keys(config) {
+        input.push_str(&key);
+        input.push('\n');
+    }
+    for key in crate::server::startup::l4_listener_topology_keys(config) {
+        input.push_str(&key);
+        input.push('\n');
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Persist the listener-topology digest next to the pidfile.
+pub(crate) fn write_topology_state(pidfile: &Path, config: &CompiledConfig) -> Result<(), String> {
+    let path = topology_path(pidfile);
+    std::fs::write(&path, topology_signature(config))
+        .map_err(|e| format!("failed to write topology state {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to protect topology state {}: {e}", path.display()))?;
+    }
     Ok(())
 }
 

@@ -33,7 +33,7 @@ use std::sync::Arc;
 /// The load-balancing pool is reconciled against the new snapshot so removed
 /// sites stop their health probes. A reload that changes the layer-4 listener
 /// *topology* is rejected: listeners are fixed at process start (ADR-010) — the
-/// operator must restart or use `raddy upgrade` (L4 plan §reload semantics).
+/// operator must perform a normal restart.
 pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>, lb_pool: Arc<LoadBalancerPool>) {
     std::thread::spawn(move || {
         let mut signals = match signal_hook::iterator::Signals::new([SIGHUP]) {
@@ -52,7 +52,7 @@ pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>, lb_pool: Arc<LoadBal
                     if old_http != new_http {
                         tracing::error!(
                             "config reload rejected: HTTP listener topology changed \
-                             (listeners are fixed at startup); restart or use `raddy upgrade`"
+                             (listeners are fixed at startup); use a normal restart"
                         );
                         continue;
                     }
@@ -61,7 +61,7 @@ pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>, lb_pool: Arc<LoadBal
                     if old_keys != new_keys {
                         tracing::error!(
                             "config reload rejected: layer-4 listener topology changed \
-                             (listeners are fixed at startup); restart or use `raddy upgrade`"
+                             (listeners are fixed at startup); use a normal restart"
                         );
                         continue;
                     }

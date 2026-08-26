@@ -701,8 +701,8 @@ tcp :8443 {
 - **Reload semantics**: a SIGHUP reload applies the new upstream set, policy,
   limits, and timeouts to *new* connections; existing connections keep their
   selected upstream. Changing a listener's bind address is a **topology
-  change** and is rejected with an error directing the operator to restart or
-  use `raddy upgrade`.
+  change** and is rejected with an error directing the operator to use a normal
+  restart. The zero-downtime upgrade requires the same listener topology.
 
 ## 9. Todo
 

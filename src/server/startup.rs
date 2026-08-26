@@ -38,6 +38,7 @@ use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
 use crate::server::acme::{AcmeManager, ChallengeStore, ISSUANCE_QUEUE_CAPACITY};
 use crate::server::issuance_queue::{EnqueueOutcome, RequestKind};
 use crate::server::reload;
+use crate::server::upgrade;
 use crate::tls::{
     cert_store_key, configure_http_alpn, CertStore, SniCallback, StaticCertCallback,
     TlsAlpnChallengeStore,
@@ -259,6 +260,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         if let Some(pidfile) = &opts.pidfile {
             std::fs::write(pidfile, std::process::id().to_string())
                 .map_err(|e| format!("failed to write pidfile {}: {e}", pidfile.display()))?;
+            upgrade::write_topology_state(pidfile, &config_store.load())?;
         }
     }
 
