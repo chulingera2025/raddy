@@ -224,6 +224,14 @@ pub fn configure_http_alpn(
     settings: &mut pingora::listeners::tls::TlsSettings,
     challenges: Arc<TlsAlpnChallengeStore>,
 ) {
+    configure_alpn_builder(&mut *settings, challenges);
+}
+
+/// Install the shared ALPN selector on an OpenSSL acceptor builder.
+fn configure_alpn_builder(
+    settings: &mut pingora::tls::ssl::SslAcceptorBuilder,
+    challenges: Arc<TlsAlpnChallengeStore>,
+) {
     settings.set_alpn_select_callback(move |ssl: &mut SslRef, client| {
         let host = ssl
             .servername(NameType::HOST_NAME)
@@ -865,13 +873,14 @@ mod tests {
         use pingora::listeners::TlsAcceptCallbacks;
         use pingora::protocols::tls::server::handshake_with_callback;
         use pingora::protocols::tls::SslStream;
-        use pingora::tls::ssl::{self, AlpnError, SslAcceptor, SslMethod};
+        use pingora::tls::ssl::{self, SslAcceptor, SslMethod};
         use std::pin::Pin;
 
         let challenge_store = Arc::new(TlsAlpnChallengeStore::new());
         challenge_store
             .register("example.test", &[7u8; 32])
             .expect("register challenge certificate");
+        let selector_challenges = challenge_store.clone();
         let expected = String::from_utf8(
             challenge_store
                 .get("example.test")
@@ -905,16 +914,7 @@ mod tests {
         ));
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
             .expect("create challenge acceptor");
-        let index = *alpn_challenge_index();
-        builder.set_alpn_select_callback(move |ssl, client| {
-            let offered = client_offers_alpn(client, b"acme-tls/1");
-            ssl.set_ex_data(index, offered);
-            if offered {
-                openssl::ssl::select_next_proto(b"\x0aacme-tls/1", client).ok_or(AlpnError::NOACK)
-            } else {
-                Err(AlpnError::NOACK)
-            }
-        });
+        configure_alpn_builder(&mut builder, selector_challenges);
         let acceptor = builder.build();
         let (client, server) = tokio::io::duplex(8192);
         let server_task =
