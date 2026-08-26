@@ -639,7 +639,7 @@ impl<'a> Parser<'a> {
 
     fn parse_site_key(&self, addr: &str) -> Result<SiteKey, ConfigError> {
         if addr.starts_with('[') {
-            return Err(self.err("IPv6 listener addresses are not supported in v0.1"));
+            return Err(self.err("IPv6 listener addresses are not supported for HTTP sites"));
         }
         if let Some(port_str) = addr.strip_prefix(':') {
             let port = self.parse_port(port_str)?;
@@ -1333,7 +1333,9 @@ impl<'a> Parser<'a> {
             (false, s)
         };
         if rest.starts_with('[') {
-            return Err(self.err("IPv6 upstream addresses are not supported in v0.1"));
+            return Err(
+                self.err("IPv6 upstream addresses are not supported for HTTP reverse_proxy")
+            );
         }
         let (host, port_str) = rest
             .rsplit_once(':')
@@ -2029,7 +2031,7 @@ fn normalize_host_name(host: &str) -> Result<String, String> {
         return Err("site hostname must not contain whitespace".to_string());
     }
     if !host.is_ascii() {
-        return Err("site hostname must be ASCII in v0.1".to_string());
+        return Err("site hostname must be ASCII".to_string());
     }
     // One trailing dot marks an FQDN; a second would leave an empty final
     // label, rejected below.

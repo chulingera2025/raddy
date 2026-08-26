@@ -596,7 +596,7 @@ api.example.com {
 
 ## 8. Layer-4 listeners (TCP, SNI passthrough, and UDP)
 
-**Status: Available (TCP/SNI/UDP) in the `v0.3.0` release candidate.** UDP
+**Status: Available (TCP/SNI/UDP) in `v0.3.0`.** UDP
 zero-downtime upgrade remains intentionally unsupported; use a plain restart.
 
 A `tcp` block is a **top-level listener**, a peer of an HTTP site block. It
