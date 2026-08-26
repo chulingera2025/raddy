@@ -3668,17 +3668,9 @@ fn raw_tcp_proxy_round_robins_across_upstreams() {
     // Alternate connections must reach both upstreams (round-robin). The
     // readiness probe already made one connection, so a few more cover both.
     for _ in 0..4 {
-        let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(b"rr").unwrap();
-        let mut buf = [0u8; 8];
-        let n = stream.read(&mut buf).unwrap();
         assert!(
-            &buf[..n] == b"echo:rr",
-            "unexpected echo: {}",
-            String::from_utf8_lossy(&buf[..n])
+            tcp_echo(raddy.port(), "rr") == "echo:rr",
+            "unexpected round-robin echo"
         );
     }
     assert!(
