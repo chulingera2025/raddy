@@ -3818,17 +3818,10 @@ fn raw_tcp_proxy_health_check_routes_around_dead_upstream() {
     // Give the health check time to mark the dead upstream unhealthy.
     thread::sleep(Duration::from_secs(2));
     for _ in 0..5 {
-        let mut stream = TcpStream::connect(("127.0.0.1", raddy.port())).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(b"hc").unwrap();
-        let mut buf = [0u8; 8];
-        let n = stream.read(&mut buf).unwrap_or(0);
         assert_eq!(
-            &buf[..n],
-            b"echo:hc",
-            "the dead upstream must not receive traffic (got {n} bytes)"
+            tcp_echo(raddy.port(), "hc"),
+            "echo:hc",
+            "the dead upstream must not receive traffic"
         );
     }
     assert!(
