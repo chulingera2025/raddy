@@ -49,9 +49,10 @@ const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `forward_auth` per-read/write timeout.
 const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The access-log destination and format (spec §5.13).
+/// The access-log destination and format (spec §5.13). The file handle is an
+/// `Arc` so the HTTP handler and the layer-4 TCP services share one sink.
 pub struct AccessLog {
-    pub file: Mutex<File>,
+    pub file: Arc<Mutex<File>>,
     pub format: AccessLogFormat,
 }
 
@@ -70,7 +71,7 @@ pub struct ProxyHandler {
     /// Single-node rate limiter (M10, ADR-011: state survives reloads).
     rate_limiter: Arc<RateLimiter>,
     /// Optional access-log destination and format (spec §5.13).
-    access_log: Option<AccessLog>,
+    access_log: Option<Arc<AccessLog>>,
     /// Caps concurrent `bcrypt::verify` calls (P1): bcrypt is deliberately
     /// expensive, so it runs on a bounded blocking pool behind this semaphore.
     bcrypt_semaphore: Arc<tokio::sync::Semaphore>,
@@ -81,7 +82,7 @@ impl ProxyHandler {
     pub fn new(
         store: Arc<ConfigStore>,
         challenges: Arc<ChallengeStore>,
-        access_log: Option<AccessLog>,
+        access_log: Option<Arc<AccessLog>>,
         pool: Arc<LoadBalancerPool>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
@@ -548,12 +549,14 @@ impl ProxyHttp for ProxyHandler {
         // accepts an algorithm, mark the response and stream it through a
         // per-request encoder in `response_body_filter`. Never double-compress
         // an already-encoded response, and skip requests/responses that carry no
-        // body (HEAD, 1xx, 204, 304, and partial 206 responses).
+        // body (HEAD, 1xx, 204, 304, and partial 206 responses) or that are
+        // known to be tiny (a small body compresses larger than it is).
         let compressible = session.req_header().method != http::Method::HEAD
             && !upstream_response
                 .headers
                 .contains_key(http::header::CONTENT_ENCODING)
-            && !matches!(upstream_response.status.as_u16(), 204 | 304 | 206 | 1..=199);
+            && !matches!(upstream_response.status.as_u16(), 204 | 304 | 206 | 1..=199)
+            && !known_tiny_response(upstream_response);
         if compressible && !ctx.encode_algos.is_empty() {
             // The representation depends on the request's Accept-Encoding, so a
             // shared cache must vary on it (RFC 9110 §12.5.3) — even when this
@@ -937,12 +940,25 @@ fn listener_port(session: &Session) -> u16 {
 }
 
 /// The raw Host header value, if present.
+///
+/// HTTP/2 has no `Host` header — the authority travels in the `:authority`
+/// pseudo-header, which the HTTP stack surfaces as the request URI's authority
+/// (RFC 9113 §8.3.1). Site selection and the `{host}` placeholder must read the
+/// authority there, or every HTTP/2 request would be a Host-less 400.
 fn host_header(session: &Session) -> Option<&[u8]> {
-    session
+    if let Some(host) = session
         .req_header()
         .headers
         .get(http::header::HOST)
         .map(|value| value.as_bytes())
+    {
+        return Some(host);
+    }
+    session
+        .req_header()
+        .uri
+        .authority()
+        .map(|authority| authority.as_str().as_bytes())
 }
 
 /// The request path (matcher input).
@@ -1260,6 +1276,18 @@ fn compression_error(e: io::Error) -> Box<Error> {
     Error::because(InternalError, "response compression failed", e)
 }
 
+/// Whether a response is known to be smaller than [`compress::MIN_COMPRESS_BYTES`]
+/// from its `Content-Length` (the size is unknown for chunked/streamed bodies,
+/// which are compressed normally). Such a body is never compressed — the codec
+/// framing makes it larger than the payload (spec §5.11).
+fn known_tiny_response(resp: &ResponseHeader) -> bool {
+    resp.headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some_and(|len| len < compress::MIN_COMPRESS_BYTES)
+}
+
 /// Add `Accept-Encoding` to the response's `Vary` header (RFC 9110 §12.5.3),
 /// merging case-insensitively with any existing tokens and avoiding duplicates.
 /// An existing `accept-encoding` token leaves the header untouched. Shared by
@@ -1417,6 +1445,20 @@ mod tests {
         // An all-trusted chain falls back to the trusted peer.
         assert_eq!(resolve_client_ip(peer, Some("2001:db8::2"), &t), peer);
         assert_eq!(resolve_client_ip(peer, None, &t), peer);
+    }
+
+    #[test]
+    fn tiny_response_is_known_uncompressed() {
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header(http::header::CONTENT_LENGTH, "10")
+            .unwrap();
+        assert!(known_tiny_response(&resp));
+        resp.insert_header(http::header::CONTENT_LENGTH, "4096")
+            .unwrap();
+        assert!(!known_tiny_response(&resp));
+        // No Content-Length (chunked/streamed): size unknown → compress.
+        let streamed = ResponseHeader::build(200, None).unwrap();
+        assert!(!known_tiny_response(&streamed));
     }
 
     #[test]

@@ -27,21 +27,26 @@
 //! new process.
 
 use crate::config::ast::{
-    AccessLogDirective, AccessLogFormat, CompiledConfig, LogLevel, SiteKey, TlsSource,
+    AccessLogDirective, AccessLogFormat, CompiledConfig, Layer4Listener, LogLevel, SiteKey,
+    TlsSource,
 };
 use crate::config::snapshot::{self, ConfigStore};
+use crate::layer4::tcp::{TcpAccessRecord, TcpProxyApp};
+use crate::layer4::udp::{UdpFlowRecord, UdpProxy};
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
 use crate::server::acme::{AcmeManager, ChallengeStore, ISSUANCE_QUEUE_CAPACITY};
 use crate::server::issuance_queue::{EnqueueOutcome, RequestKind};
 use crate::server::reload;
-use crate::tls::{CertStore, SniCallback};
+use crate::tls::{cert_store_key, CertStore, SniCallback};
 use pingora::listeners::{tls::TlsSettings, TlsAcceptCallbacks};
 use pingora::prelude::*;
 use pingora::server::configuration::{Opt, ServerConf};
+use pingora::services::background::background_service;
 use pingora::services::listening::Service;
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -76,8 +81,13 @@ pub struct RunOptions {
 /// Returns an error if the Raddyfile is invalid or the server cannot be
 /// constructed; the caller reports it and exits non-zero.
 pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> {
+    // The ACME/DNS-01 HTTP clients use rustls, which 0.23 refuses to
+    // auto-select a CryptoProvider for when more than one backend feature is
+    // compiled in (here both aws-lc-rs and ring). Install one explicitly before
+    // the issuance worker can make its first TLS connection.
+    install_rustls_crypto_provider();
     let snapshot = snapshot::build(config_path)?;
-    let ports = snapshot.listeners();
+    let ports = listeners_to_serve(&snapshot);
     let email = snapshot.global.acme_email.clone();
     // The access-log directive (spec §5.13); read before `snapshot` is moved.
     let global_access_log = snapshot.global.access_log.clone();
@@ -135,10 +145,14 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     lb_pool.warm(&snapshot);
     spawn_health_check_runner(lb_pool.clone());
 
+    // The layer-4 listener set is captured before `snapshot` is moved into the
+    // store: the L4 services are registered after the HTTP proxy service.
+    let layer4 = snapshot.layer4.clone();
     let config_store = Arc::new(ConfigStore::new(snapshot));
     // Access log destination (spec §5.13): the `--access-log` CLI flag wins;
     // otherwise the global `access_log` directive. `access_log off` (or neither)
-    // disables it.
+    // disables it. Shared (via `Arc`) by the HTTP handler and the layer-4
+    // services.
     let access_log = match &opts.access_log {
         Some(path) => Some(open_access_log(
             path,
@@ -151,13 +165,14 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
             _ => None,
         },
     };
+    let access_log = access_log.map(Arc::new);
     // Single-node rate limiter (M10): process-lifetime, so bucket state
     // survives reloads like the LB pool (ADR-011).
     let rate_limiter = Arc::new(crate::proxy::ratelimit::RateLimiter::new());
     let handler = ProxyHandler::new(
         config_store.clone(),
         challenges.clone(),
-        access_log,
+        access_log.clone(),
         lb_pool.clone(),
         rate_limiter,
     );
@@ -255,6 +270,49 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     }
     server.add_service(proxy);
 
+    // Layer-4 raw-TCP services (L4_PROXY_PLAN P0): one `Service<TcpProxyApp>`
+    // per `tcp` listener. Access records are written as JSON lines to the same
+    // access-log file the HTTP handler uses (the plan keeps HTTP and layer-4
+    // records distinct typed events, not the HTTP common-log format).
+    let l4_access_log = access_log.clone();
+    for listener in &layer4 {
+        match listener {
+            Layer4Listener::Tcp(tcp) => {
+                let sink = l4_access_log.as_ref().map(|log| {
+                    let log = log.clone();
+                    Arc::new(move |record: &TcpAccessRecord| {
+                        let mut guard = log.file.lock().expect("access log lock poisoned");
+                        let _ = serde_json::to_writer(&mut *guard, record);
+                        let _ = writeln!(&mut *guard);
+                        let _ = guard.flush();
+                    }) as Arc<dyn Fn(&TcpAccessRecord) + Send + Sync>
+                });
+                let app = TcpProxyApp::new(tcp, config_store.clone(), sink)?;
+                let mut service = Service::new(format!("tcp/{}", tcp.listen.display()), app);
+                service.add_tcp(&tcp.listen.display());
+                server.add_service(service);
+                tracing::info!("listening (raw TCP) on {}", tcp.listen.display());
+            }
+            Layer4Listener::Udp(udp) => {
+                let sink = l4_access_log.as_ref().map(|log| {
+                    let log = log.clone();
+                    Arc::new(move |record: &UdpFlowRecord| {
+                        let mut guard = log.file.lock().expect("access log lock poisoned");
+                        let _ = serde_json::to_writer(&mut *guard, record);
+                        let _ = writeln!(&mut *guard);
+                        let _ = guard.flush();
+                    }) as Arc<dyn Fn(&UdpFlowRecord) + Send + Sync>
+                });
+                let proxy = UdpProxy::new(udp, config_store.clone(), sink)?;
+                server.add_service(background_service(
+                    &format!("udp/{}", udp.listen.display()),
+                    proxy,
+                ));
+                tracing::info!("listening (UDP) on {}", udp.listen.display());
+            }
+        }
+    }
+
     // Prometheus metrics listener (M5), if enabled.
     if let Some(metrics_addr) = &opts.metrics_addr {
         let mut metrics = Service::prometheus_http_service();
@@ -269,9 +327,31 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     server.run_forever();
 }
 
-/// Hostnames that need an ACME certificate up front: named sites served over
-/// TLS whose `tls` source is ACME (a static or internal source supplies its
-/// own cert — spec §5.7).
+/// The listeners to serve: the configured sites' ports, plus an implicit
+/// plain-HTTP :80 listener when automatic HTTPS needs HTTP-01.
+///
+/// raddy proves domain control with HTTP-01 on a plain-HTTP listener, so a
+/// config with named sites but no explicit :80 listener would otherwise be
+/// unreachable by the ACME server and issuance would hang forever (P0). DNS-01
+/// deployments (`dns_challenge`) skip the implicit listener — they chose DNS
+/// precisely because port 80 is unavailable. An explicit :80 catch-all already
+/// covers the challenge (it is served before site selection), so it is never
+/// duplicated.
+fn listeners_to_serve(snapshot: &CompiledConfig) -> BTreeSet<u16> {
+    let mut ports = snapshot.listeners();
+    if snapshot.global.dns_challenge.is_none()
+        && !ports.contains(&80)
+        && !hosts_needing_certs(snapshot).is_empty()
+    {
+        ports.insert(80);
+    }
+    ports
+}
+
+/// Certificate-store keys that need an ACME certificate up front: named sites
+/// served over TLS whose `tls` source is ACME (a static or internal source
+/// supplies its own cert — spec §5.7). Keys are the bare host on 443 and
+/// `host:port` on any other TLS port, matching the SNI callback's lookup.
 fn hosts_needing_certs(config: &CompiledConfig) -> Vec<String> {
     let tls_ports = tls_listener_ports(config);
     config
@@ -279,19 +359,23 @@ fn hosts_needing_certs(config: &CompiledConfig) -> Vec<String> {
         .iter()
         .filter_map(|site| match &site.key {
             SiteKey::Named { host, port } if tls_ports.contains(port) && uses_acme(site) => {
-                Some(host.clone())
+                Some(cert_store_key(host, *port))
             }
             _ => None,
         })
         .collect()
 }
 
-/// Whether `host` is a named site configured on this instance whose
-/// certificate comes from ACME (a static/internal site never triggers
-/// on-demand issuance — spec §5.7).
-fn is_configured_host(config: &CompiledConfig, host: &str) -> bool {
+/// Whether `store_key` is a named site configured on this instance whose
+/// certificate comes from ACME (a static/internal site never triggers on-demand
+/// issuance — spec §5.7). The key includes the port, so a host served on two
+/// TLS ports is authorized independently per port (P2).
+fn is_configured_host(config: &CompiledConfig, store_key: &str) -> bool {
     config.sites.iter().any(|site| {
-        matches!(&site.key, SiteKey::Named { host: named, .. } if named == host) && uses_acme(site)
+        matches!(
+            &site.key,
+            SiteKey::Named { host, port } if cert_store_key(host, *port) == store_key
+        ) && uses_acme(site)
     })
 }
 
@@ -331,16 +415,14 @@ fn load_site_certificates(
         let SiteKey::Named { host, port } = &site.key else {
             continue;
         };
-        let key = if *port == 443 {
-            host.clone()
-        } else {
-            format!("{host}:{port}")
-        };
+        let key = cert_store_key(host, *port);
         match &tls.source {
             TlsSource::Acme => {}
             TlsSource::Internal => {
                 let cert = generate_internal_cert(host)?;
-                cert_store.store(&key, cert);
+                // `store_supplied`: this certificate is the operator's, so the
+                // renewal scheduler never re-issues it via ACME.
+                cert_store.store_supplied(&key, cert);
                 tracing::info!("serving a self-signed internal certificate for {host}");
             }
             TlsSource::Static {
@@ -352,7 +434,7 @@ fn load_site_certificates(
                 let key_pem = std::fs::read_to_string(key_file)
                     .map_err(|e| format!("failed to read key {key_file}: {e}"))?;
                 let cert = crate::tls::cert_key_from_pem(&cert_pem, &key_pem)?;
-                cert_store.store(&key, cert);
+                cert_store.store_supplied(&key, cert);
                 tracing::info!("serving static certificate for {host}");
             }
         }
@@ -367,7 +449,8 @@ fn generate_internal_cert(host: &str) -> Result<pingora::utils::tls::CertKey, St
     crate::tls::cert_key_from_pem(&cert.cert.pem(), &cert.signing_key.serialize_pem())
 }
 
-/// Open the access-log file (spec §5.13), creating it if needed.
+/// Open the access-log file (spec §5.13), creating it if needed. The handle is
+/// `Arc`-shared by the HTTP handler and the layer-4 services.
 fn open_access_log(
     path: &Path,
     format: AccessLogFormat,
@@ -378,7 +461,7 @@ fn open_access_log(
         .open(path)
         .map_err(|e| format!("failed to open access log {}: {e}", path.display()))?;
     Ok(crate::proxy::handler::AccessLog {
-        file: Mutex::new(file),
+        file: Arc::new(Mutex::new(file)),
         format,
     })
 }
@@ -389,6 +472,23 @@ fn global_access_log_format(global: &Option<AccessLogDirective>) -> AccessLogFor
     match global {
         Some(AccessLogDirective::File { format, .. }) => *format,
         _ => AccessLogFormat::Json,
+    }
+}
+
+/// Install the rustls `CryptoProvider` that the ACME/DNS-01 HTTP clients need.
+///
+/// rustls 0.23 panics on first TLS use when it cannot pick a single backend
+/// from the crate features. Feature unification across raddy's dependencies
+/// enables both `aws-lc-rs` (instant-acme's hyper-rustls) and `ring`
+/// (rustls-platform-verifier), so the provider is chosen and installed
+/// explicitly here — the aws-lc-rs backend, matching instant-acme. Idempotent;
+/// safe to call on every `run` (including the upgrade pre-flight).
+fn install_rustls_crypto_provider() {
+    use rustls::crypto::CryptoProvider;
+    if CryptoProvider::get_default().is_none() {
+        if let Err(already) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+            tracing::debug!("rustls crypto provider already installed: {already:?}");
+        }
     }
 }
 
@@ -440,5 +540,73 @@ mod tests {
     #[test]
     fn default_log_filter_falls_back_to_info() {
         assert_eq!(default_log_filter(None), "info");
+    }
+
+    /// Build a snapshot from an in-memory Raddyfile (temp file). `tag`
+    /// distinguishes parallel tests so they never share a temp filename.
+    fn build_snapshot(tag: &str, config: &str) -> crate::config::ast::CompiledConfig {
+        let path = std::env::temp_dir().join(format!(
+            "raddy_startup_{tag}_{}.Raddyfile",
+            std::process::id()
+        ));
+        std::fs::write(&path, config).unwrap();
+        let cfg = snapshot::build(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        cfg
+    }
+
+    #[test]
+    fn named_sites_get_implicit_http01_listener() {
+        // A config with only a named site must still serve an implicit
+        // plain-HTTP :80 listener so the ACME server can reach the HTTP-01
+        // challenge (P0.2).
+        let cfg = build_snapshot(
+            "named",
+            "api.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n",
+        );
+        let ports = listeners_to_serve(&cfg);
+        assert!(
+            ports.contains(&80),
+            "named sites must bind :80 for HTTP-01: {ports:?}"
+        );
+        assert!(ports.contains(&443));
+    }
+
+    #[test]
+    fn dns_challenge_skips_implicit_http01_listener() {
+        // DNS-01 deployments chose DNS because port 80 is unavailable; they
+        // must not be forced to bind it.
+        let cfg = build_snapshot(
+            "dns01",
+            "{ dns_challenge cloudflare abc123 }\napi.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n",
+        );
+        let ports = listeners_to_serve(&cfg);
+        assert!(
+            !ports.contains(&80),
+            "DNS-01 must not force a :80 listener: {ports:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_http_listener_is_not_duplicated() {
+        // An explicit :80 catch-all already answers the challenge (it is served
+        // before site selection), so the implicit listener must not be added.
+        let cfg = build_snapshot(
+            "explicit80",
+            ":80 {\n    redir https://{host}{uri} permanent\n}\napi.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n",
+        );
+        let ports = listeners_to_serve(&cfg);
+        assert_eq!(ports.iter().filter(|p| **p == 80).count(), 1);
+    }
+
+    #[test]
+    fn catch_all_only_config_gets_no_implicit_listener() {
+        let cfg = build_snapshot("catchall", ":8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n");
+        let ports = listeners_to_serve(&cfg);
+        assert!(
+            !ports.contains(&80),
+            "no named sites, no implicit :80: {ports:?}"
+        );
+        assert_eq!(ports, BTreeSet::from([8080]));
     }
 }

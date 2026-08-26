@@ -26,6 +26,7 @@ use pingora::utils::tls::CertKey;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -241,6 +242,8 @@ impl ValueTemplate {
 pub struct Raddyfile {
     pub global: GlobalConfig,
     pub sites: Vec<Site>,
+    /// Top-level layer-4 listener blocks (`tcp`/`udp`), peers of HTTP sites.
+    pub layer4: Vec<Layer4Listener>,
 }
 
 /// Global configuration from the leading bare `{ ... }` block.
@@ -610,6 +613,10 @@ impl Default for HealthCheckSpec {
 pub struct CompiledConfig {
     pub global: GlobalConfig,
     pub sites: Vec<CompiledSite>,
+    /// Compiled layer-4 listeners. The listener *topology* (the bound
+    /// endpoints) is fixed at process start like the HTTP ports (ADR-010); the
+    /// upstream set/policy/timeouts inside a listener are reloadable.
+    pub layer4: Vec<Layer4Listener>,
 }
 
 impl CompiledConfig {
@@ -618,6 +625,156 @@ impl CompiledConfig {
     pub fn listeners(&self) -> BTreeSet<u16> {
         self.sites.iter().map(|s| s.key.port()).collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Layer 4 (raw TCP proxy) configuration (L4_PROXY_PLAN, P0)
+// ---------------------------------------------------------------------------
+
+/// A bound layer-4 endpoint. Only IP sockets ship in the first release; the
+/// enum reserves a clean extension point for Unix-domain sockets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ListenAddress {
+    Socket(SocketAddr),
+}
+
+impl ListenAddress {
+    /// The port this endpoint binds.
+    pub fn port(&self) -> u16 {
+        match self {
+            ListenAddress::Socket(addr) => addr.port(),
+        }
+    }
+
+    /// Whether a bind on this address captures every interface (IPv4
+    /// `0.0.0.0` / IPv6 `::`). A wildcard bind overlaps any other bind on the
+    /// same transport and port (used for conflict detection).
+    pub fn is_wildcard(&self) -> bool {
+        match self {
+            ListenAddress::Socket(addr) => addr.ip().is_unspecified(),
+        }
+    }
+
+    /// The `host:port` display form (bracketed for IPv6), for logs and keys.
+    pub fn display(&self) -> String {
+        match self {
+            ListenAddress::Socket(addr) => addr.to_string(),
+        }
+    }
+}
+
+/// The transport of a layer-4 listener. TCP and UDP may bind the same address
+/// and port without conflicting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SocketTransport {
+    Tcp,
+    Udp,
+}
+
+/// The identity of one bound layer-4 listener: transport + address.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListenerKey {
+    pub transport: SocketTransport,
+    pub address: ListenAddress,
+}
+
+/// A configured layer-4 upstream: a hostname or IP literal plus a port. The
+/// configured endpoint is retained — not reduced to one resolved `SocketAddr`
+/// at parse time — so resolution, multi-address results, health, and reload
+/// behavior belong to the layer-4 runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L4Upstream {
+    pub host: String,
+    pub port: u16,
+}
+
+impl L4Upstream {
+    /// The endpoint as `host:port` (bracketed for IPv6), for logs and metrics.
+    pub fn display(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// Active TCP-connect health check for a raw-TCP listener (L4 P0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpHealthCheckSpec {
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub consecutive_failures: usize,
+    pub consecutive_successes: usize,
+}
+
+/// An exact-SNI route (L4 P1): when a client's TLS ClientHello carries this
+/// server name, the raw connection is proxied to `upstream` (instead of the
+/// shared `to` set, which is unused in SNI mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SniRoute {
+    /// The exact SNI to match (lowercased; no wildcards in P1).
+    pub name: String,
+    /// The single upstream this SNI is proxied to.
+    pub upstream: L4Upstream,
+}
+
+/// A raw-TCP proxy listener (`tcp :3306 { ... }`, L4 P0).
+///
+/// Kept as its own type (not a large struct with `Option<TcpOptions>` /
+/// `Option<UdpOptions>`), per the L4 plan: shared fields use small value
+/// objects; the UDP proxy gets its own type when P2 lands.
+#[derive(Debug, Clone)]
+pub struct TcpProxyConfig {
+    pub listen: ListenAddress,
+    pub upstreams: Vec<L4Upstream>,
+    /// Load-balancing over the resolved upstreams (reuses `LbPolicy`;
+    /// `IpHash` is source-IP stickiness).
+    pub lb_policy: LbPolicy,
+    /// Bound on a single upstream TCP connect.
+    pub connect_timeout: Duration,
+    /// Inactivity timeout; a connection idle for this long is closed. Reset by
+    /// traffic in either direction.
+    pub idle_timeout: Duration,
+    /// Per-listener cap on concurrently accepted connections.
+    pub max_connections: usize,
+    /// Optional active TCP-connect health check.
+    pub health_check: Option<TcpHealthCheckSpec>,
+    /// SNI-routing mode (L4 P1): when non-empty, each exact SNI is proxied to
+    /// its own upstream and `to`/`upstreams` must be empty.
+    pub sni_routes: Vec<SniRoute>,
+    /// In SNI mode, the upstream served for an unknown/absent/malformed SNI;
+    /// absent = close the connection.
+    pub sni_fallback: Option<L4Upstream>,
+}
+
+/// A UDP proxy listener (`udp :53 { ... }`, L4 P2).
+#[derive(Debug, Clone)]
+pub struct UdpProxyConfig {
+    pub listen: ListenAddress,
+    pub upstreams: Vec<L4Upstream>,
+    /// Selection over the resolved upstreams, once per new flow. `IpHash` is
+    /// source-IP stickiness (the client IP); the flow identity still includes
+    /// the client port.
+    pub lb_policy: LbPolicy,
+    /// A flow idle for this long is evicted (its upstream socket closed).
+    pub idle_timeout: Duration,
+    /// Cap on concurrent flows for this listener.
+    pub max_flows: usize,
+    /// Datagrams larger than this are dropped and counted.
+    pub max_datagram_size: usize,
+    /// Receive socket buffer size (0 = OS default).
+    pub recv_buffer: usize,
+    /// Send socket buffer size (0 = OS default).
+    pub send_buffer: usize,
+}
+
+/// A top-level layer-4 listener block (`tcp` / `udp`), a peer of an HTTP site
+/// block (L4_PROXY_PLAN).
+#[derive(Debug, Clone)]
+pub enum Layer4Listener {
+    Tcp(TcpProxyConfig),
+    Udp(UdpProxyConfig),
 }
 
 /// A compiled site: terminal directives in write order plus block-level

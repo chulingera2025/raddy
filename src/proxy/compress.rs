@@ -35,6 +35,11 @@ pub enum Algo {
     Brotli,
 }
 
+/// Responses smaller than this many bytes are never compressed: the codec
+/// framing (gzip header/footer, zstd frame, brotli stream) makes a tiny body
+/// *larger* after encoding, so the encoding is pure overhead (spec §5.11).
+pub const MIN_COMPRESS_BYTES: usize = 64;
+
 impl Algo {
     /// The `Content-Encoding` token for this algorithm.
     pub fn token(self) -> &'static str {

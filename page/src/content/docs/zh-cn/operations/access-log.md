@@ -14,8 +14,10 @@ raddy 为每个完成的请求写一行访问日志。你可以从 CLI 或从 Ra
 raddy run -c Raddyfile --access-log /var/log/raddy/access.jsonl
 ```
 
-每行是一个独立的 JSON 对象(JSON Lines)。**追加**(绝不截断),因此你可以在
-raddy 运行期间轮转文件,它会继续写入新路径。
+每行是一个独立的 JSON 对象(JSON Lines)。**追加**(绝不截断)。文件在启动时
+打开一次,句柄在整个进程生命周期内保持不变,因此轮转请使用 logrotate 的
+**`copytruncate`** 模式(raddy 持续追加到同一个 inode);基于重命名的轮转会
+让 raddy 继续写入被改名的旧文件,而非新路径。SIGHUP 重载不会重新打开日志。
 
 ## 经 Raddyfile:`access_log`
 

@@ -40,15 +40,23 @@ enum Normalized {
     Empty,
     /// Non-ASCII, so it can never match a named site in v0.1.
     NonAscii,
+    /// The `:port` part was not a valid port number → 400 (RFC 9112 §3.2).
+    InvalidPort,
 }
 
-/// Normalize a Host header value for site matching: strip `:port`, strip a
+/// Normalize a Host header value for site matching: strip `:port` (validating
+/// it — `example.com:notaport` must not silently match `example.com`), strip a
 /// trailing dot, ASCII-lowercase.
 fn normalize_host(raw: &[u8]) -> Normalized {
-    let host = match raw.split(|&b| b == b':').next() {
-        Some(host) => host,
-        None => raw,
+    let (host, port) = match raw.iter().rposition(|&b| b == b':') {
+        Some(idx) => (&raw[..idx], Some(&raw[idx + 1..])),
+        None => (raw, None),
     };
+    if let Some(port) = port {
+        if !is_valid_port(port) {
+            return Normalized::InvalidPort;
+        }
+    }
     let host = match host.strip_suffix(b".") {
         Some(host) => host,
         None => host,
@@ -66,6 +74,20 @@ fn normalize_host(raw: &[u8]) -> Normalized {
     Normalized::Matchable(out)
 }
 
+/// Whether `bytes` is a valid TCP port number: 1–5 ASCII digits in 1..=65535
+/// (RFC 9112 §3.2).
+fn is_valid_port(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() > 5 || bytes.iter().any(|b| !b.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok()),
+        Some(1..=65535)
+    )
+}
+
 /// Select the site that serves a request on the given listener port.
 ///
 /// `host` is `None` when the request carried no Host header.
@@ -73,7 +95,7 @@ pub fn select<'a>(config: &'a CompiledConfig, port: u16, host: Option<&[u8]>) ->
     let normalized = match host {
         None => return Selection::BadRequest,
         Some(raw) => match normalize_host(raw) {
-            Normalized::Empty => return Selection::BadRequest,
+            Normalized::Empty | Normalized::InvalidPort => return Selection::BadRequest,
             Normalized::NonAscii => None,
             Normalized::Matchable(h) => Some(h),
         },
@@ -136,6 +158,7 @@ mod tests {
         let config = CompiledConfig {
             global: Default::default(),
             sites: vec![named("api.example.com", 8080), catch_all(80)],
+            layer4: vec![],
         };
         assert!(matches!(
             select(&config, 8080, Some(b"api.example.com")),
@@ -153,6 +176,7 @@ mod tests {
         let config = CompiledConfig {
             global: Default::default(),
             sites: vec![named("api.example.com", 8080), catch_all(8080)],
+            layer4: vec![],
         };
         assert!(matches!(
             select(&config, 8080, Some(b"other.example.com")),
@@ -165,6 +189,7 @@ mod tests {
         let config = CompiledConfig {
             global: Default::default(),
             sites: vec![catch_all(80)],
+            layer4: vec![],
         };
         assert!(matches!(select(&config, 80, None), Selection::BadRequest));
     }
@@ -174,6 +199,7 @@ mod tests {
         let config = CompiledConfig {
             global: Default::default(),
             sites: vec![catch_all(80)],
+            layer4: vec![],
         };
         assert!(matches!(
             select(&config, 80, Some(b":8080")),
@@ -182,10 +208,38 @@ mod tests {
     }
 
     #[test]
+    fn invalid_host_port_is_bad_request_not_a_match() {
+        // `Host: api.example.com:notaport` must not silently strip the port and
+        // match the named site (RFC 9112 §3.2 requires 400).
+        let config = CompiledConfig {
+            global: Default::default(),
+            sites: vec![named("api.example.com", 8080)],
+            layer4: vec![],
+        };
+        for bad in [
+            b"api.example.com:notaport".as_slice(),
+            b"api.example.com:99999".as_slice(),
+            b"api.example.com:0".as_slice(),
+            b"api.example.com:".as_slice(),
+        ] {
+            assert!(
+                matches!(select(&config, 8080, Some(bad)), Selection::BadRequest),
+                "{bad:?} must be a 400, not a site match"
+            );
+        }
+        // A valid port still matches.
+        assert!(matches!(
+            select(&config, 8080, Some(b"api.example.com:8080")),
+            Selection::Site(_)
+        ));
+    }
+
+    #[test]
     fn unmatched_host_is_not_found() {
         let config = CompiledConfig {
             global: Default::default(),
             sites: vec![named("api.example.com", 8080)],
+            layer4: vec![],
         };
         assert!(matches!(
             select(&config, 8080, Some(b"other.example.com")),
@@ -198,6 +252,7 @@ mod tests {
         let config = CompiledConfig {
             global: Default::default(),
             sites: vec![catch_all(80)],
+            layer4: vec![],
         };
         // 例え.jp is non-ASCII → cannot match → catch-all serves.
         assert!(matches!(

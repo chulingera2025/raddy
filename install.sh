@@ -49,7 +49,12 @@ curl -fsSL -o "$TMP/SHA256SUMS" "$(release)/SHA256SUMS"
 echo "verifying checksum..."
 (
   cd "$TMP"
-  shasum -a 256 -c SHA256SUMS 2>/dev/null | grep -q "raddy-$ARCH.tar.gz: OK"
+  # The release SHA256SUMS lists every architecture's tarball, but only the
+  # tarball for THIS architecture was downloaded — a full `shasum -c` would
+  # fail on the missing files. Extract the matching line and verify it alone.
+  line="$(grep "  raddy-$ARCH.tar.gz$" SHA256SUMS || true)"
+  [ -n "$line" ] || exit 1
+  printf '%s\n' "$line" | shasum -a 256 -c
 ) || {
   echo "checksum verification FAILED; refusing to install" >&2
   exit 1

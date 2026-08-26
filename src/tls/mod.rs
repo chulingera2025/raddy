@@ -41,6 +41,11 @@ use pingora::utils::tls::CertKey;
 pub struct CachedCert {
     cert: Arc<CertKey>,
     expires_at: SystemTime,
+    /// Whether this certificate was issued by ACME (true) or supplied by the
+    /// operator (`tls internal` / `tls <cert> <key>`, spec §5.7). Only ACME
+    /// certificates are renewed; an operator-supplied certificate is the
+    /// operator's to rotate.
+    acme_managed: bool,
 }
 
 /// Process-lifetime store of certificates keyed by hostname.
@@ -82,20 +87,37 @@ impl CertStore {
     }
 
     /// Hostnames whose certificate expires on or before `before` — candidates
-    /// for renewal. Unknown expiry (unparsable `notAfter`) is treated as never
-    /// due rather than hammering ACME on every scan.
+    /// for renewal. Only ACME-managed certificates are candidates: an
+    /// operator-supplied (`tls internal` / static) certificate is the
+    /// operator's to rotate, never re-issued by raddy. Unknown expiry
+    /// (unparsable `notAfter`) is treated as never due rather than hammering
+    /// ACME on every scan.
     pub fn hosts_due_renewal(&self, before: SystemTime) -> Vec<String> {
         self.certs
             .read()
             .expect("cert store lock poisoned")
             .iter()
-            .filter(|(_, entry)| entry.expires_at <= before)
+            .filter(|(_, entry)| entry.acme_managed && entry.expires_at <= before)
             .map(|(host, _)| host.clone())
             .collect()
     }
 
-    /// Insert or replace the certificate for a hostname, recording its expiry.
+    /// Insert or replace the ACME certificate for a hostname, recording its
+    /// expiry. The certificate is marked ACME-managed, so the renewal scheduler
+    /// considers it (see [`Self::hosts_due_renewal`]).
     pub fn store(&self, host: &str, cert: CertKey) {
+        self.store_with_source(host, cert, true);
+    }
+
+    /// Insert or replace an operator-supplied certificate (`tls internal` /
+    /// static, spec §5.7). It is never renewed by ACME.
+    pub fn store_supplied(&self, host: &str, cert: CertKey) {
+        self.store_with_source(host, cert, false);
+    }
+
+    /// Shared insertion path: record the cert, its expiry, and whether it is
+    /// ACME-managed.
+    fn store_with_source(&self, host: &str, cert: CertKey, acme_managed: bool) {
         let expires_at = leaf_not_after(&cert).unwrap_or_else(|| {
             // Unreachable for a cert that parsed as valid PEM; fall back to
             // never-due so a parsing regression cannot cause a renewal storm.
@@ -110,8 +132,22 @@ impl CertStore {
                 CachedCert {
                     cert: Arc::new(cert),
                     expires_at,
+                    acme_managed,
                 },
             );
+    }
+}
+
+/// The certificate-store key for `host` on listener `port`: the bare host on
+/// 443 (where ACME certificates live), `host:port` otherwise (P2). Every store
+/// accessor — the SNI callback's lookup, ACME issuance/persistence, and the
+/// startup/on-demand enqueue paths — must use the same key, or a certificate
+/// issued for a named site on a non-443 TLS port would never be found.
+pub fn cert_store_key(host: &str, port: u16) -> String {
+    if port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -179,13 +215,9 @@ impl SniCallback {
 
     /// The certificate-store key for `host` on this listener's port (P2): the
     /// bare host on the default 443 (where ACME certs live), `host:port`
-    /// otherwise.
+    /// otherwise — the same key [`cert_store_key`] uses everywhere.
     fn cert_key(&self, host: &str) -> String {
-        if self.port == 443 {
-            host.to_string()
-        } else {
-            format!("{host}:{}", self.port)
-        }
+        cert_store_key(host, self.port)
     }
 
     /// Apply a site's per-SNI TLS options (spec §5.7) to an in-progress
@@ -323,8 +355,11 @@ impl TlsAccept for SniCallback {
                 }
             }
             None => {
+                // The store key (host on 443, host:port elsewhere) is what a
+                // certificate for this site would be filed under, so the
+                // on-demand path must enqueue exactly that key (A1).
                 tracing::warn!("no certificate for SNI '{sni}'; triggering on-demand issuance");
-                (self.on_miss)(&sni);
+                (self.on_miss)(&cert_key);
             }
         }
         // Per-site TLS options (spec §5.7): min/max version, ciphers, mTLS.
@@ -406,6 +441,38 @@ mod tests {
         assert_eq!(store.hosts_due_renewal(later_expiry).len(), 2);
     }
 
+    #[test]
+    fn operator_supplied_cert_is_never_renewed() {
+        // A `tls internal` / static certificate (store_supplied) must not be
+        // re-issued by ACME: the renewal scan skips it even when it is inside
+        // the renewal window (A2).
+        let store = CertStore::new();
+        let (pem, key) = rcgen_test_cert_validity("op.test", (2025, 1, 1), (2026, 1, 1));
+        store.store_supplied("op.test", cert_key_from_pem(&pem, &key).unwrap());
+        let (pem, key) = rcgen_test_cert_validity("acme.test", (2025, 1, 1), (2026, 1, 1));
+        store.store("acme.test", cert_key_from_pem(&pem, &key).unwrap());
+
+        // A deadline far past both expiries: only the ACME-managed cert is a
+        // renewal candidate.
+        let far_future =
+            std::time::SystemTime::now() + std::time::Duration::from_secs(100 * 365 * 24 * 3600);
+        let mut due = store.hosts_due_renewal(far_future);
+        due.sort();
+        assert_eq!(due, vec!["acme.test".to_string()]);
+        // The operator cert still serves (it is in the store).
+        assert!(store.has("op.test"));
+    }
+
+    #[test]
+    fn cert_store_key_is_bare_host_on_443_else_host_port() {
+        assert_eq!(cert_store_key("api.example.com", 443), "api.example.com");
+        assert_eq!(
+            cert_store_key("api.example.com", 8443),
+            "api.example.com:8443"
+        );
+        assert_eq!(cert_store_key("api.example.com", 80), "api.example.com:80");
+    }
+
     /// Generate a self-signed certificate valid between two fixed dates
     /// (dev/test helper; production certificates come from ACME).
     fn rcgen_test_cert_validity(
@@ -449,6 +516,7 @@ mod tests {
         let config = Arc::new(ConfigStore::new(crate::config::ast::CompiledConfig {
             global: crate::config::ast::GlobalConfig::default(),
             sites: vec![],
+            layer4: vec![],
         }));
 
         let callbacks: TlsAcceptCallbacks =
@@ -498,6 +566,7 @@ mod tests {
         let config = Arc::new(ConfigStore::new(crate::config::ast::CompiledConfig {
             global: crate::config::ast::GlobalConfig::default(),
             sites: vec![],
+            layer4: vec![],
         }));
         let cb443 = SniCallback::new(store.clone(), config.clone(), 443, Arc::new(|_| {}));
         let cb8443 = SniCallback::new(store, config, 8443, Arc::new(|_| {}));
@@ -542,6 +611,7 @@ mod tests {
         let config = Arc::new(ConfigStore::new(crate::config::ast::CompiledConfig {
             global: crate::config::ast::GlobalConfig::default(),
             sites: vec![site_443, site_8443],
+            layer4: vec![],
         }));
         let cb443 = SniCallback::new(
             Arc::new(CertStore::new()),

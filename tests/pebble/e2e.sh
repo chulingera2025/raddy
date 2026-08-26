@@ -54,9 +54,15 @@ if ! timeout 5 curl -s --cacert "$PEBBLE_CA" https://localhost:14000/dir >/dev/n
   exit 1
 fi
 
-# --- raddy config: one named site (default 443 -> TLS) proxying to the upstream ---
+# --- raddy config: one named site on 443, one on a non-443 TLS port (A1) ---
+# `alt.test:8443` carries a bare `tls` directive (ACME source) so it is served
+# over TLS on 8443; its certificate must be keyed and served as `host:port`.
 cat > "$CONFIG" <<EOF
 raddy.test {
+    reverse_proxy 127.0.0.1:$UPSTREAM_PORT
+}
+alt.test:8443 {
+    tls
     reverse_proxy 127.0.0.1:$UPSTREAM_PORT
 }
 EOF
@@ -96,6 +102,32 @@ if [ "$STATUS" = "200" ]; then
   echo "OK: HTTPS forwarding works with the ACME-issued certificate (status $STATUS)"
 else
   echo "FAILED: unexpected HTTPS status: $STATUS" >&2
+  exit 1
+fi
+
+# --- non-443 TLS site (A1): the certificate is keyed by `host:port` and the
+# SNI callback must find it there, or the handshake fails forever. ---
+echo "waiting for non-443 ACME certificate..."
+for _ in $(seq 1 60); do
+  if [ -f "$CERT_DIR/alt.test:8443.pem" ]; then
+    echo "certificate issued: $CERT_DIR/alt.test:8443.pem"
+    break
+  fi
+  sleep 1
+done
+if [ ! -f "$CERT_DIR/alt.test:8443.pem" ]; then
+  echo "FAILED: non-443 certificate was not issued; raddy log:" >&2
+  tail -30 /tmp/raddy_e2e.log >&2 || true
+  exit 1
+fi
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" --cacert "$CERT_DIR/alt.test:8443.pem" \
+  --resolve alt.test:8443:127.0.0.1 \
+  https://alt.test:8443/ 2>/dev/null)
+if [ "$STATUS" = "200" ]; then
+  echo "OK: non-443 HTTPS forwarding works with the ACME-issued certificate (status $STATUS)"
+else
+  echo "FAILED: non-443 HTTPS unexpected status: $STATUS" >&2
+  tail -30 /tmp/raddy_e2e.log >&2 || true
   exit 1
 fi
 

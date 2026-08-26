@@ -17,3 +17,10 @@ path = "fuzz_targets/parse_config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "parse_client_hello"
+path = "fuzz_targets/parse_client_hello.rs"
+test = false
+doc = false
+bench = false

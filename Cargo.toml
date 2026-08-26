@@ -1,6 +1,6 @@
 [package]
 name = "raddy"
-version = "0.2.10"
+version = "0.3.0"
 edition = "2021"
 authors = ["chulingera2025"]
 description = "A minimal high-performance reverse proxy gateway built on Cloudflare Pingora"
@@ -37,6 +37,9 @@ rcgen = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
+# Socket options (receive/send buffer sizes) for the layer-4 UDP listeners;
+# std::net::UdpSocket no longer exposes the buffer setters directly.
+socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
@@ -45,8 +48,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # issuance worker runs on its own single-threaded runtime and serializes orders,
 # so blocking a call there is acceptable. `json` enables send_json/into_json.
 ureq = { version = "2", features = ["json"] }
+# rustls is pulled transitively by the ACME client (instant-acme -> hyper-rustls)
+# and the DNS-01 client (ureq); feature unification enables BOTH crypto backends
+# (aws-lc-rs via instant-acme, ring via rustls-platform-verifier), which makes
+# rustls 0.23 refuse to auto-select a provider and panic on first TLS use.
+# Declared directly so startup installs the aws-lc-rs provider explicitly.
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 zstd = "0.13"
 
 [dev-dependencies]
 rcgen = "0.14"
-socket2 = "0.6"

@@ -140,8 +140,12 @@ for it here.
 `root` + the **full request path** (including the `handle` prefix) —
 `handle /static/* { root /var/www; file_server }` maps `/static/foo` to
 `/var/www/static/foo`. Directories serve their `index.html`; `..` traversal is
-rejected with 404; only GET/HEAD are allowed. `encode` applies to `file_server`
-responses too.
+rejected with 404; only GET/HEAD are allowed. **Hidden files are never
+served**: any path segment beginning with `.` (`.env`, `.git/`, `.htaccess`)
+is rejected with 404, except the `.well-known` directory (RFC 8615 well-known
+URIs are public discovery endpoints). `encode` applies to `file_server`
+responses too, and a body smaller than 64 bytes is left uncompressed (the
+codec framing would make it larger).
 
 ### 5.1 `lb_policy` / `health_check` (sub-directives of the `reverse_proxy` block)
 
@@ -529,6 +533,14 @@ configure access logging more precisely:
   the matching certificate, and the 443 listener uses SNI dynamic certificates
   (cached in `raddy_certs/`, reused on restart). Certificates are renewed
   automatically within 30 days of expiry.
+- **Implicit HTTP-01 listener on :80**: HTTP-01 is answered on a plain-HTTP
+  listener, so when a config has named sites but no site on port 80, raddy
+  binds an implicit plain-HTTP `:80` listener that serves only the ACME
+  challenge (other requests to it get 404). Without it, the ACME server could
+  never reach the challenge and issuance would hang. Configuring `dns_challenge`
+  (DNS-01) skips the implicit listener — DNS deployments chose it precisely
+  because port 80 is unavailable. An explicit `:80` catch-all already answers
+  the challenge, so it is never duplicated.
 - **Explicit named-site ports**: `api.example.com:8081 { ... }` binds a named
   site to a non-standard port (for local multi-port deployment and testing);
   the default is 443 when the port is omitted. IPv6 literal addresses
@@ -582,7 +594,83 @@ api.example.com {
 > Deferred and future directives (`tls_alpn_challenge`, …) do not appear in the
 > example, so readers never copy an unparseable config.
 
-## 8. Todo
+## 8. Layer-4 listeners (TCP, SNI passthrough, and UDP)
+
+**Status: Available (TCP/SNI/UDP) in the `v0.3.0` release candidate.** UDP
+zero-downtime upgrade remains intentionally unsupported; use a plain restart.
+
+A `tcp` block is a **top-level listener**, a peer of an HTTP site block. It
+proxies raw TCP connections (no HTTP parsing, no TLS termination) to one or
+more upstreams:
+
+```caddyfile
+tcp :3306 {
+    to db-1.internal:3306 db-2.internal:3306
+    lb_policy round_robin          # round_robin | random | ip_hash
+    connect_timeout 3s
+    idle_timeout 5m
+    max_connections 10000
+    health_check {
+        interval 10s
+        timeout 2s
+        consecutive_failures 3
+        consecutive_successes 2
+    }
+}
+```
+
+- **Listen address**: an IP literal, or `:port` for all interfaces; IPv6 is
+  bracketed (`tcp [::1]:8080`, `udp [::1]:53`). TCP and UDP may share an address and port, but
+  two TCP listeners whose binds overlap (a wildcard overlaps any specific bind)
+  are rejected, as is a raw-TCP listener on an HTTP site's port.
+- **`to <host>:<port>...`**: at least one upstream. Hostnames are resolved at
+  startup and re-resolved periodically (default 60s; the resolved address set
+  is swapped for new connections only); a transient refresh failure keeps the
+  last-known-good addresses (`raddy_l4_tcp_dns_refresh_failures_total` counts
+  it). An unresolvable upstream at startup is an error.
+- **SNI routing** (`sni <name> <host:port>` + optional
+  `fallback <host:port>`, L4 P1): a `tcp` listener with `sni` lines routes TLS
+  connections by the ClientHello's exact SNI — without terminating TLS (the
+  ClientHello is inspected in a bounded prefix and forwarded unchanged). Each
+  `sni` maps an exact (lowercased) name to its own upstream; an
+  unknown/absent/malformed/oversized SNI goes to `fallback` when set, otherwise
+  the connection is closed. `sni` and `to` are mutually exclusive, wildcard
+  names are not supported in v1, and `health_check` does not apply to SNI
+  mode.
+- **`lb_policy`** reuses the HTTP policies: `round_robin` (default), `random`,
+  and `ip_hash` (source-IP stickiness — the same client stays on the same
+  upstream).
+- **`connect_timeout`** bounds a single upstream connect (default `5s`);
+  **`idle_timeout`** is a *true* inactivity timeout reset by traffic in either
+  direction (default `5m`, so a long-lived active connection never times out);
+  **`max_connections`** caps concurrent connections (default `10000`; rejected
+  connections are counted in metrics).
+- **`health_check { ... }`** runs active TCP-connect probes with the same
+  defaults as HTTP (`5s` interval, `2s` timeout, `3` consecutive failures,
+  `2` consecutive successes). An unhealthy upstream is skipped; when every
+  upstream is unhealthy the connection is refused.
+- Each closed connection emits a typed access-log line (JSON, distinct from the
+  HTTP access log) and Prometheus metrics (`raddy_l4_tcp_*`, labelled by
+  listener).
+- **UDP proxying** (`udp <address> { to ... lb_policy idle_timeout max_flows
+  max_datagram_size recv_buffer send_buffer }`, L4 P2): proxies datagrams. Each
+  client (address + port) maps to a **flow** with its own connected upstream
+  socket (the ephemeral local port demultiplexes responses). Selection happens
+  once per flow — `ip_hash` pins the client *IP* while the flow identity still
+  includes the port. Bounds: `max_flows` caps the table (oldest-first
+  eviction), `idle_timeout` evicts idle flows, `max_datagram_size` drops and
+  counts oversized datagrams, and `recv_buffer`/`send_buffer` size the sockets
+  (0 = OS default). UDP and TCP may share an address and port. Metrics:
+  `raddy_l4_udp_*`. **Zero-downtime upgrades do not apply to UDP**: the listener
+  socket is bound outside the fd-handoff mechanism, so `raddy upgrade` cannot
+  serve a UDP configuration — use a plain restart (flows reset).
+- **Reload semantics**: a SIGHUP reload applies the new upstream set, policy,
+  limits, and timeouts to *new* connections; existing connections keep their
+  selected upstream. Changing a listener's bind address is a **topology
+  change** and is rejected with an error directing the operator to restart or
+  use `raddy upgrade`.
+
+## 9. Todo
 
 - Any syntax detail not covered here: **document it before implementing**.
 - DNS-01 providers beyond Cloudflare are **deferred** — one GitHub issue per

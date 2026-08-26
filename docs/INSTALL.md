@@ -65,6 +65,23 @@ docker run --rm -p 80:80 -p 443:443 \
 
 > Note: integrity is guaranteed with **sha256 checksums** (verified by the installer). Code signing with a published release key (e.g. minisign/cosign) is a future enhancement.
 
+## Run as a systemd service
+
+`examples/raddy.service` is a ready-made unit that starts raddy on boot, hot-reloads
+it on `systemctl reload` (SIGHUP), and restarts it on failure:
+
+```bash
+sudo install -Dm644 examples/raddy.service /etc/systemd/system/raddy.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now raddy
+```
+
+Because automatic HTTPS binds ports 80/443, the service runs as root (or grant
+`CAP_NET_BIND_SERVICE`). It expects the config at `/etc/raddy/Raddyfile` and
+stores certificates under `/var/lib/raddy/certs` — edit the unit to match your
+layout. The unit's `ExecStart` flags are also what `raddy upgrade` must be
+invoked with for zero-downtime binary upgrades.
+
 ## Verify the install
 
 ```bash

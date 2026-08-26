@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml/badge.svg)](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/chulingera2025/raddy)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v0.2.10-blue)]()
+[![Version](https://img.shields.io/badge/version-v0.3.0-blue)]()
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)]()
 [中文文档](README.zh_CN.md)
 
@@ -24,7 +24,8 @@ models, limited extensibility). Raddy takes a different answer on three things:
 2. **Automatic HTTPS as a first-class citizen** — native ACME issuance and SNI
    dynamic certificates, out of the box.
 3. **Pingora's hardcore engine** — multi-threaded shared connection pools, no
-   GC, and (future) zero-downtime binary upgrades.
+   GC, and zero-downtime binary upgrades (`raddy upgrade` hands listening
+   sockets to a new binary without dropping a request).
 
 ## Features
 
@@ -47,6 +48,10 @@ models, limited extensibility). Raddy takes a different answer on three things:
 - **Migration** — `raddy import caddyfile|nginx <file>` converts a common
   Caddyfile / nginx.conf subset into a Raddyfile (independent converter, never
   changes the Raddyfile grammar).
+- **Layer-4 proxying** — `tcp <address> { ... }` and `udp <address> { ... }`
+  listeners proxy raw TCP connections and UDP datagrams (no HTTP parsing), with
+  load-balancing policies, SNI passthrough routing, idle/connect timeouts,
+  bounded connections/flows, health checks, DNS refresh, and metrics.
 
 ## Quick start
 
@@ -114,8 +119,15 @@ and the global block.
 
 The core implementation is complete: forwarding + hot reload, the Raddyfile
 parser (fuzz-verified, with line/column errors), ACME automatic HTTPS (verified
-against a local Pebble test CA), static hosting + compression, observability,
-and release tooling.
+against a local Pebble test CA, HTTP-01 + DNS-01, with automatic renewal),
+per-site TLS (static/internal certs, mTLS, TLS to upstreams), health checks and
+load-balancing policies, single-node rate limiting with a trusted client-IP
+model, gzip/zstd/brotli compression (streaming, range-aware), structured JSON
+and common-format access logs, the Caddyfile/nginx migration tool, and
+zero-downtime binary upgrades. Layer-4 TCP, SNI passthrough, and UDP are
+implemented and covered by integration tests; UDP intentionally uses a restart
+path for upgrades. Release tooling ships a checksum-verified installer for
+Linux x86_64/aarch64 plus Docker.
 
 ## License
 

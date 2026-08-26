@@ -279,11 +279,14 @@ where
             0 => None,
             1 => Some(indices[0]),
             // Several peers share the address with different TLS identities
-            // (P2): rotate among them so each virtual host gets traffic.
-            _ => {
+            // (P2): the pick must be distributed among them. Round-robin and
+            // random rotate globally (empty key); `ip_hash` must pin the same
+            // client to the same peer, so its (non-empty) client key decides.
+            _ if key.is_empty() => {
                 let n = self.rotation.fetch_add(1, Ordering::Relaxed);
                 Some(indices[n % indices.len()])
             }
+            _ => Some(indices[stable_hash(key) as usize % indices.len()]),
         }
     }
 
@@ -294,6 +297,19 @@ where
     async fn probe(&self) {
         self.inner.backends().run_health_check(true).await;
     }
+}
+
+/// A small deterministic (FNV-1a) hash of `bytes`. Used to pin `ip_hash`
+/// clients to one peer among several that share an address (P2): the mapping
+/// must be stable across restarts, so the process-random `DefaultHasher` is not
+/// used here.
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -367,6 +383,7 @@ mod tests {
         let empty = CompiledConfig {
             global: GlobalConfig::default(),
             sites: vec![],
+            layer4: vec![],
         };
         pool.reconcile(&empty);
         let rebuilt = pool.balancer_for(&key, 0, s);
@@ -421,5 +438,47 @@ mod tests {
             a < 2 && b < 2,
             "selection must be an index into the two upstreams (got {a}, {b})"
         );
+    }
+
+    #[test]
+    fn ip_hash_pins_same_client_across_same_addr_tls_peers() {
+        // A4: two TLS peers sharing one address (P2). `ip_hash` must stick the
+        // same client to the same peer — the old global rotation made successive
+        // requests from one client alternate SNI identities.
+        let pool = LoadBalancerPool::new();
+        let key = SiteKey::CatchAll { port: 8080 };
+        let mut spec = spec(LbPolicy::IpHash, &["10.0.0.1:443"]);
+        spec.upstreams[0].tls = true;
+        spec.upstreams[0].host = "a.example.com".into();
+        spec.upstreams.push(UpstreamPeer {
+            addr: "10.0.0.1:443".parse().unwrap(),
+            tls: true,
+            host: "b.example.com".into(),
+        });
+        let balancer = pool.balancer_for(&key, 0, spec);
+
+        // The same client key always selects the same index; distinct clients
+        // are distributed (with two peers, some must differ).
+        let client_a = b"203.0.113.9".as_slice();
+        let pick = balancer.select(client_a).unwrap();
+        for _ in 0..10 {
+            assert_eq!(
+                balancer.select(client_a).unwrap(),
+                pick,
+                "ip_hash must not rotate same-address TLS peers for one client"
+            );
+        }
+        let mut distinct = false;
+        for n in 0..16u32 {
+            if balancer
+                .select(format!("203.0.113.{n}").as_bytes())
+                .unwrap()
+                != pick
+            {
+                distinct = true;
+                break;
+            }
+        }
+        assert!(distinct, "distinct clients should reach both TLS peers");
     }
 }

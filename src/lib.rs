@@ -27,6 +27,7 @@
 //! * [`migrate`] — Caddyfile/nginx.conf → Raddyfile converter (ARCHITECTURE §7).
 
 pub mod config;
+pub mod layer4;
 pub mod migrate;
 pub mod observ;
 pub mod proxy;

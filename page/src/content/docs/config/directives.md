@@ -276,8 +276,11 @@ scoped block.
 **Behavior.** Serves `root` + the full request path, including any `handle`
 prefix — `handle /static/* { root /var/www; file_server }` maps `/static/foo` to
 `/var/www/static/foo`. A directory serves its `index.html`. Path traversal
-(`..`) is rejected with `404`. Only `GET` and `HEAD` are allowed. `encode`
-applies to `file_server` responses too.
+(`..`) is rejected with `404`. Hidden files are never served — any path segment
+starting with `.` (`.env`, `.git/`, `.htaccess`) is rejected with `404`, except
+the `.well-known` directory (RFC 8615 well-known URIs are public by design).
+Only `GET` and `HEAD` are allowed. `encode` applies to `file_server` responses
+too; a body smaller than 64 bytes is left uncompressed.
 
 **Example.**
 
