@@ -35,8 +35,14 @@
 
 ## Release
 
-- [ ] Commit the release changes.
-- [ ] Push the release branch and open a pull request.
-- [ ] Merge the pull request into `main`.
-- [ ] Create and push the `v0.3.5` tag from the merge commit.
-- [ ] Publish the GitHub release and verify installer artifacts/checksums.
+- [x] Commit the release changes.
+- [x] Push the release branch and open a pull request.
+- [x] Merge the pull request into `main`.
+- [x] Create and push the `v0.3.5` tag from the merge commit.
+- [x] Publish the GitHub release and verify installer artifacts/checksums.
+
+Release evidence:
+
+- Merge commit: `ee27445a50a14b64d5cb78d342c3fceee373cd6a`.
+- Pull request: [#24](https://github.com/chulingera2025/raddy/pull/24).
+- Release: [v0.3.5](https://github.com/chulingera2025/raddy/releases/tag/v0.3.5).

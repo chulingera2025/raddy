@@ -23,8 +23,9 @@ internal links in the content are **relative** so they resolve under any base.
 └── tsconfig.json
 ```
 
-Each page under `src/content/docs/` maps to a route; the `zh-cn/` subdirectory
-mirrors the same paths. Missing translations fall back to English until written.
+Each page under `src/content/docs/` maps to a route. The English tree is the
+canonical source; the `zh-cn/` subdirectory mirrors translated paths where they
+exist, and missing translations fall back to English until written.
 
 ## Commands
 
@@ -40,7 +41,8 @@ Run from this directory:
 
 ## Writing docs
 
-- Content is bilingual: keep English and `zh-cn/` in sync.
+- Write new or rewritten documentation in English first. Keep the existing
+  `zh-cn/` translations aligned when localization work is scheduled.
 - Use **relative** links between pages (never `/config/…` absolute paths) so
   they keep working under the `/raddy/` base.
 - Raddyfile code blocks use the `caddyfile` language tag — a lightweight grammar

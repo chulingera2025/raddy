@@ -6,8 +6,14 @@
 > **Red line**: any syntax not specified here must be added here before it is
 > implemented — never decide syntax on the fly.
 
-Status legend: **Available** = implemented; **Deferred** = blocked or postponed;
-**Future** = not yet scheduled.
+This specification describes the syntax and behavior shipped in `v0.3.5`.
+New syntax must be documented here before it is implemented. A feature boundary
+or deployment prerequisite belongs in the architecture and operations records,
+not in an untracked implementation plan.
+
+Every directive listed as **Available** below is part of the `v0.3.5`
+configuration contract. A release may add syntax only by updating this document
+and its validation coverage together.
 
 ## 1. Design philosophy: explicit write-order execution
 
@@ -705,10 +711,12 @@ tcp :8443 {
   change** and is rejected with an error directing the operator to use a normal
   restart. The zero-downtime upgrade requires the same listener topology.
 
-## 9. Todo
+## 9. Compatibility and boundaries
 
-- Any syntax detail not covered here: **document it before implementing**.
-- DNS-01 providers beyond Cloudflare are **deferred** — one GitHub issue per
-  provider (community contributions welcome).
-- QUIC/HTTP-3 termination remains a separate sidecar boundary because Pingora
-  0.8.1 does not expose a QUIC transport.
+- Any syntax detail not covered here must be documented before implementation.
+- The Cloudflare DNS-01 provider is the provider included in `v0.3.5`; other
+  providers are outside this release's configuration contract.
+- UDP can carry QUIC datagrams as passthrough, but QUIC/HTTP-3 termination,
+  HTTP/3 routing, and connection migration require a separate protocol service.
+- Listener topology changes are not reloadable. Use a normal restart; a
+  zero-downtime upgrade is valid only when the listener topology is unchanged.

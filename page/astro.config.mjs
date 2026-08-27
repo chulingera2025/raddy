@@ -92,6 +92,13 @@ export default defineConfig({
 						{ label: 'Redirect HTTP → HTTPS', translations: { 'zh-CN': 'HTTP → HTTPS 重定向' }, slug: 'guides/http-to-https' },
 						{ label: 'Proxy an API', translations: { 'zh-CN': '代理 API' }, slug: 'guides/api-proxy' },
 						{ label: 'Layer 4 (TCP & UDP)', translations: { 'zh-CN': '四层代理（TCP 与 UDP）' }, slug: 'guides/layer4' },
+						{ label: 'Migrate from Caddy or nginx', slug: 'guides/migration' },
+					],
+				},
+				{
+					label: 'Architecture',
+					items: [
+						{ label: 'Capability matrix', slug: 'architecture/capabilities' },
 					],
 				},
 				{
@@ -109,6 +116,8 @@ export default defineConfig({
 					translations: { 'zh-CN': 'CLI 与运维' },
 					items: [
 						{ label: 'CLI reference', translations: { 'zh-CN': 'CLI 参考' }, slug: 'cli' },
+						{ label: 'Deployment and operations', slug: 'operations/deployment' },
+						{ label: 'Troubleshooting', slug: 'operations/troubleshooting' },
 						{ label: 'Metrics', translations: { 'zh-CN': '指标' }, slug: 'operations/metrics' },
 						{ label: 'Access log', translations: { 'zh-CN': '访问日志' }, slug: 'operations/access-log' },
 						{ label: 'Performance', translations: { 'zh-CN': '性能' }, slug: 'performance' },

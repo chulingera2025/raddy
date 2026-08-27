@@ -1,60 +1,72 @@
 ---
 title: Installation
-description: Install raddy with a checksum-verified installer, manually, or from source.
+description: Install a verified Linux release, build Raddy from source, or run it in Docker.
 ---
 
-Releases ship a **checksum-verified installer** and a **manual path** — neither
-relies on `curl | sudo bash`. The installer downloads, verifies the sha256, then
-installs.
+The release page provides checksum-verified Linux binaries for `x86_64` and
+`aarch64`. Other platforms can build from source. The installer downloads the
+matching archive and verifies its checksum before it writes the binary.
 
-## Installer script (recommended)
+## Install a release
 
-The release assets include `install.sh` (download and review it first):
+Download the installer and its checksum file, inspect the script, then run it:
 
 ```bash
-# Download and review the script, then run it
-curl -fsSL -O https://github.com/chulingera2025/raddy/releases/latest/download/install.sh
-# Optional: verify the script's own checksum against the release SHA256SUMS
-shasum -a 256 -c SHA256SUMS
-./install.sh                  # installs to /usr/local/bin/raddy
-./install.sh v0.1.2 ~/.local  # specific version and prefix
+curl -fsSLO https://github.com/chulingera2025/raddy/releases/latest/download/install.sh
+curl -fsSLO https://github.com/chulingera2025/raddy/releases/latest/download/SHA256SUMS
+grep '  install.sh$' SHA256SUMS | shasum -a 256 -c -
+less install.sh
+./install.sh
+raddy --version
 ```
 
-The script picks `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` from
-`uname -m`, downloads the matching tarball and `SHA256SUMS`, and only runs
-`install` after `shasum -a 256 -c` passes. A failed check aborts without
-installing.
+The default prefix is `/usr/local`. A specific release and prefix can be
+selected explicitly:
 
-## Manual install
+```bash
+./install.sh v0.3.5 "$HOME/.local"
+```
 
-1. From [Releases](https://github.com/chulingera2025/raddy/releases), download
-   `raddy-<arch>.tar.gz` for your architecture and `SHA256SUMS`.
-2. Verify:
+If the prefix is not on `PATH`, invoke the binary by its full path or update
+your shell configuration.
+
+## Install manually
+
+1. Download `raddy-<arch>-unknown-linux-gnu.tar.gz` and `SHA256SUMS` from the
+   [release page](https://github.com/chulingera2025/raddy/releases).
+2. Verify the archive:
+
    ```bash
    shasum -a 256 -c SHA256SUMS
    ```
-   The output must include `<filename>: OK`.
-3. Extract and install:
+
+3. Extract the matching archive and install the binary:
+
    ```bash
-   tar -xzf raddy-<arch>.tar.gz -C /usr/local
+   tar -xzf raddy-<arch>-unknown-linux-gnu.tar.gz
+   sudo install -Dm755 raddy /usr/local/bin/raddy
    raddy --version
    ```
 
 ## Build from source
 
+Requirements:
+
+- stable Rust and Cargo;
+- OpenSSL development libraries;
+- CMake and a C compiler.
+
+Build and verify the release binary:
+
 ```bash
-cargo build --release
+cargo build --release --locked
 ./target/release/raddy --version
 ```
 
-System dependencies: stable Rust, OpenSSL dev libraries (`libssl-dev` /
-`openssl`), and `cmake` (required by pingora's `libz-ng-sys`).
+## Run in Docker
 
-## Docker
-
-The image does **not** bake in a Raddyfile, so mount your own read-only. The
-image's `ENTRYPOINT` is `raddy`, so the container command is the `run`
-subcommand itself. Run these from the directory that contains your `Raddyfile`:
+Build the included image, mount the configuration read-only, and expose only
+the listener ports you use:
 
 ```bash
 docker build -t raddy .
@@ -63,8 +75,7 @@ docker run --rm -p 8080:8080 \
   raddy run -c /etc/raddy/Raddyfile
 ```
 
-To keep ACME certificates across container restarts, mount a certificate
-directory and point `--cert-dir` at it:
+For ACME, persist the certificate directory and publish ports 80 and 443:
 
 ```bash
 docker run --rm -p 80:80 -p 443:443 \
@@ -73,9 +84,11 @@ docker run --rm -p 80:80 -p 443:443 \
   raddy run -c /etc/raddy/Raddyfile --cert-dir /etc/raddy/certs
 ```
 
-## Verify the install
+## Verify before deployment
 
 ```bash
-raddy check -c <your Raddyfile>   # validate the config
-raddy run -c <your Raddyfile>     # run
+raddy check -c /etc/raddy/Raddyfile
 ```
+
+For systemd, service hardening, certificate permissions, reload, and upgrade
+procedures, continue with [Deployment and operations](../operations/deployment/).

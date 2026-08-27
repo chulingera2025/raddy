@@ -1,124 +1,126 @@
 ---
-title: HTTPS & TLS
-description: Automatic HTTPS, the tls directive, upstream TLS, mutual TLS, and HTTP/2.
+title: HTTPS and TLS
+description: Choose automatic HTTPS, static certificates, mTLS, upstream TLS, or explicit HTTP/2 behavior.
 ---
 
-This guide covers everything TLS in raddy: automatic HTTPS with ACME, the `tls`
-directive for per-site control (self-signed or static certificates, protocol
-versions, ciphers, mutual TLS), TLS to your upstream backends, and HTTP/2
-downstream.
+Raddy has two separate TLS decisions:
 
-## Automatic HTTPS in one line
+1. **Downstream TLS** protects the connection from the client to Raddy.
+2. **Upstream TLS** protects the connection from Raddy to the backend.
 
-A named site without a port binds **443** and gets an ACME certificate
-automatically:
+Configure them independently. A TLS client connection does not imply that the
+backend connection also uses TLS.
+
+## Choose a certificate source
+
+| Configuration | Result | Typical use |
+| --- | --- | --- |
+| Named site without `tls` | ACME certificate on port 443 | Public HTTPS |
+| `tls internal` | Locally generated certificate | Development or a private trust domain |
+| `tls <cert> <key>` | Static PEM certificate and key | Externally managed certificates |
+
+## Automatic HTTPS
+
+The smallest public HTTPS configuration is:
 
 ```caddyfile
+{
+    acme_email ops@example.com
+}
+
 example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
 
-raddy registers with the ACME directory, proves control of the domain — with
-**HTTP-01** on its plain-HTTP listener by default, or **DNS-01** via
-[`dns_challenge`](../../config/directives/#dns_challenge) when port 80 is
-unreachable, or TLS-ALPN-01 via the tls_alpn_challenge directive when port 80 is
-unavailable — and renews the certificate within 30 days of expiry. Set your
-contact email in the [global block](../../config/sites/#the-global-block), and add
-an HTTP→HTTPS redirect if you want port 80 visitors pointed at the secure site.
-The full matching model is on [Sites, ports & HTTPS](../../config/sites/).
+A named site without a port uses port 443 and obtains a certificate through
+ACME. Raddy stores certificates and account credentials under `raddy_certs/`
+by default; use `--cert-dir` to persist them elsewhere.
 
-## The `tls` directive
+The challenge methods are mutually exclusive at the instance level:
 
-The [`tls` directive](../../config/directives/#tls) in a site block customizes TLS
-for that site. It has three certificate **sources**:
+| Method | Configuration | Network requirement |
+| --- | --- | --- |
+| HTTP-01 | Default | The ACME server can reach TCP 80 |
+| Cloudflare DNS-01 | `dns_challenge cloudflare <token>` in the global block | The token can edit the authoritative DNS zone |
+| TLS-ALPN-01 | `tls_alpn_challenge` in the global block | The ACME server can reach TCP 443; the site is an ACME site on 443 |
 
-| Source | When to use |
-|---|---|
-| *(omitted)* | ACME, the default |
-| `tls internal` | A self-signed certificate generated at startup — development only; clients must trust it |
-| `tls <cert-file> <key-file>` | A static PEM certificate chain and key; you handle renewal |
+HTTP-01 may create an implicit plain-HTTP listener for the ACME challenge when
+the configuration has no site on port 80. Add a separate `:80` site when you
+also want to redirect normal HTTP traffic:
 
 ```caddyfile
-dev.example.com {
+:80 {
+    redir https://{host}{uri} permanent
+}
+```
+
+For wildcard certificates, use DNS-01. Raddy's v0.3.5 implementation includes
+Cloudflare only; other DNS providers are outside this release.
+
+## Local or private TLS
+
+```caddyfile
+dev.example.test:8443 {
     tls internal
     reverse_proxy 127.0.0.1:8080
 }
+```
 
+The explicit `tls` directive makes an otherwise non-443 named site a TLS
+listener. Clients must trust the generated certificate; `curl -k` is suitable
+for a local smoke test, not for production policy.
+
+Static certificates use the same shape:
+
+```caddyfile
 intranet.example.com {
-    tls /etc/certs/intranet.pem /etc/certs/intranet.key
+    tls /etc/raddy/certs/intranet.pem /etc/raddy/certs/intranet.key
     reverse_proxy 127.0.0.1:9000
 }
 ```
 
-A named site with a `tls` directive binds its port as a **TLS listener**, so a
-static or self-signed site can serve TLS on a non-443 port:
+Raddy does not renew a static certificate. The external certificate owner must
+replace the files and trigger the appropriate reload or restart procedure.
 
-```caddyfile
-dev.local:8443 {
-    tls internal
-    reverse_proxy 127.0.0.1:8080
-}
-```
+## TLS options and mTLS
 
-```bash
-curl -k -H 'Host: dev.local' https://127.0.0.1:8443/
-```
-
-### Protocol versions and ciphers
-
-Restrict the negotiated TLS version and the cipher suites per site. Each option
-is its own `tls` line:
+TLS options are separate `tls` lines:
 
 ```caddyfile
 secure.example.com {
     tls min_version 1.2
     tls max_version 1.3
     tls ciphers ECDHE-ECDSA-AES128-GCM-SHA256
+    tls client_auth require /etc/raddy/certs/clients-ca.pem
     reverse_proxy 127.0.0.1:9000
 }
 ```
 
-`min_version` / `max_version` accept `1.2` or `1.3`. `ciphers` takes an OpenSSL
-cipher suite list; space-separated names are joined with `:`.
+- `min_version` and `max_version` accept `1.2` or `1.3`.
+- `ciphers` accepts OpenSSL cipher names; multiple names are joined with `:`.
+- `client_auth require <ca>` rejects clients without a valid certificate.
+- `client_auth optional <ca>` requests a certificate but also accepts clients
+  without one.
 
-### Mutual TLS (client certificates)
+## TLS to an upstream
 
-Require — or optionally request — a client certificate signed by a CA you trust:
-
-```caddyfile
-secure.example.com {
-    tls client_auth require /etc/certs/clients-ca.pem
-    reverse_proxy 127.0.0.1:9000
-}
-```
-
-- `client_auth require <ca-file>` — reject clients without a valid certificate.
-- `client_auth optional <ca-file>` — request one, but accept clients without.
-
-The same CA file can be reused across sites. See the
-[Authentication guide](../auth/) for the other half of "who may connect"
-— HTTP-level auth guards.
-
-## TLS to your backends (upstream TLS)
-
-Upstreams are plain HTTP by default. Prefix an upstream with `https://` to talk
-TLS to the backend:
+Bare upstreams use HTTP/1.1 without TLS. Select the backend protocol with its
+scheme:
 
 ```caddyfile
-api.example.com {
-    reverse_proxy https://127.0.0.1:8443
-}
+reverse_proxy http://127.0.0.1:8080
+reverse_proxy https://127.0.0.1:8443
+reverse_proxy h2://127.0.0.1:9443
+reverse_proxy h2c://127.0.0.1:9080
 ```
 
-For backends that need a specific SNI name, a private CA, or a client
-certificate, use the block form with the [upstream TLS
-options](../../config/directives/#upstream-tls-options):
+Use block form for backend identity and trust settings:
 
 ```caddyfile
 api.example.com {
     reverse_proxy {
-        to https://10.0.0.1:8443 https://10.0.0.2:8443
+        to https://10.0.0.11:8443 https://10.0.0.12:8443
         tls_servername api.internal
         tls_ca /etc/raddy/root-ca.pem
         tls_cert /etc/raddy/client.pem /etc/raddy/client.key
@@ -126,41 +128,38 @@ api.example.com {
 }
 ```
 
-- `tls_servername` — the SNI sent to the upstream (default: the upstream host).
-  Required when the address is an IP but the certificate is for a name.
-- `tls_ca` — extra root CA(s) for verifying the upstream certificate; system
-  roots are always trusted in addition.
-- `tls_cert <cert-file> <key-file>` — a client certificate for upstream mTLS.
-- `tls_skip_verify` — disables verification entirely; never use in production.
+- `tls_servername` controls the SNI and hostname used for verification.
+- `tls_ca` supplies the trusted PEM roots for the backend; when set, it replaces
+  the system trust roots.
+- `tls_cert` supplies a client certificate for backend mTLS.
+- `tls_skip_verify` disables backend certificate verification and should not be
+  used in production.
 
-Upstream certificate verification failures surface as `502 Bad Gateway`, so a
-mismatched `tls_servername` or missing `tls_ca` is loud, not silent.
+An upstream certificate or protocol mismatch becomes a `502 Bad Gateway`; it
+is not silently downgraded to another scheme.
 
-## HTTP/2 downstream
+## HTTP/2 and WebSockets
 
-TLS listeners advertise HTTP/2 (`h2`) via ALPN and serve HTTP/2 to clients that
-support it, falling back to HTTP/1.1 otherwise — no configuration needed. Plain
-HTTP listeners stay HTTP/1.1. Upstream HTTP/2 is explicit: use
-`h2://host:port` for TLS HTTP/2 or `h2c://host:port` for cleartext
-prior-knowledge HTTP/2.
+TLS listeners advertise `h2` and fall back to HTTP/1.1 through ALPN. Plain HTTP
+listeners remain HTTP/1.1. Upstream HTTP/2 is explicit with `h2://`, while
+`h2c://` uses the cleartext HTTP/2 connection preface directly; it does not use
+the obsolete HTTP/1.1 `Upgrade: h2c` mechanism.
 
-## TLS-ALPN-01
+`reverse_proxy` forwards WebSocket and other HTTP/1.1 upgrade requests without
+an extra directive. The backend remains responsible for the upgraded protocol.
 
-Enable the challenge in the global block when port 80 cannot be used:
+## TLS-ALPN-01 details
+
+Enable the method globally:
 
 ```caddyfile
 {
+    acme_email ops@example.com
     tls_alpn_challenge
 }
 ```
 
-The challenge is served on TCP port 443 with a temporary certificate carrying
-the RFC 8737 `acmeIdentifier` extension and `acme-tls/1` ALPN. It is
-mutually exclusive with DNS-01 and applies only to ACME sites on port 443.
-
-## WebSockets over TLS
-
-WebSocket upgrades work over both HTTP and HTTPS listeners — `reverse_proxy`
-forwards `Upgrade` requests transparently. See [WebSocket and protocol
-upgrades](../../config/directives/#websocket-and-protocol-upgrades) and the
-[API proxy guide](../api-proxy/) for an example.
+Raddy serves a temporary RFC 8737 certificate with the `acme-tls/1` ALPN
+protocol on TCP 443 during the challenge. It cannot be combined with
+`dns_challenge`, and it does not turn an arbitrary TLS listener into an ACME
+challenge endpoint.

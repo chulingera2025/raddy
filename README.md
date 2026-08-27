@@ -2,138 +2,144 @@
 
 [![CI](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml/badge.svg)](https://github.com/chulingera2025/raddy/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/chulingera2025/raddy)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v0.3.5-blue)]()
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)]()
-[中文文档](README.zh_CN.md)
+[![Release](https://img.shields.io/github/v/release/chulingera2025/raddy)](https://github.com/chulingera2025/raddy/releases)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
 
-A minimal, high-performance reverse proxy gateway in Rust, built on
-[Cloudflare Pingora](https://github.com/cloudflare/pingora). Raddy combines the
-**developer experience of Caddy** (an explicit, write-order config DSL + native
-automatic HTTPS) with the **performance and memory safety of Pingora** (Rust,
-no GC, multi-threaded shared connection pools).
+[Chinese documentation](README.zh_CN.md)
 
-## Why Raddy
+Raddy is a small reverse-proxy gateway written in Rust and built on
+[Cloudflare Pingora](https://github.com/cloudflare/pingora). It combines a
+readable, Caddy-style configuration file with Pingora's multi-threaded proxy
+engine, shared upstream pools, and memory safety.
 
-The Rust gateway landscape splits into two camps: hand-written Pingora code
-(flexible but no config model) and existing distributions (diverse config
-models, limited extensibility). Raddy takes a different answer on three things:
+## The short version
 
-1. **Predictable configuration** — directives execute strictly in write order,
-   with no implicit ordering table. The result is predictable without looking
-   anything up.
-2. **Automatic HTTPS as a first-class citizen** — native ACME issuance and SNI
-   dynamic certificates, out of the box.
-3. **Pingora's hardcore engine** — multi-threaded shared connection pools, no
-   GC, and zero-downtime binary upgrades (`raddy upgrade` hands listening
-   sockets to a new binary without dropping a request).
+Use Raddy when you want one binary to handle HTTP/HTTPS routing, automatic TLS,
+static files, upstream load balancing, and selected TCP/UDP workloads without
+turning the configuration into application code.
 
-## Features
+Raddy's defining rule is simple: directives in a site block are interpreted in
+the order you write them. Terminals decide who serves the request; modifiers
+and guards describe how that terminal behaves. The model is explicit rather
+than dependent on a hidden ordering table.
 
-- **Explicit write-order DSL** (`Raddyfile`) — terminal vs modifier directives,
-  `handle` mutual-exclusion blocks, and no hidden ordering rules. See the
-  [Raddyfile specification](docs/RADDYFILE_SPEC.md).
-- **Automatic HTTPS** — ACME issuance for named sites (HTTP-01 by default, or
-  **DNS-01** via `dns_challenge cloudflare <token>`, or TLS-ALPN-01 via
-  `tls_alpn_challenge`), SNI dynamic and wildcard certificates, and an
-  on-demand `ask` authorization callback.
-- **Config hot reload** — SIGHUP swaps the routing snapshot atomically; the
-  upstream connection pools survive reloads (zero-interrupt).
-- **Static file serving + compression** — `file_server` with traversal
-  protection, and `encode` with gzip/zstd honoring `Accept-Encoding`.
-- **Observability** — structured JSON access logs and a Prometheus `/metrics`
-  endpoint (QPS + latency).
-- **Forwarding** — `reverse_proxy` with `to` multi-target round-robin, header
-  rewrites, upstream HTTP/2/h2c, multi-domain site blocks, IPv6 listeners,
-  redirects, and clean 400/404 fallbacks.
-- **Edge protection** — `rate_limit remote_ip` single-node token-bucket rate
-  limiting, with `trusted_proxies` for the real client IP.
-- **Migration** — `raddy import caddyfile|nginx <file>` converts a common
-  Caddyfile / nginx.conf subset into a Raddyfile (independent converter, never
-  changes the Raddyfile grammar).
-- **Layer-4 proxying** — `tcp <address> { ... }` and `udp <address> { ... }`
-  listeners proxy raw TCP connections and UDP datagrams (no HTTP parsing), with
-  load-balancing policies, wildcard SNI passthrough, TLS termination,
-  transparent Linux routing, idle/connect timeouts, bounded connections/flows,
-  health checks, DNS refresh, lossless Linux UDP upgrades, and metrics.
+## Release surface
 
-## Quick start
+Raddy `v0.3.5` is a pre-1.0 release. The following table describes what is
+implemented and tested in this release; it is not a promise that every public
+API is already frozen.
 
-Install the latest release (checksum-verified installer, no `curl | sudo bash`):
+| Area | Included | Boundary |
+| --- | --- | --- |
+| HTTP reverse proxy | HTTP/1.1, downstream HTTP/2, WebSocket upgrades, load balancing, health checks | Rate limits are per process |
+| TLS and ACME | HTTP-01, Cloudflare DNS-01, TLS-ALPN-01, static certificates, internal certificates, mTLS | TLS-ALPN-01 is for eligible ACME sites on port 443 and cannot be combined with DNS-01; other DNS-01 providers are not included |
+| Upstream protocols | HTTP/1.1, `https://`, `h2://`, `h2c://` | `h2c://` requires prior-knowledge HTTP/2 upstreams |
+| Site routing | Multiple domains, IPv4/IPv6, exact and one-label wildcard matching | Wildcards do not match the apex or multiple labels |
+| Layer 4 | TCP, SNI passthrough, TCP TLS termination, UDP datagram proxying | Transparent TCP and UDP handoff are Linux-only integrations |
+| Operations | Config check, SIGHUP reload, zero-downtime binary upgrade, JSON/Prometheus output | Listener topology changes require a normal restart; upgrades require unchanged topology |
+| QUIC / HTTP/3 | UDP datagram passthrough | HTTP/3 termination and routing require a separate QUIC service or sidecar |
+
+## Five-minute local proxy
+
+Install a release binary, or build from source, then start a local upstream:
 
 ```bash
-curl -fsSL -O https://github.com/chulingera2025/raddy/releases/latest/download/install.sh
-./install.sh
-raddy --version
+python3 -m http.server 8080 --bind 127.0.0.1
 ```
 
-Or build from source:
+Create `Raddyfile`:
+
+```caddyfile
+example.local:8090 {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Validate and run Raddy in another terminal:
 
 ```bash
-cargo build --release
+raddy check -c Raddyfile
+raddy run -c Raddyfile
+```
+
+Send a request with the site Host header:
+
+```bash
+curl -H 'Host: example.local' http://127.0.0.1:8090/
+```
+
+`raddy check` performs the same configuration validation used by reload. Keep
+it in deployment scripts and CI before starting or reloading the service.
+
+## A production-shaped site
+
+```caddyfile
+{
+    acme_email ops@example.com
+    trusted_proxies 10.0.0.0/8 192.168.0.0/16
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}
+
+api.example.com {
+    rate_limit remote_ip 100r/s burst=200
+
+    handle /static/* {
+        root /var/www/html
+        file_server
+        encode zstd gzip
+    }
+
+    reverse_proxy {
+        to https://10.0.0.11:8443 https://10.0.0.12:8443
+        tls_servername api.internal
+        health_check {
+            interval 5s
+            timeout 2s
+        }
+    }
+}
+```
+
+The default ACME method is HTTP-01. Use `dns_challenge` when port 80 cannot be
+reached, or `tls_alpn_challenge` when the ACME server can reach TCP 443 and the
+site is eligible for TLS-ALPN-01.
+
+If either backend uses a private CA, add `tls_ca <path>` to the
+`reverse_proxy` block and ensure the file exists before running `raddy check`.
+
+## Documentation map
+
+- [Documentation site](https://chulingera2025.github.io/raddy/) — task-oriented guides and reference.
+- [Installation and deployment](docs/INSTALL.md) — release binaries, Docker, systemd, permissions, and upgrades.
+- [Raddyfile specification](docs/RADDYFILE_SPEC.md) — configuration semantics and compatibility source of truth.
+- [Architecture and capability boundaries](docs/PINGORA_CAPABILITY_RESEARCH.md) — what is native, application-level, Linux-only, or sidecar-based.
+- [Layer 4 architecture](docs/L4_PROXY_PLAN.md) — TCP/UDP runtime model and operational invariants.
+- [Performance baseline](docs/PERFORMANCE.md) — reproducible measurements and their limitations.
+- [Release checklist](docs/RELEASE_CHECKLIST_v0.3.5.md) — historical release evidence.
+
+## Build from source
+
+```bash
+cargo build --release --locked
 ./target/release/raddy --version
 ```
 
-Write a `Raddyfile`:
+Stable Rust, OpenSSL development libraries, and CMake are required for a
+source build. Prebuilt release artifacts currently target Linux GNU on
+`x86_64` and `aarch64`.
 
-```
-:8080 {
-    reverse_proxy 127.0.0.1:9000
-}
-```
+## Project status
 
-Run it:
-
-```bash
-raddy run -c Raddyfile
-curl http://127.0.0.1:8080/
-```
-
-For automatic HTTPS, configure a named site and run with ACME (requires a
-publicly reachable domain on ports 80/443):
-
-```
-raddy.test {
-    reverse_proxy 127.0.0.1:9000
-}
-```
-
-```bash
-raddy run -c Raddyfile --acme-directory https://acme-v02.api.letsencrypt.org/directory
-```
-
-Port 80 unreachable? Add `dns_challenge cloudflare <token>` to the global block
-to prove control via DNS-01 instead (see the
-[Raddyfile specification](docs/RADDYFILE_SPEC.md)).
-
-## Configuration
-
-See the [Raddyfile specification](docs/RADDYFILE_SPEC.md) for the full syntax
-and semantics: sites, `handle`, headers, static files, compression, redirects,
-and the global block.
-
-## Documentation
-
-- [Installation](docs/INSTALL.md) — installer script, manual install, Docker
-- [Raddyfile specification](docs/RADDYFILE_SPEC.md) — the config language
-- [Performance](docs/PERFORMANCE.md) — reproducible QPS / P99 baseline
-- [中文文档](README.zh_CN.md)
-
-## Development status
-
-The core implementation is complete: forwarding + hot reload, the Raddyfile
-parser (fuzz-verified, with line/column errors), ACME automatic HTTPS
-(HTTP-01, DNS-01, and TLS-ALPN-01, with automatic renewal), per-site TLS
-(static/internal certs, mTLS, TLS to upstreams), upstream HTTP/2/h2c,
-multi-domain and wildcard routing, IPv6 listeners, health checks and
-load-balancing policies, single-node rate limiting with a trusted client-IP
-model, gzip/zstd/brotli compression (streaming, range-aware), structured JSON
-and common-format access logs, the Caddyfile/nginx migration tool, and
-zero-downtime binary upgrades. Layer-4 TCP, SNI passthrough, UDP, TLS
-termination, transparent Linux routing, and UDP flow handoff are implemented
-and covered by integration tests. QUIC/HTTP/3 termination remains a separate
-sidecar boundary because Pingora 0.8.1 has no QUIC transport. Release tooling
-ships a checksum-verified installer for Linux x86_64/aarch64 plus Docker.
+The released tree contains the HTTP/TLS gateway, the Raddyfile parser and
+validator, automatic HTTPS, the migration tool, observability, and the tested
+TCP/UDP extensions described above. Work that depends on a separate QUIC
+transport is intentionally kept outside the Pingora process. See the
+[capability document](docs/PINGORA_CAPABILITY_RESEARCH.md) before deploying a
+protocol that needs termination rather than passthrough.
 
 ## License
 
-[Apache-2.0](LICENSE) — matching Pingora.
+[Apache-2.0](LICENSE), matching Pingora.

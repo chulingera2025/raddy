@@ -119,7 +119,8 @@ api.example.com {
 
 - `tls_servername` —— 发给上游的 SNI(默认:上游主机)。地址是 IP 但证书签给
   某个名字时必需。
-- `tls_ca` —— 校验上游证书所用的额外根 CA;系统根始终额外信任。
+- `tls_ca` —— 校验上游证书所用的根 CA;设置后仅信任列出的 CA,不再参考系统
+  信任根。
 - `tls_cert <cert-file> <key-file>` —— 用于上游 mTLS 的客户端证书。
 - `tls_skip_verify` —— 关闭校验;生产环境切勿使用。
 
