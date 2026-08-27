@@ -1,90 +1,119 @@
-# Installation
+# Installation and deployment
 
-Releases ship a **checksum-verified installer** and a **manual path** — neither relies on `curl | sudo bash`. The installer downloads, verifies the sha256, then installs.
+This document is the operator-facing installation record for Raddy. The
+task-oriented version is available in the [documentation site](https://chulingera2025.github.io/raddy/).
 
-## Option 1: Installer script (recommended)
+## Release binaries
 
-The release assets include `install.sh` (download and review it first):
+Prebuilt release archives currently target Linux GNU on `x86_64` and `aarch64`.
+Download the installer and checksum file from the release:
 
 ```bash
-# Download and review the script, then run it
-curl -fsSL -O https://github.com/chulingera2025/raddy/releases/latest/download/install.sh
-# Optional: verify the script's own checksum against the release SHA256SUMS
-shasum -a 256 -c SHA256SUMS
-./install.sh                  # installs to /usr/local/bin/raddy
-./install.sh v0.1.2 ~/.local  # specific version and prefix
+curl -fsSLO https://github.com/chulingera2025/raddy/releases/latest/download/install.sh
+curl -fsSLO https://github.com/chulingera2025/raddy/releases/latest/download/SHA256SUMS
+grep '  install.sh$' SHA256SUMS | shasum -a 256 -c -
+less install.sh
+./install.sh
+raddy --version
 ```
 
-The script picks `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` from `uname -m`, downloads the matching tarball and `SHA256SUMS`, and only runs `install` after `shasum -a 256 -c` passes. A failed check aborts without installing.
-
-## Option 2: Manual install
-
-1. From [Releases](https://github.com/chulingera2025/raddy/releases), download `raddy-<arch>.tar.gz` for your architecture and `SHA256SUMS`.
-2. Verify:
-   ```bash
-   shasum -a 256 -c SHA256SUMS
-   ```
-   The output must include `<filename>: OK`.
-3. Extract and install:
-   ```bash
-   tar -xzf raddy-<arch>.tar.gz -C /usr/local
-   raddy --version
-   ```
-
-## Option 3: Build from source
+The installer downloads the matching archive, verifies its checksum, and only
+then installs `/usr/local/bin/raddy`. Pass a release tag and prefix when needed:
 
 ```bash
-cargo build --release
+./install.sh v0.3.5 /usr/local
+./install.sh v0.3.5 "$HOME/.local"
+```
+
+For a manual installation, download the matching archive and `SHA256SUMS`, run
+`shasum -a 256 -c SHA256SUMS`, extract the archive, and install the `raddy`
+binary with mode `0755`.
+
+## Build from source
+
+Source builds require stable Rust, OpenSSL development libraries, CMake, and a
+C compiler:
+
+```bash
+cargo build --release --locked
 ./target/release/raddy --version
 ```
 
-System dependencies: stable Rust, OpenSSL dev libraries (`libssl-dev` / `openssl`), and `cmake` (required by pingora's `libz-ng-sys`).
+## Files and permissions
+
+A typical host layout is:
+
+```text
+/etc/raddy/Raddyfile       configuration
+/var/lib/raddy/certs/      ACME account and certificate state
+/run/raddy.pid             process identity for upgrade
+/run/raddy_upgrade.sock    listener handoff socket
+/var/log/raddy/            optional access logs
+```
+
+The service account must read the configuration and write the certificate
+directory. Protect the certificate directory because it contains ACME account
+credentials. Keep access logs separate from certificate state and configure
+rotation for the process's long-lived file handle.
+
+## systemd
+
+The repository includes [`examples/raddy.service`](../examples/raddy.service):
+
+```bash
+sudo install -Dm644 examples/raddy.service /etc/systemd/system/raddy.service
+sudo install -d -m0750 /etc/raddy /var/lib/raddy/certs
+sudo install -m0640 Raddyfile /etc/raddy/Raddyfile
+sudo systemctl daemon-reload
+sudo systemctl enable --now raddy
+```
+
+Automatic HTTPS normally needs ports 80 and 443. Run with the required bind
+privilege or grant `CAP_NET_BIND_SERVICE`. Transparent TCP additionally needs
+the Linux networking capabilities described in the [layer 4 guide](https://chulingera2025.github.io/raddy/guides/layer4/).
+
+Validate and reload:
+
+```bash
+sudo raddy check -c /etc/raddy/Raddyfile
+sudo systemctl reload raddy
+```
 
 ## Docker
 
-The image does **not** bake in a Raddyfile, so mount your own read-only. The
-image's `ENTRYPOINT` is `raddy`, so the container command is the `run`
-subcommand itself. Run these from the directory that contains your `Raddyfile`:
+Build the included image and mount configuration and ACME state explicitly:
 
 ```bash
 docker build -t raddy .
-docker run --rm -p 8080:8080 \
-  -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
-  raddy run -c /etc/raddy/Raddyfile
-```
-
-To keep ACME certificates across container restarts, mount a certificate
-directory and point `--cert-dir` at it:
-
-```bash
 docker run --rm -p 80:80 -p 443:443 \
   -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
   -v raddy_certs:/etc/raddy/certs \
   raddy run -c /etc/raddy/Raddyfile --cert-dir /etc/raddy/certs
 ```
 
-> Note: integrity is guaranteed with **sha256 checksums** (verified by the installer). Code signing with a published release key (e.g. minisign/cosign) is a future enhancement.
+## Reload and upgrade policy
 
-## Run as a systemd service
-
-`examples/raddy.service` is a ready-made unit that starts raddy on boot, hot-reloads
-it on `systemctl reload` (SIGHUP), and restarts it on failure:
+Use SIGHUP for routing changes that keep the listener topology unchanged. Use
+`raddy upgrade` when replacing the binary or transferring compatible listeners:
 
 ```bash
-sudo install -Dm644 examples/raddy.service /etc/systemd/system/raddy.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now raddy
+raddy upgrade \
+  -c /etc/raddy/Raddyfile \
+  --cert-dir /var/lib/raddy/certs \
+  --pidfile /run/raddy.pid \
+  --upgrade-sock /run/raddy_upgrade.sock
 ```
 
-Because automatic HTTPS binds ports 80/443, the service runs as root (or grant
-`CAP_NET_BIND_SERVICE`). It expects the config at `/etc/raddy/Raddyfile` and
-stores certificates under `/var/lib/raddy/certs` — edit the unit to match your
-layout. The unit's `ExecStart` flags are also what `raddy upgrade` must be
-invoked with for zero-downtime binary upgrades.
+Topology changes are intentionally rejected by reload and upgrade preflight.
+Transparent TCP uses a custom listener and requires a normal restart. Linux UDP
+listener and flow handoff is verified and fails closed when state cannot be
+transferred.
 
-## Verify the install
+## Preflight checklist
 
-```bash
-raddy check -c <your Raddyfile>   # validate the config
-raddy run -c <your Raddyfile>     # run
-```
+- Verify the release checksum and record the version.
+- Run `raddy check` with the same path used by the service.
+- Confirm DNS, ports, firewall rules, and upstream reachability.
+- Persist and protect `--cert-dir`.
+- Bind metrics to a private address and configure log rotation.
+- Test reload, upgrade, and rollback with the production listener topology.

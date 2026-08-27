@@ -861,7 +861,7 @@ reverse_proxy {
 |---|---|
 | `tls_servername <host>` | The SNI/hostname sent to the upstream (default: the upstream host). Required when the upstream address is an IP but its certificate is issued for a name. |
 | `tls_skip_verify` | Disable upstream certificate *and* hostname verification (never use in production). |
-| `tls_ca <pem-file>` | Additional root CA(s) used to verify the upstream certificate; repeatable. System roots are always trusted in addition. |
+| `tls_ca <pem-file>` | Root CA(s) used to verify the upstream certificate; repeatable. When set, these CAs replace the system trust roots. |
 | `tls_cert <cert-file> <key-file>` | A client certificate presented to the upstream (mutual TLS to the backend). |
 
 By default the upstream certificate is verified against the system trust roots

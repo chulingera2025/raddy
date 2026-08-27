@@ -817,7 +817,7 @@ reverse_proxy {
 |---|---|
 | `tls_servername <host>` | 发给上游的 SNI / 主机名(默认:上游主机)。上游地址是 IP 但证书签给某个名字时必需。 |
 | `tls_skip_verify` | 关闭上游证书*与*主机名校验(生产环境切勿使用)。 |
-| `tls_ca <pem-file>` | 校验上游证书所用的额外根 CA;可重复。系统根始终额外信任。 |
+| `tls_ca <pem-file>` | 校验上游证书所用的根 CA;可重复。设置后仅信任列出的 CA,不再参考系统信任根。 |
 | `tls_cert <cert-file> <key-file>` | 出示给上游的客户端证书(到后端的双向 TLS)。 |
 
 默认情况下,上游证书按系统信任根校验,且其主机名必须匹配 `tls_servername`
