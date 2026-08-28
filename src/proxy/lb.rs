@@ -24,13 +24,14 @@
 //! fixed service set.
 
 use crate::config::ast::{HealthCheckSpec, LbPolicy, SiteKey, TerminalKind, UpstreamPeer};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora::lb::health_check;
 use pingora::lb::selection::{BackendIter, BackendSelection, Consistent, Random, RoundRobin};
 use pingora::lb::LoadBalancer;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The health-check runner's wake-up period. Smaller than any realistic
@@ -63,16 +64,30 @@ pub struct LbSpec {
 }
 
 /// Process-lifetime pool of per-(site, terminal) load balancers.
-#[derive(Default)]
 pub struct LoadBalancerPool {
-    entries: RwLock<HashMap<(SiteKey, usize), PoolEntry>>,
+    entries: ArcSwap<BalancerSnapshot>,
+    update_lock: Mutex<()>,
+    probe_times: Mutex<HashMap<(SiteKey, usize), Instant>>,
+}
+
+#[derive(Clone, Default)]
+struct BalancerSnapshot {
+    entries: HashMap<SiteKey, HashMap<usize, Arc<PoolEntry>>>,
 }
 
 struct PoolEntry {
     spec: LbSpec,
     balancer: Arc<dyn BackendSelector>,
-    /// When this balancer was last probed (`None` = never, so due immediately).
-    last_probe: Option<Instant>,
+}
+
+impl Default for LoadBalancerPool {
+    fn default() -> Self {
+        Self {
+            entries: ArcSwap::from_pointee(BalancerSnapshot::default()),
+            update_lock: Mutex::new(()),
+            probe_times: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl LoadBalancerPool {
@@ -90,39 +105,145 @@ impl LoadBalancerPool {
         terminal_index: usize,
         spec: &LbSpec,
     ) -> Arc<dyn BackendSelector> {
-        let key = (site_key.clone(), terminal_index);
+        self.balancer_for_parts(
+            site_key,
+            terminal_index,
+            &spec.upstreams,
+            spec.policy,
+            spec.health_check,
+        )
+    }
+
+    /// Get or build a balancer from compiled terminal fields.
+    ///
+    /// The common request path passes borrowed upstream metadata from the
+    /// immutable config snapshot. The `LbSpec` allocation is therefore limited
+    /// to a cache miss or a configuration change.
+    ///
+    /// # Parameters
+    ///
+    /// * `site_key` identifies the configured site.
+    /// * `terminal_index` identifies the reverse-proxy terminal within it.
+    /// * `upstreams` contains the resolved upstream peers.
+    /// * `policy` selects the backend selection algorithm.
+    /// * `health_check` describes optional active health checking.
+    ///
+    /// # Returns
+    ///
+    /// The process-lifetime balancer for this site and terminal.
+    pub fn balancer_for_parts(
+        &self,
+        site_key: &SiteKey,
+        terminal_index: usize,
+        upstreams: &[UpstreamPeer],
+        policy: LbPolicy,
+        health_check: Option<HealthCheckSpec>,
+    ) -> Arc<dyn BackendSelector> {
+        if let Some(balancer) =
+            self.matching_balancer(site_key, terminal_index, upstreams, policy, health_check)
         {
-            let entries = self.entries.read().expect("lb pool lock poisoned");
-            if let Some(entry) = entries.get(&key) {
-                if entry.spec == *spec {
-                    return entry.balancer.clone();
-                }
-            }
+            return balancer;
         }
 
-        // Rebuilds are rare; serialize only this slow path while keeping the
-        // request path on a shared read lock for unchanged configurations.
-        let mut entries = self.entries.write().expect("lb pool lock poisoned");
-        if let Some(entry) = entries.get(&key) {
-            if entry.spec == *spec {
-                return entry.balancer.clone();
-            }
+        // Rebuilds are rare; serialize only this slow path. Request handling
+        // uses `balancer_for_request`, which never enters this writer path.
+        let _update = self
+            .update_lock
+            .lock()
+            .expect("lb pool update lock poisoned");
+        if let Some(balancer) =
+            self.matching_balancer(site_key, terminal_index, upstreams, policy, health_check)
+        {
+            return balancer;
         }
-        let balancer = build_balancer(spec);
-        entries.insert(
-            key,
-            PoolEntry {
-                spec: spec.clone(),
+        let spec = LbSpec {
+            upstreams: upstreams.to_vec(),
+            policy,
+            health_check,
+        };
+        let balancer = build_balancer(&spec);
+        let current = self.entries.load();
+        let mut next = (**current).clone();
+        next.entries.entry(site_key.clone()).or_default().insert(
+            terminal_index,
+            Arc::new(PoolEntry {
+                spec,
                 balancer: balancer.clone(),
-                last_probe: None,
-            },
+            }),
         );
+        self.entries.store(Arc::new(next));
+        self.probe_times
+            .lock()
+            .expect("lb probe lock poisoned")
+            .remove(&(site_key.clone(), terminal_index));
         balancer
     }
 
-    /// Pre-build a balancer for every reverse-proxy terminal in the snapshot,
-    /// so health checks begin immediately at startup instead of only after the
-    /// first request reaches that terminal.
+    /// Return a balancer for an in-flight request without mutating the pool.
+    ///
+    /// The request already owns an immutable config snapshot. If a reload has
+    /// published a different entry for the same site and terminal, building an
+    /// ephemeral balancer preserves that request's snapshot without replacing
+    /// the new entry in the process-lifetime pool.
+    ///
+    /// # Parameters
+    ///
+    /// * `site_key` identifies the configured site.
+    /// * `terminal_index` identifies the reverse-proxy terminal within it.
+    /// * `upstreams` contains the resolved upstream peers.
+    /// * `policy` selects the backend selection algorithm.
+    /// * `health_check` describes optional active health checking.
+    ///
+    /// # Returns
+    ///
+    /// The matching cached balancer or a request-local fallback.
+    pub(crate) fn balancer_for_request(
+        &self,
+        site_key: &SiteKey,
+        terminal_index: usize,
+        upstreams: &[UpstreamPeer],
+        policy: LbPolicy,
+        health_check: Option<HealthCheckSpec>,
+    ) -> Arc<dyn BackendSelector> {
+        if let Some(balancer) =
+            self.matching_balancer(site_key, terminal_index, upstreams, policy, health_check)
+        {
+            return balancer;
+        }
+        let spec = LbSpec {
+            upstreams: upstreams.to_vec(),
+            policy,
+            health_check,
+        };
+        build_balancer(&spec)
+    }
+
+    /// Look up a balancer without taking a writer lock.
+    fn matching_balancer(
+        &self,
+        site_key: &SiteKey,
+        terminal_index: usize,
+        upstreams: &[UpstreamPeer],
+        policy: LbPolicy,
+        health_check: Option<HealthCheckSpec>,
+    ) -> Option<Arc<dyn BackendSelector>> {
+        let entries = self.entries.load();
+        let entry = entries
+            .entries
+            .get(site_key)
+            .and_then(|terminals| terminals.get(&terminal_index))?;
+        if entry.spec.upstreams.as_slice() == upstreams
+            && entry.spec.policy == policy
+            && entry.spec.health_check == health_check
+        {
+            Some(entry.balancer.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Replace the pool snapshot with balancers for all reverse-proxy
+    /// terminals in a compiled config.
     pub fn warm(&self, config: &crate::config::ast::CompiledConfig) {
         for site in &config.sites {
             for (index, terminal) in site.terminals.iter().enumerate() {
@@ -135,15 +256,7 @@ impl LoadBalancerPool {
                 else {
                     continue;
                 };
-                self.balancer_for(
-                    &site.key,
-                    index,
-                    &LbSpec {
-                        upstreams: upstreams.clone(),
-                        policy: *lb_policy,
-                        health_check: *health_check,
-                    },
-                );
+                self.balancer_for_parts(&site.key, index, upstreams, *lb_policy, *health_check);
             }
         }
     }
@@ -152,8 +265,23 @@ impl LoadBalancerPool {
     /// snapshot. Called after every reload so removing a site stops its health
     /// probes instead of probing a decommissioned upstream forever.
     pub fn reconcile(&self, config: &crate::config::ast::CompiledConfig) {
-        let mut entries = self.entries.write().expect("lb pool lock poisoned");
-        entries.retain(|key, _| Self::live_keys(config).contains(key));
+        let _update = self
+            .update_lock
+            .lock()
+            .expect("lb pool update lock poisoned");
+        let live = Self::live_keys(config);
+        let current = self.entries.load();
+        let mut next = (**current).clone();
+        next.entries.retain(|site_key, terminals| {
+            terminals
+                .retain(|terminal_index, _| live.contains(&(site_key.clone(), *terminal_index)));
+            !terminals.is_empty()
+        });
+        self.entries.store(Arc::new(next));
+        self.probe_times
+            .lock()
+            .expect("lb probe lock poisoned")
+            .retain(|key, _| live.contains(key));
     }
 
     /// The (site, terminal) keys that currently hold a reverse-proxy terminal.
@@ -176,23 +304,29 @@ impl LoadBalancerPool {
     /// The balancers due for a health-check probe at `now`, resetting their
     /// probe timestamps. Called by the health-check runner thread.
     fn probe_due(&self, now: Instant) -> Vec<Arc<dyn BackendSelector>> {
-        let mut entries = self.entries.write().expect("lb pool lock poisoned");
-        entries
-            .values_mut()
-            .filter_map(|entry| {
-                let interval = entry.balancer.probe_interval()?;
-                let due = match entry.last_probe {
-                    None => true,
-                    Some(last) => now.duration_since(last) >= interval,
+        let _update = self
+            .update_lock
+            .lock()
+            .expect("lb pool update lock poisoned");
+        let entries = self.entries.load();
+        let mut probe_times = self.probe_times.lock().expect("lb probe lock poisoned");
+        let mut due = Vec::new();
+        for (site_key, terminals) in &entries.entries {
+            for (terminal_index, entry) in terminals {
+                let Some(interval) = entry.balancer.probe_interval() else {
+                    continue;
                 };
-                if due {
-                    entry.last_probe = Some(now);
-                    Some(entry.balancer.clone())
-                } else {
-                    None
+                let key = (site_key.clone(), *terminal_index);
+                let is_due = probe_times
+                    .get(&key)
+                    .is_none_or(|last| now.duration_since(*last) >= interval);
+                if is_due {
+                    probe_times.insert(key, now);
+                    due.push(entry.balancer.clone());
                 }
-            })
-            .collect()
+            }
+        }
+        due
     }
 }
 
@@ -242,6 +376,10 @@ where
     S::Iter: BackendIter,
 {
     let interval = spec.health_check.map(|hc| hc.interval);
+    let mut indices_by_addr: HashMap<std::net::SocketAddr, Vec<usize>> = HashMap::new();
+    for (index, peer) in spec.upstreams.iter().enumerate() {
+        indices_by_addr.entry(peer.addr).or_default().push(index);
+    }
     if let Some(hc) = spec.health_check {
         let mut check = health_check::TcpHealthCheck::new();
         check.consecutive_failure = hc.consecutive_failures;
@@ -252,7 +390,7 @@ where
     Arc::new(WrappedLb {
         inner: lb,
         interval,
-        upstreams: spec.upstreams.clone(),
+        indices_by_addr,
         rotation: AtomicUsize::new(0),
     })
 }
@@ -261,11 +399,9 @@ where
 struct WrappedLb<S: BackendSelection> {
     inner: LoadBalancer<S>,
     interval: Option<Duration>,
-    /// The resolved upstreams, so a selected address can be mapped back to a
-    /// peer (address + TLS scheme + host). Two peers may share an address but
-    /// differ in TLS identity (P2); the rotation counter round-robins among
-    /// them since pingora's `LoadBalancer` is keyed by address alone.
-    upstreams: Vec<UpstreamPeer>,
+    /// Mapping from Pingora's selected address back to all configured peer
+    /// indices that share it. Built once when the balancer is created.
+    indices_by_addr: HashMap<std::net::SocketAddr, Vec<usize>>,
     rotation: AtomicUsize,
 }
 
@@ -279,25 +415,21 @@ where
         // All configured upstreams are IP addresses; a non-inet backend is
         // treated as unavailable.
         let addr = self.inner.select(key, 256)?.addr.as_inet().cloned()?;
-        let indices: Vec<usize> = self
-            .upstreams
-            .iter()
-            .enumerate()
-            .filter(|(_, peer)| peer.addr == addr)
-            .map(|(index, _)| index)
-            .collect();
+        let indices = self.indices_by_addr.get(&addr)?;
         match indices.len() {
-            0 => None,
-            1 => Some(indices[0]),
+            1 => indices.first().copied(),
             // Several peers share the address with different TLS identities
             // (P2): the pick must be distributed among them. Round-robin and
             // random rotate globally (empty key); `ip_hash` must pin the same
             // client to the same peer, so its (non-empty) client key decides.
-            _ if key.is_empty() => {
-                let n = self.rotation.fetch_add(1, Ordering::Relaxed);
-                Some(indices[n % indices.len()])
+            _ => {
+                let selected = if key.is_empty() {
+                    self.rotation.fetch_add(1, Ordering::Relaxed) % indices.len()
+                } else {
+                    stable_hash(key) as usize % indices.len()
+                };
+                indices.get(selected).copied()
             }
-            _ => Some(indices[stable_hash(key) as usize % indices.len()]),
         }
     }
 
@@ -369,6 +501,29 @@ mod tests {
             !Arc::ptr_eq(&a, &b),
             "changed spec must rebuild the balancer"
         );
+    }
+
+    #[test]
+    fn request_lookup_does_not_replace_newer_cached_entry() {
+        let pool = LoadBalancerPool::new();
+        let key = SiteKey::CatchAll { port: 8080 };
+        let current_spec = spec(LbPolicy::RoundRobin, &["127.0.0.1:1"]);
+        let old_spec = spec(LbPolicy::RoundRobin, &["127.0.0.1:2"]);
+        let current = pool.balancer_for(&key, 0, &current_spec);
+
+        // An in-flight request may still carry an older snapshot after reload.
+        // It receives a private fallback, while the current pool entry remains
+        // the one warmed for new requests.
+        let old = pool.balancer_for_request(
+            &key,
+            0,
+            &old_spec.upstreams,
+            old_spec.policy,
+            old_spec.health_check,
+        );
+        let after = pool.balancer_for(&key, 0, &current_spec);
+        assert!(!Arc::ptr_eq(&current, &old));
+        assert!(Arc::ptr_eq(&current, &after));
     }
 
     #[test]

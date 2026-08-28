@@ -66,6 +66,10 @@ pub fn spawn(config_path: PathBuf, store: Arc<ConfigStore>, lb_pool: Arc<LoadBal
                         continue;
                     }
                     lb_pool.reconcile(&new_snapshot);
+                    // Refresh changed/new balancers before publishing the
+                    // snapshot so the first request after reload stays on the
+                    // warmed request path.
+                    lb_pool.warm(&new_snapshot);
                     store.store(new_snapshot);
                     tracing::info!("config reloaded from {}", config_path.display());
                 }

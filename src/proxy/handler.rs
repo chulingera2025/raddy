@@ -20,12 +20,12 @@
 //! so the upstream Connector's connection pools survive (ADR-011).
 
 use crate::config::ast::{
-    AccessLogFormat, Cidr, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec, SiteKey,
-    TemplatePart, TerminalKind, UpstreamHttpVersion, UpstreamTls, ValueTemplate, Variable,
+    AccessLogFormat, Cidr, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec, TemplatePart,
+    Terminal, TerminalKind, UpstreamHttpVersion, UpstreamTls, ValueTemplate, Variable,
 };
-use crate::config::snapshot::ConfigStore;
+use crate::config::snapshot::{ConfigSnapshot, ConfigStore};
 use crate::proxy::compress;
-use crate::proxy::lb::{LbSpec, LoadBalancerPool};
+use crate::proxy::lb::{BackendSelector, LoadBalancerPool};
 use crate::proxy::ratelimit::RateLimiter;
 use crate::proxy::site;
 use crate::server::acme::ChallengeStore;
@@ -34,6 +34,7 @@ use bytes::Bytes;
 use pingora::prelude::*;
 use pingora::proxy::Session;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -166,14 +167,7 @@ impl ProxyHandler {
     /// Whether the selected site disabled access logging with `access_log off`
     /// (spec §5.13).
     fn site_access_log_off(&self, ctx: &ProxyCtx) -> bool {
-        let Some(key) = ctx.site_key.as_ref() else {
-            return false;
-        };
-        self.store
-            .load()
-            .sites
-            .iter()
-            .any(|site| &site.key == key && site.access_log_off)
+        ctx.access_log_off
     }
 }
 
@@ -194,19 +188,17 @@ struct AccessLogEntry {
 /// Per-request state carried across the `ProxyHttp` hook chain.
 #[derive(Default)]
 pub struct ProxyCtx {
-    /// The selected site key (for load-balancer state).
-    site_key: Option<SiteKey>,
+    /// The immutable snapshot that selected the site, retained across proxy
+    /// hooks so a concurrent reload cannot change upstream metadata mid-request.
+    config: Option<Arc<ConfigSnapshot>>,
+    /// Index of the selected site in `config`.
+    site_index: usize,
     /// The index of the selected terminal within its site.
     terminal_index: usize,
-    /// The load-balancing spec of the selected terminal.
-    lb_spec: Option<LbSpec>,
-    /// Compiled TLS options for a `https://` reverse-proxy block (spec §5.4);
-    /// `None` for plain-HTTP terminals.
-    tls: Option<UpstreamTls>,
-    /// The effective modifier directives (block-level + terminal-scoped).
-    modifiers: Vec<Modifier>,
-    /// The site's `encode` priorities (empty = no compression).
-    encode_algos: Vec<Encoding>,
+    /// Whether the selected site disabled access logging.
+    access_log_off: bool,
+    /// Balancer selected from the same immutable snapshot as the terminal.
+    balancer: Option<Arc<dyn BackendSelector>>,
     /// Per-request streaming compression encoder, created in `response_filter`
     /// when a response is compressed (B3b1). Bounded by the codec state plus the
     /// current chunk; `None` when the response is not compressed.
@@ -267,42 +259,40 @@ impl ProxyHttp for ProxyHandler {
         let port = listener_port(session);
         let host = host_header(session);
 
-        match site::select(&config, port, host) {
-            site::Selection::BadRequest => {
+        match site::select_with_index(&config, port, host) {
+            site::IndexedSelection::BadRequest => {
                 session.respond_error(400).await?;
                 Ok(true)
             }
-            site::Selection::NotFound => {
+            site::IndexedSelection::NotFound => {
                 session.respond_error(404).await?;
                 Ok(true)
             }
-            site::Selection::Site(site) => {
-                // Owned so a mutable session borrow can coexist while matching.
-                let path = request_path(session).to_string();
+            site::IndexedSelection::Site(site_index, site) => {
                 let is_tls = session_is_tls(session);
                 // Site-scoped `trusted_proxies` override the global list (§4).
-                let trusted: Vec<Cidr> = match &site.trusted_proxies {
-                    Some(networks) => networks.clone(),
-                    None => config.global.trusted_proxies.clone(),
-                };
+                let trusted = site
+                    .trusted_proxies
+                    .as_deref()
+                    .unwrap_or(config.global.trusted_proxies.as_slice());
                 // Resolve the effective client IP once per site (§4). rate_limit,
                 // `ip_hash`, matchers, and the access log all consume this same
                 // value; requests that fail before a site is selected
                 // (ACME/400/404) fall back to the TCP peer.
-                ctx.effective_client_ip = client_ip(session, &trusted);
+                ctx.effective_client_ip = client_ip(session, trusted);
                 // The site is recorded for every terminal (and the within-site
                 // 404), so `access_log off` (spec §5.13) excludes redir,
                 // file_server, respond, and error requests too (P2).
-                ctx.site_key = Some(site.key.clone());
+                ctx.access_log_off = site.access_log_off;
                 for (index, terminal) in site.terminals.iter().enumerate() {
                     if !matchers_match(&terminal.matchers, session, ctx.effective_client_ip, is_tls)
                     {
                         continue;
                     }
-                    // Effective modifiers: block-level then terminal-scoped
-                    // (ADR-012), shared by the rate-limit guard and the dispatch.
-                    let mut modifiers = site.modifiers.clone();
-                    modifiers.extend(terminal.modifiers.iter().cloned());
+                    // Validation precomputes the effective block/terminal
+                    // modifiers on each terminal (ADR-012), so the request
+                    // path can borrow them directly from the snapshot.
+                    let modifiers = terminal.modifiers.as_slice();
                     // Rate limiting (spec §5.2): each `rate_limit` directive has
                     // its own token bucket, keyed by `remote_ip` or a request
                     // header value; an empty bucket rejects the request with 429.
@@ -321,7 +311,7 @@ impl ProxyHttp for ProxyHandler {
                     }
                     // Auth guards (spec §5.10): `basic_auth` and `forward_auth`
                     // gate whichever terminal serves the block.
-                    if let Some(reject) = self.check_auth_guards(session, &modifiers, ctx).await? {
+                    if let Some(reject) = self.check_auth_guards(session, modifiers, ctx).await? {
                         match reject {
                             AuthReject::BasicUnauthorized => {
                                 let mut resp = ResponseHeader::build(401, None)?;
@@ -338,11 +328,6 @@ impl ProxyHttp for ProxyHandler {
                         }
                         return Ok(true);
                     }
-                    // The effective request path the terminal serves: `handle_path`
-                    // strips its matched prefix, then `rewrite` modifiers
-                    // transform the path (spec §5.9).
-                    let serve_path =
-                        serving_path(terminal.strip_prefix.as_deref(), &modifiers, &path, session);
                     match &terminal.kind {
                         TerminalKind::Redir { to, code } => {
                             let location = expand_template(to, session);
@@ -352,37 +337,63 @@ impl ProxyHttp for ProxyHandler {
                             // `header_down` applies to the final response header,
                             // overriding the redirect's own Location/Content-Length
                             // exactly like the reverse-proxy path.
-                            apply_header_down(&modifiers, session, &mut resp);
+                            apply_header_down(modifiers, session, &mut resp);
                             session.write_response_header(Box::new(resp), true).await?;
                             return Ok(true);
                         }
-                        TerminalKind::ReverseProxy {
-                            upstreams,
-                            lb_policy,
-                            health_check,
-                            tls,
-                        } => {
+                        TerminalKind::ReverseProxy { .. } => {
+                            // The effective request path the terminal serves:
+                            // `handle_path` strips its matched prefix, then
+                            // `rewrite` modifiers transform the path (spec §5.9).
+                            ctx.config = Some(config.clone());
+                            ctx.site_index = site_index;
                             ctx.terminal_index = index;
-                            ctx.lb_spec = Some(LbSpec {
-                                upstreams: upstreams.clone(),
-                                policy: *lb_policy,
-                                health_check: *health_check,
-                            });
-                            ctx.tls = tls.clone();
-                            ctx.modifiers = modifiers;
-                            ctx.encode_algos = encode_algos(&ctx.modifiers);
-                            ctx.serve_path = Some(serve_path);
+                            let TerminalKind::ReverseProxy {
+                                upstreams,
+                                lb_policy,
+                                health_check,
+                                ..
+                            } = &terminal.kind
+                            else {
+                                unreachable!("reverse-proxy terminal pattern changed");
+                            };
+                            ctx.balancer = Some(self.pool.balancer_for_request(
+                                &site.key,
+                                index,
+                                upstreams,
+                                *lb_policy,
+                                *health_check,
+                            ));
+                            ctx.serve_path = match serving_path(
+                                terminal.strip_prefix.as_deref(),
+                                modifiers,
+                                request_path(session),
+                                session,
+                            ) {
+                                Cow::Borrowed(_) => None,
+                                Cow::Owned(path) => Some(path),
+                            };
                             // Continue to upstream_peer for forwarding.
                             return Ok(false);
                         }
                         TerminalKind::FileServer { root } => {
-                            let encode = encode_algos(&modifiers);
+                            // Only file serving and reverse proxying need the
+                            // transformed path; direct response terminals stay
+                            // allocation-free here.
+                            let path = request_path(session).to_string();
+                            let serve_path = serving_path(
+                                terminal.strip_prefix.as_deref(),
+                                modifiers,
+                                &path,
+                                session,
+                            );
+                            let encode = encode_algos(modifiers);
                             crate::proxy::fs::serve(
                                 session,
                                 root,
                                 &serve_path,
                                 &encode,
-                                &modifiers,
+                                modifiers,
                                 &mut ctx.response_bytes,
                             )
                             .await?;
@@ -396,7 +407,7 @@ impl ProxyHttp for ProxyHandler {
                                         http::header::CONTENT_LENGTH,
                                         body.len().to_string(),
                                     )?;
-                                    apply_header_down(&modifiers, session, &mut resp);
+                                    apply_header_down(modifiers, session, &mut resp);
                                     session.write_response_header(Box::new(resp), false).await?;
                                     ctx.response_bytes += body.len();
                                     session
@@ -405,7 +416,7 @@ impl ProxyHttp for ProxyHandler {
                                 }
                                 None => {
                                     resp.insert_header(http::header::CONTENT_LENGTH, "0")?;
-                                    apply_header_down(&modifiers, session, &mut resp);
+                                    apply_header_down(modifiers, session, &mut resp);
                                     session.write_response_header(Box::new(resp), true).await?;
                                 }
                             }
@@ -420,7 +431,7 @@ impl ProxyHttp for ProxyHandler {
                                         http::header::CONTENT_LENGTH,
                                         body.len().to_string(),
                                     )?;
-                                    apply_header_down(&modifiers, session, &mut resp);
+                                    apply_header_down(modifiers, session, &mut resp);
                                     session.write_response_header(Box::new(resp), false).await?;
                                     ctx.response_bytes += body.len();
                                     session.write_response_body(Some(body), true).await?;
@@ -445,22 +456,39 @@ impl ProxyHttp for ProxyHandler {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let site_key = ctx
-            .site_key
+        let config = ctx
+            .config
             .as_ref()
-            .expect("upstream_peer requires a selected reverse-proxy terminal");
-        let lb_spec = ctx
-            .lb_spec
+            .expect("upstream_peer requires a selected site snapshot");
+        let site = config
+            .sites
+            .get(ctx.site_index)
+            .expect("upstream_peer requires a valid selected site");
+        let terminal = site
+            .terminals
+            .get(ctx.terminal_index)
+            .expect("upstream_peer requires a valid selected terminal");
+        let TerminalKind::ReverseProxy {
+            upstreams,
+            lb_policy,
+            tls,
+            health_check: _,
+        } = &terminal.kind
+        else {
+            return Err(Error::explain(
+                InternalError,
+                "upstream_peer requires a reverse-proxy terminal",
+            ));
+        };
+        let balancer = ctx
+            .balancer
             .as_ref()
-            .expect("upstream_peer requires a selected reverse-proxy terminal");
-        let balancer = self
-            .pool
-            .balancer_for(site_key, ctx.terminal_index, lb_spec);
+            .expect("upstream_peer requires a selected balancer");
         // `ip_hash` keys on the effective client IP for per-IP session
         // stickiness; the other policies ignore the key. The effective IP is
         // resolved once per site (spec §4) so a trusted `X-Forwarded-For` client
         // is honored here exactly as in rate limiting and the access log.
-        let key = match lb_spec.policy {
+        let key = match lb_policy {
             LbPolicy::IpHash => ctx
                 .effective_client_ip
                 .or_else(|| {
@@ -479,21 +507,21 @@ impl ProxyHttp for ProxyHandler {
         // Recover the selected peer by index so its TLS scheme and original host
         // (the default SNI) are correct even when two peers share an address
         // (P2). The balancer only ever returns configured indices.
-        let addr = lb_spec.upstreams[index].addr;
-        let is_tls = lb_spec.upstreams[index].tls;
-        let default_sni = lb_spec.upstreams[index].host.as_str();
+        let addr = upstreams[index].addr;
+        let is_tls = upstreams[index].tls;
+        let default_sni = upstreams[index].host.as_str();
         let mut peer = if is_tls {
             // A `https://` upstream (spec §5.4): TLS with the compiled options.
             // `UpstreamTls` is always present when any upstream is TLS (the
             // validator guarantees it), so fall back to plain HTTP defensively.
-            match ctx.tls.as_ref() {
+            match tls.as_ref() {
                 Some(tls) => build_tls_peer(addr, default_sni, tls),
                 None => HttpPeer::new(addr, false, String::new()),
             }
         } else {
             HttpPeer::new(addr, false, String::new())
         };
-        match lb_spec.upstreams[index].http_version {
+        match upstreams[index].http_version {
             UpstreamHttpVersion::Auto => {}
             UpstreamHttpVersion::H2 | UpstreamHttpVersion::H2c => {
                 // Pingora's connector uses ALPN for TLS H2. For plaintext, a
@@ -510,6 +538,12 @@ impl ProxyHttp for ProxyHandler {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        let terminal = selected_terminal(ctx).ok_or_else(|| {
+            Error::explain(
+                InternalError,
+                "upstream_request_filter requires a selected terminal",
+            )
+        })?;
         // Path rewrite (spec §5.9): the request may have been transformed by a
         // `handle_path` prefix strip or a `rewrite` modifier; rebuild the
         // upstream URI so the backend sees the effective path.
@@ -536,7 +570,7 @@ impl ProxyHttp for ProxyHandler {
                 let _ = upstream_request.insert_header(name, value);
             }
         }
-        let ops = header_ops(&ctx.modifiers, true, session);
+        let ops = header_ops(&terminal.modifiers, true, session);
         apply_header_ops(&ops, |name, value| {
             let _ = upstream_request.insert_header(name, value);
         });
@@ -549,9 +583,16 @@ impl ProxyHttp for ProxyHandler {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        let terminal = selected_terminal(ctx).ok_or_else(|| {
+            Error::explain(
+                InternalError,
+                "response_filter requires a selected terminal",
+            )
+        })?;
+        let modifiers = &terminal.modifiers;
         // `header_down` is a declarative transform on the final response header,
         // shared with the `redir` and `file_server` terminals.
-        apply_header_down(&ctx.modifiers, session, upstream_response);
+        apply_header_down(modifiers, session, upstream_response);
 
         // Compression (M5, B3b1): if the site enables `encode` and the client
         // accepts an algorithm, mark the response and stream it through a
@@ -565,7 +606,8 @@ impl ProxyHttp for ProxyHandler {
                 .contains_key(http::header::CONTENT_ENCODING)
             && !matches!(upstream_response.status.as_u16(), 204 | 304 | 206 | 1..=199)
             && !known_tiny_response(upstream_response);
-        if compressible && !ctx.encode_algos.is_empty() {
+        let encode_algos = encode_algos(modifiers);
+        if compressible && !encode_algos.is_empty() {
             // The representation depends on the request's Accept-Encoding, so a
             // shared cache must vary on it (RFC 9110 §12.5.3) — even when this
             // particular client did not ask for compression.
@@ -574,7 +616,7 @@ impl ProxyHttp for ProxyHandler {
                 .req_header()
                 .headers
                 .get(http::header::ACCEPT_ENCODING);
-            if let Some(algo) = compress::choose(&ctx.encode_algos, accept) {
+            if let Some(algo) = compress::choose(&encode_algos, accept) {
                 match compress::Encoder::new(algo) {
                     Ok(encoder) => {
                         ctx.encoder = Some(encoder);
@@ -659,6 +701,16 @@ impl ProxyHttp for ProxyHandler {
             }
         }
     }
+}
+
+/// Return the reverse-proxy terminal selected for the current request.
+fn selected_terminal(ctx: &ProxyCtx) -> Option<&Terminal> {
+    let config = ctx.config.as_ref()?;
+    config
+        .sites
+        .get(ctx.site_index)?
+        .terminals
+        .get(ctx.terminal_index)
 }
 
 /// Build a TLS `HttpPeer` to a `https://` upstream (spec §5.4): SNI from the
@@ -1134,21 +1186,21 @@ fn session_is_tls(session: &Session) -> bool {
 
 /// The effective request path a terminal serves: `handle_path` strips its
 /// matched prefix, then `rewrite` modifiers replace the path (spec §5.9).
-fn serving_path(
+fn serving_path<'a>(
     strip_prefix: Option<&str>,
     modifiers: &[Modifier],
-    path: &str,
+    path: &'a str,
     session: &Session,
-) -> String {
-    let mut out = path.to_string();
+) -> Cow<'a, str> {
+    let mut out = Cow::Borrowed(path);
     if let Some(prefix) = strip_prefix {
-        if let Some(stripped) = strip_path_prefix(prefix, &out) {
-            out = stripped;
+        if let Some(stripped) = strip_path_prefix(prefix, out.as_ref()) {
+            out = Cow::Owned(stripped);
         }
     }
     for modifier in modifiers {
         if let Modifier::Rewrite { to } = modifier {
-            out = expand_template(to, session);
+            out = Cow::Owned(expand_template(to, session));
         }
     }
     out
