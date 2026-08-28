@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "warmup_seconds": 10,
+    "duration_seconds": 30,
+    "repetitions": 3,
+    "connections": 64,
+    "stable_error_rate": 0.001
+  },
+  "profiles": {
+    "quick": {
+      "scenario_ids": [
+        "http1_keepalive_small",
+        "https_http1",
+        "https_http2"
+      ],
+      "warmup_seconds": 1,
+      "duration_seconds": 3,
+      "repetitions": 1,
+      "load_points": {
+        "http1_keepalive_small": [200],
+        "https_http1": [200],
+        "https_http2": [200]
+      }
+    },
+    "full": {
+      "scenario_ids": "all"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "http1_keepalive_small",
+      "title": "HTTP/1.1 keep-alive / small response",
+      "scheme": "http",
+      "protocol": "http1",
+      "path": "/small",
+      "load_model": "qps",
+      "qps_points": [250, 1000, 4000],
+      "reference_load": 1000,
+      "flags": ["--latency-correction"]
+    },
+    {
+      "id": "http1_keepalive_4k",
+      "title": "HTTP/1.1 keep-alive / 4 KiB response",
+      "scheme": "http",
+      "protocol": "http1",
+      "path": "/4k",
+      "load_model": "qps",
+      "qps_points": [100, 500, 2000],
+      "reference_load": 500,
+      "flags": ["--latency-correction"]
+    },
+    {
+      "id": "http1_keepalive_1m",
+      "title": "HTTP/1.1 keep-alive / 1 MiB response",
+      "scheme": "http",
+      "protocol": "http1",
+      "path": "/1m",
+      "load_model": "qps",
+      "qps_points": [1, 4, 16],
+      "reference_load": 4,
+      "connections": 32,
+      "flags": ["--latency-correction"]
+    },
+    {
+      "id": "http1_connection_churn",
+      "title": "HTTP/1.1 connection churn / small response",
+      "scheme": "http",
+      "protocol": "http1",
+      "path": "/small",
+      "load_model": "qps",
+      "qps_points": [100, 500, 1000],
+      "reference_load": 500,
+      "connections": 64,
+      "flags": ["--latency-correction", "--disable-keepalive"]
+    },
+    {
+      "id": "https_http1",
+      "title": "HTTPS / HTTP/1.1",
+      "scheme": "https",
+      "protocol": "http1",
+      "path": "/small",
+      "load_model": "qps",
+      "qps_points": [100, 500, 1000],
+      "reference_load": 500,
+      "connections": 64,
+      "flags": ["--latency-correction"]
+    },
+    {
+      "id": "https_http2",
+      "title": "HTTPS / HTTP/2 multiplexing",
+      "scheme": "https",
+      "protocol": "http2",
+      "path": "/small",
+      "load_model": "qps",
+      "qps_points": [250, 1000, 4000],
+      "reference_load": 1000,
+      "connections": 16,
+      "http2_parallel": 16,
+      "flags": ["--latency-correction"]
+    },
+    {
+      "id": "routing_simple",
+      "title": "Simple route / small response",
+      "scheme": "http",
+      "protocol": "http1",
+      "path": "/small",
+      "load_model": "qps",
+      "qps_points": [250, 1000, 4000],
+      "reference_load": 1000,
+      "flags": ["--latency-correction"]
+    },
+    {
+      "id": "routing_multi_match",
+      "title": "Multi-condition route / small response",
+      "scheme": "http",
+      "protocol": "http1",
+      "path": "/route/multi/test",
+      "load_model": "qps",
+      "qps_points": [250, 1000, 4000],
+      "reference_load": 1000,
+      "flags": ["--latency-correction"]
+    },
+    {
+      "id": "http1_concurrency_scan",
+      "title": "HTTP/1.1 concurrency scan / small response",
+      "scheme": "http",
+      "protocol": "http1",
+      "path": "/small",
+      "load_model": "concurrency",
+      "concurrency_points": [1, 4, 16, 64],
+      "reference_load": 16,
+      "connections": 16,
+      "flags": []
+    }
+  ]
+}

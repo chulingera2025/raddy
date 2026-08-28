@@ -30,7 +30,7 @@ use pingora::lb::selection::{BackendIter, BackendSelection, Consistent, Random, 
 use pingora::lb::LoadBalancer;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// The health-check runner's wake-up period. Smaller than any realistic
@@ -65,7 +65,7 @@ pub struct LbSpec {
 /// Process-lifetime pool of per-(site, terminal) load balancers.
 #[derive(Default)]
 pub struct LoadBalancerPool {
-    entries: Mutex<HashMap<(SiteKey, usize), PoolEntry>>,
+    entries: RwLock<HashMap<(SiteKey, usize), PoolEntry>>,
 }
 
 struct PoolEntry {
@@ -88,20 +88,31 @@ impl LoadBalancerPool {
         &self,
         site_key: &SiteKey,
         terminal_index: usize,
-        spec: LbSpec,
+        spec: &LbSpec,
     ) -> Arc<dyn BackendSelector> {
-        let mut entries = self.entries.lock().expect("lb pool lock poisoned");
         let key = (site_key.clone(), terminal_index);
+        {
+            let entries = self.entries.read().expect("lb pool lock poisoned");
+            if let Some(entry) = entries.get(&key) {
+                if entry.spec == *spec {
+                    return entry.balancer.clone();
+                }
+            }
+        }
+
+        // Rebuilds are rare; serialize only this slow path while keeping the
+        // request path on a shared read lock for unchanged configurations.
+        let mut entries = self.entries.write().expect("lb pool lock poisoned");
         if let Some(entry) = entries.get(&key) {
-            if entry.spec == spec {
+            if entry.spec == *spec {
                 return entry.balancer.clone();
             }
         }
-        let balancer = build_balancer(&spec);
+        let balancer = build_balancer(spec);
         entries.insert(
             key,
             PoolEntry {
-                spec,
+                spec: spec.clone(),
                 balancer: balancer.clone(),
                 last_probe: None,
             },
@@ -127,7 +138,7 @@ impl LoadBalancerPool {
                 self.balancer_for(
                     &site.key,
                     index,
-                    LbSpec {
+                    &LbSpec {
                         upstreams: upstreams.clone(),
                         policy: *lb_policy,
                         health_check: *health_check,
@@ -141,7 +152,7 @@ impl LoadBalancerPool {
     /// snapshot. Called after every reload so removing a site stops its health
     /// probes instead of probing a decommissioned upstream forever.
     pub fn reconcile(&self, config: &crate::config::ast::CompiledConfig) {
-        let mut entries = self.entries.lock().expect("lb pool lock poisoned");
+        let mut entries = self.entries.write().expect("lb pool lock poisoned");
         entries.retain(|key, _| Self::live_keys(config).contains(key));
     }
 
@@ -165,7 +176,7 @@ impl LoadBalancerPool {
     /// The balancers due for a health-check probe at `now`, resetting their
     /// probe timestamps. Called by the health-check runner thread.
     fn probe_due(&self, now: Instant) -> Vec<Arc<dyn BackendSelector>> {
-        let mut entries = self.entries.lock().expect("lb pool lock poisoned");
+        let mut entries = self.entries.write().expect("lb pool lock poisoned");
         entries
             .values_mut()
             .filter_map(|entry| {
@@ -338,8 +349,8 @@ mod tests {
         let pool = LoadBalancerPool::new();
         let key = SiteKey::CatchAll { port: 8080 };
         let s = spec(LbPolicy::RoundRobin, &["127.0.0.1:1", "127.0.0.1:2"]);
-        let first = pool.balancer_for(&key, 0, s.clone());
-        let second = pool.balancer_for(&key, 0, s);
+        let first = pool.balancer_for(&key, 0, &s);
+        let second = pool.balancer_for(&key, 0, &s);
         assert!(
             Arc::ptr_eq(&first, &second),
             "unchanged spec must reuse the balancer"
@@ -350,8 +361,10 @@ mod tests {
     fn changed_upstreams_rebuilds() {
         let pool = LoadBalancerPool::new();
         let key = SiteKey::CatchAll { port: 8080 };
-        let a = pool.balancer_for(&key, 0, spec(LbPolicy::RoundRobin, &["127.0.0.1:1"]));
-        let b = pool.balancer_for(&key, 0, spec(LbPolicy::RoundRobin, &["127.0.0.1:2"]));
+        let a_spec = spec(LbPolicy::RoundRobin, &["127.0.0.1:1"]);
+        let b_spec = spec(LbPolicy::RoundRobin, &["127.0.0.1:2"]);
+        let a = pool.balancer_for(&key, 0, &a_spec);
+        let b = pool.balancer_for(&key, 0, &b_spec);
         assert!(
             !Arc::ptr_eq(&a, &b),
             "changed spec must rebuild the balancer"
@@ -363,8 +376,8 @@ mod tests {
         let pool = LoadBalancerPool::new();
         let key = SiteKey::CatchAll { port: 8080 };
         let s = spec(LbPolicy::RoundRobin, &["127.0.0.1:1", "127.0.0.1:2"]);
-        let a = pool.balancer_for(&key, 0, s.clone());
-        let b = pool.balancer_for(&key, 1, s);
+        let a = pool.balancer_for(&key, 0, &s);
+        let b = pool.balancer_for(&key, 1, &s);
         assert!(
             !Arc::ptr_eq(&a, &b),
             "different terminals must not share a balancer"
@@ -378,7 +391,7 @@ mod tests {
         let pool = LoadBalancerPool::new();
         let key = SiteKey::CatchAll { port: 8080 };
         let s = spec(LbPolicy::RoundRobin, &["127.0.0.1:1"]);
-        let first = pool.balancer_for(&key, 0, s.clone());
+        let first = pool.balancer_for(&key, 0, &s);
 
         // Reconcile against a config with no sites: the entry must be pruned.
         let empty = CompiledConfig {
@@ -387,7 +400,7 @@ mod tests {
             layer4: vec![],
         };
         pool.reconcile(&empty);
-        let rebuilt = pool.balancer_for(&key, 0, s);
+        let rebuilt = pool.balancer_for(&key, 0, &s);
         assert!(
             !Arc::ptr_eq(&first, &rebuilt),
             "a pruned entry must not be reused"
@@ -403,7 +416,7 @@ mod tests {
         let balancer = pool.balancer_for(
             &key,
             0,
-            spec(LbPolicy::RoundRobin, &["127.0.0.1:1", "127.0.0.1:2"]),
+            &spec(LbPolicy::RoundRobin, &["127.0.0.1:1", "127.0.0.1:2"]),
         );
         let a = balancer.select(b"").unwrap();
         let b = balancer.select(b"").unwrap();
@@ -429,7 +442,7 @@ mod tests {
             http_version: crate::config::ast::UpstreamHttpVersion::Auto,
             host: "b.example.com".into(),
         });
-        let balancer = pool.balancer_for(&key, 0, spec);
+        let balancer = pool.balancer_for(&key, 0, &spec);
         let a = balancer.select(b"").unwrap();
         let b = balancer.select(b"").unwrap();
         assert_ne!(
@@ -458,7 +471,7 @@ mod tests {
             http_version: crate::config::ast::UpstreamHttpVersion::Auto,
             host: "b.example.com".into(),
         });
-        let balancer = pool.balancer_for(&key, 0, spec);
+        let balancer = pool.balancer_for(&key, 0, &spec);
 
         // The same client key always selects the same index; distinct clients
         // are distributed (with two peers, some must differ).

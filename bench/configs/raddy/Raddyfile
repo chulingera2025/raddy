@@ -1,0 +1,17 @@
+:8080 {
+    handle path /route/multi/* {
+        reverse_proxy origin:18080
+    }
+
+    reverse_proxy origin:18080
+}
+
+bench.local:8443 {
+    tls /etc/raddy/tls/bench.crt /etc/raddy/tls/bench.key
+
+    handle path /route/multi/* {
+        reverse_proxy origin:18080
+    }
+
+    reverse_proxy origin:18080
+}

@@ -59,6 +59,20 @@ struct ServerArgs {
     /// Unix socket both the old and new process use to hand over listening fds.
     #[arg(long, default_value = "/tmp/raddy_upgrade.sock")]
     upgrade_sock: String,
+    /// Number of Pingora worker threads allocated to the HTTP service.
+    #[arg(long, default_value_t = 1, value_parser = positive_threads)]
+    threads: usize,
+}
+
+/// Parse a positive worker-thread count for the server service.
+fn positive_threads(value: &str) -> Result<usize, String> {
+    let threads = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid worker thread count '{value}'"))?;
+    if threads == 0 {
+        return Err("worker thread count must be at least 1".to_string());
+    }
+    Ok(threads)
 }
 
 impl ServerArgs {
@@ -74,6 +88,7 @@ impl ServerArgs {
             test,
             pidfile: self.pidfile,
             upgrade_sock: self.upgrade_sock,
+            threads: self.threads,
         }
     }
 }
@@ -208,4 +223,27 @@ fn validate_converted(raddyfile: &str) -> Result<(), ConfigError> {
     let parsed = crate::config::parser::parse("import", raddyfile)?;
     crate::config::validate::validate_and_compile("import", &parsed)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_thread_count_defaults_to_one() {
+        let cli = Cli::try_parse_from(["raddy", "run"]).expect("default CLI should parse");
+        let Command::Run { server, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(server.threads, 1);
+    }
+
+    #[test]
+    fn worker_thread_count_rejects_zero() {
+        let error = match Cli::try_parse_from(["raddy", "run", "--threads", "0"]) {
+            Ok(_) => panic!("zero worker threads must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("at least 1"));
+    }
 }

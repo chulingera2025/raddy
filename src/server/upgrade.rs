@@ -280,6 +280,8 @@ fn server_args(sub: &str, flags: &[&str], config_path: &Path, opts: &RunOptions)
     }
     args.push("--upgrade-sock".to_string());
     args.push(opts.upgrade_sock.clone());
+    args.push("--threads".to_string());
+    args.push(opts.threads.to_string());
     args
 }
 

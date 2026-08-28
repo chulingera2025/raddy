@@ -455,7 +455,7 @@ impl ProxyHttp for ProxyHandler {
             .expect("upstream_peer requires a selected reverse-proxy terminal");
         let balancer = self
             .pool
-            .balancer_for(site_key, ctx.terminal_index, lb_spec.clone());
+            .balancer_for(site_key, ctx.terminal_index, lb_spec);
         // `ip_hash` keys on the effective client IP for per-IP session
         // stickiness; the other policies ignore the key. The effective IP is
         // resolved once per site (spec §4) so a trusted `X-Forwarded-For` client

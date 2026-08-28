@@ -1,0 +1,92 @@
+name: raddy-bench
+
+services:
+  origin:
+    build:
+      context: ./origin
+      args:
+        RUST_IMAGE: ${RUST_IMAGE}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE}
+    expose:
+      - "18080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/bench-origin", "--healthcheck"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      - bench
+
+  nginx:
+    image: ${NGINX_IMAGE}
+    cpus: ${BENCH_CPUS:-2.0}
+    mem_limit: ${BENCH_MEMORY_LIMIT:-1g}
+    depends_on:
+      origin:
+        condition: service_healthy
+    volumes:
+      - ./configs/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./tls:/etc/nginx/tls:ro
+    networks:
+      - bench
+
+  caddy:
+    image: ${CADDY_IMAGE}
+    cpus: ${BENCH_CPUS:-2.0}
+    mem_limit: ${BENCH_MEMORY_LIMIT:-1g}
+    depends_on:
+      origin:
+        condition: service_healthy
+    volumes:
+      - ./configs/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./tls:/etc/caddy/tls:ro
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    networks:
+      - bench
+
+  raddy:
+    build:
+      context: ..
+      dockerfile: bench/raddy/Dockerfile
+      args:
+        RUST_IMAGE: ${RUST_IMAGE}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE}
+    cpus: ${BENCH_CPUS:-2.0}
+    mem_limit: ${BENCH_MEMORY_LIMIT:-1g}
+    depends_on:
+      origin:
+        condition: service_healthy
+    volumes:
+      - ./configs/raddy/Raddyfile:/etc/raddy/Raddyfile:ro
+      - ./tls:/etc/raddy/tls:ro
+    command: ["run", "-c", "/etc/raddy/Raddyfile", "--threads", "${RADDY_THREADS:-2}"]
+    networks:
+      - bench
+
+  loadgen:
+    build:
+      context: ./loadgen
+      args:
+        RUST_IMAGE: ${RUST_IMAGE}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE}
+        OHA_VERSION: ${OHA_VERSION}
+    networks:
+      - bench
+
+  reporter:
+    build:
+      context: ./reporter
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE}
+        MATPLOTLIB_VERSION: ${MATPLOTLIB_VERSION}
+    working_dir: /bench
+    entrypoint: ["python"]
+    environment:
+      MPLBACKEND: Agg
+    volumes:
+      - .:/bench
+      - ../page/public/benchmarks:/public/benchmarks
+
+networks:
+  bench:
+    driver: bridge

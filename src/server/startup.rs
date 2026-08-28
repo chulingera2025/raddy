@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Runtime options that come from the CLI and shape the server.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RunOptions {
     /// Directory for persisted certificates and the ACME account.
     pub cert_dir: PathBuf,
@@ -78,6 +78,25 @@ pub struct RunOptions {
     pub pidfile: Option<PathBuf>,
     /// Unix socket both sides use to hand over listening fds (must match).
     pub upgrade_sock: String,
+    /// Number of Pingora worker threads allocated to the HTTP service.
+    pub threads: usize,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            cert_dir: PathBuf::default(),
+            acme_directory: String::default(),
+            acme_root_pem: None,
+            access_log: None,
+            metrics_addr: None,
+            upgrade: false,
+            test: false,
+            pidfile: None,
+            upgrade_sock: String::default(),
+            threads: 1,
+        }
+    }
 }
 
 /// Boot the proxy server and run until a shutdown signal.
@@ -243,6 +262,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         }),
         ServerConf {
             upgrade_sock: opts.upgrade_sock.clone(),
+            threads: opts.threads,
             // After an upgrade the old process has already handed its listeners
             // to the replacement; the grace period only drains already-in-flight
             // requests. Pingora's default (300s) would make an upgraded process
