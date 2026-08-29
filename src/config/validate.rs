@@ -352,7 +352,12 @@ fn compile_site(file: &str, site: &Site) -> Result<CompiledSite, ConfigError> {
     // [`compile_handle_block`].
     let root = roots.last().cloned();
     for terminal in &mut terminals {
-        terminal.modifiers.extend(modifiers.clone());
+        // Handle-scoped modifiers were collected while compiling the terminal.
+        // Put site-level modifiers first so the more specific terminal scope
+        // remains last and wins for ordered overrides.
+        let scoped_modifiers = std::mem::take(&mut terminal.modifiers);
+        terminal.modifiers = modifiers.clone();
+        terminal.modifiers.extend(scoped_modifiers);
         if let TerminalKind::FileServer { root: file_root } = &mut terminal.kind {
             if file_root.is_empty() {
                 *file_root = root.clone().ok_or_else(|| {
@@ -938,6 +943,43 @@ mod tests {
         // The block-level reverse_proxy terminal carries the header_up.
         assert_eq!(site.terminals[1].matchers.len(), 0);
         assert_eq!(site.terminals[1].modifiers.len(), 1);
+    }
+
+    #[test]
+    fn terminal_modifiers_keep_site_before_handle_scope() {
+        let cfg = compile(
+            ":8080 {
+    header_up X-Scope site
+    handle /api/* {
+        header_up X-Scope handle
+        reverse_proxy 127.0.0.1:9000
+    }
+}
+",
+        )
+        .unwrap();
+        let modifiers = &cfg.sites[0].terminals[0].modifiers;
+        assert_eq!(modifiers.len(), 2);
+        assert!(matches!(
+            &modifiers[0],
+            Modifier::HeaderUp { name, value }
+                if name == "X-Scope" && value.parts().len() == 1
+        ));
+        assert!(matches!(
+            &modifiers[1],
+            Modifier::HeaderUp { name, value }
+                if name == "X-Scope" && value.parts().len() == 1
+        ));
+        assert!(matches!(
+            &modifiers[0],
+            Modifier::HeaderUp { value, .. }
+                if matches!(value.parts()[0], TemplatePart::Literal(ref text) if text == "site")
+        ));
+        assert!(matches!(
+            &modifiers[1],
+            Modifier::HeaderUp { value, .. }
+                if matches!(value.parts()[0], TemplatePart::Literal(ref text) if text == "handle")
+        ));
     }
 
     #[test]

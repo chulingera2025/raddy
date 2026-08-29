@@ -863,7 +863,8 @@ pub struct Terminal {
     /// match for the terminal to serve.
     pub matchers: Vec<Matcher>,
     pub kind: TerminalKind,
-    /// Modifiers scoped to this terminal (from an enclosing `handle` block).
+    /// Effective modifiers: site-level directives followed by any enclosing
+    /// handle scope, in application order.
     pub modifiers: Vec<Modifier>,
     /// A path prefix stripped from the request before the terminal serves
     /// (the `handle_path` prefix, spec §5.9). `None` = serve the full path.

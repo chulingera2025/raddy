@@ -49,6 +49,7 @@ raddy run -c Raddyfile
 | `--metrics-addr <addr>` | unset | Expose Prometheus `/metrics` |
 | `--pidfile <file>` | unset | PID file used by `raddy upgrade` |
 | `--upgrade-sock <sock>` | `/tmp/raddy_upgrade.sock` | Unix socket used for listener handoff |
+| `--threads <n>` | `1` | Pingora worker threads allocated to the HTTP service |
 | `-t, --test` | off | Validate construction without binding listeners |
 | `-u, --upgrade` | off | Start as the replacement side of an upgrade |
 
@@ -77,6 +78,8 @@ the listener topology is unchanged.
 
 Pass the same deployment flags used by the running service, including
 `--cert-dir`, `--access-log`, and `--metrics-addr` when they are configured.
+Pass the same `--threads` value as the running process when comparing or
+replacing a worker configuration.
 Transparent TCP uses a custom Linux listener and must use a normal restart.
 UDP listener and flow handoff is supported on Linux when the upgrade preflight
 and handoff checks pass.

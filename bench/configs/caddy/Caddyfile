@@ -1,0 +1,26 @@
+{
+    admin off
+    auto_https off
+}
+
+:8080 {
+    @multi path /route/multi/*
+
+    handle @multi {
+        reverse_proxy origin:18080
+    }
+
+    reverse_proxy origin:18080
+}
+
+:8443 {
+    tls /etc/caddy/tls/bench.crt /etc/caddy/tls/bench.key
+
+    @multi path /route/multi/*
+
+    handle @multi {
+        reverse_proxy origin:18080
+    }
+
+    reverse_proxy origin:18080
+}

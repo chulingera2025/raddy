@@ -20,6 +20,7 @@
 //! (with no catch-all) is a 404.
 
 use crate::config::ast::{wildcard_match_specificity, CompiledConfig, CompiledSite, SiteKey};
+use std::borrow::Cow;
 
 /// The outcome of selecting a site for a request.
 #[derive(Debug)]
@@ -32,10 +33,20 @@ pub enum Selection<'a> {
     NotFound,
 }
 
+/// Internal site selection result that also carries the snapshot index.
+pub(crate) enum IndexedSelection<'a> {
+    /// A site and its index will serve the request.
+    Site(usize, &'a CompiledSite),
+    /// Host header missing or malformed.
+    BadRequest,
+    /// No site on this listener matches.
+    NotFound,
+}
+
 /// The result of normalizing a Host header value.
-enum Normalized {
+enum Normalized<'a> {
     /// A matchable hostname.
-    Matchable(String),
+    Matchable(Cow<'a, str>),
     /// The host was empty after stripping the port and trailing dot.
     Empty,
     /// Non-ASCII, so it can never match a named site in v0.1.
@@ -49,7 +60,7 @@ enum Normalized {
 /// Normalize a Host header value for site matching: strip `:port` (validating
 /// it — `example.com:notaport` must not silently match `example.com`), strip a
 /// trailing dot, ASCII-lowercase.
-fn normalize_host(raw: &[u8]) -> Normalized {
+fn normalize_host<'a>(raw: &'a [u8]) -> Normalized<'a> {
     let (host, port) = if raw.first() == Some(&b'[') {
         let Some(close) = raw.iter().position(|&b| b == b']') else {
             return Normalized::InvalidHost;
@@ -92,14 +103,15 @@ fn normalize_host(raw: &[u8]) -> Normalized {
     if host.contains(&b':') && !(host.first() == Some(&b'[') && host.last() == Some(&b']')) {
         return Normalized::InvalidHost;
     }
-    let mut out = String::new();
-    for &b in host {
-        if !b.is_ascii() {
-            return Normalized::NonAscii;
-        }
-        out.push((b as char).to_ascii_lowercase());
+    if host.iter().any(|b| !b.is_ascii()) {
+        return Normalized::NonAscii;
     }
-    Normalized::Matchable(out)
+    let host = std::str::from_utf8(host).expect("ASCII host must be valid UTF-8");
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Normalized::Matchable(Cow::Owned(host.to_ascii_lowercase()))
+    } else {
+        Normalized::Matchable(Cow::Borrowed(host))
+    }
 }
 
 /// Whether `bytes` is a valid TCP port number: 1–5 ASCII digits in 1..=65535
@@ -120,11 +132,24 @@ fn is_valid_port(bytes: &[u8]) -> bool {
 ///
 /// `host` is `None` when the request carried no Host header.
 pub fn select<'a>(config: &'a CompiledConfig, port: u16, host: Option<&[u8]>) -> Selection<'a> {
+    match select_with_index(config, port, host) {
+        IndexedSelection::Site(_, site) => Selection::Site(site),
+        IndexedSelection::BadRequest => Selection::BadRequest,
+        IndexedSelection::NotFound => Selection::NotFound,
+    }
+}
+
+/// Select a site for the request and retain its index for later proxy hooks.
+pub(crate) fn select_with_index<'a>(
+    config: &'a CompiledConfig,
+    port: u16,
+    host: Option<&[u8]>,
+) -> IndexedSelection<'a> {
     let normalized = match host {
-        None => return Selection::BadRequest,
+        None => return IndexedSelection::BadRequest,
         Some(raw) => match normalize_host(raw) {
             Normalized::Empty | Normalized::InvalidPort | Normalized::InvalidHost => {
-                return Selection::BadRequest;
+                return IndexedSelection::BadRequest;
             }
             Normalized::NonAscii => None,
             Normalized::Matchable(h) => Some(h),
@@ -134,30 +159,30 @@ pub fn select<'a>(config: &'a CompiledConfig, port: u16, host: Option<&[u8]>) ->
     let mut catch_all = None;
     let mut wildcard = None;
     let mut wildcard_suffix_len = 0;
-    for site in &config.sites {
+    for (index, site) in config.sites.iter().enumerate() {
         if site.key.port() != port {
             continue;
         }
         match &site.key {
             SiteKey::Named { host: named, .. } => {
                 if normalized.as_deref() == Some(named.as_str()) {
-                    return Selection::Site(site);
+                    return IndexedSelection::Site(index, site);
                 }
                 if let Some(host) = normalized.as_deref() {
                     if let Some(suffix_len) = wildcard_match_specificity(named, host) {
                         if suffix_len > wildcard_suffix_len {
-                            wildcard = Some(site);
+                            wildcard = Some((index, site));
                             wildcard_suffix_len = suffix_len;
                         }
                     }
                 }
             }
-            SiteKey::CatchAll { .. } => catch_all = Some(site),
+            SiteKey::CatchAll { .. } => catch_all = Some((index, site)),
         }
     }
     match wildcard.or(catch_all) {
-        Some(site) => Selection::Site(site),
-        None => Selection::NotFound,
+        Some((index, site)) => IndexedSelection::Site(index, site),
+        None => IndexedSelection::NotFound,
     }
 }
 

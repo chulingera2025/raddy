@@ -71,6 +71,23 @@ curl -H 'Host: example.local' http://127.0.0.1:8090/
 `raddy check` performs the same configuration validation used by reload. Keep
 it in deployment scripts and CI before starting or reloading the service.
 
+## Relative performance benchmark
+
+The repository includes a Docker comparison suite for Nginx, Caddy, and Raddy.
+It uses the same origin and scenario for each target and normalizes every
+scenario against Nginx (`1.00x = 100%`).
+
+![Relative maximum stable throughput](page/public/benchmarks/throughput.svg)
+
+Run it locally with:
+
+```bash
+./bench/scripts/run.sh quick
+```
+
+See the [benchmark documentation](docs/PERFORMANCE.md) for the full matrix,
+relative-metric rules, and generated report locations.
+
 ## A production-shaped site
 
 ```caddyfile
@@ -117,7 +134,7 @@ If either backend uses a private CA, add `tls_ca <path>` to the
 - [Raddyfile specification](docs/RADDYFILE_SPEC.md) — configuration semantics and compatibility source of truth.
 - [Architecture and capability boundaries](docs/PINGORA_CAPABILITY_RESEARCH.md) — what is native, application-level, Linux-only, or sidecar-based.
 - [Layer 4 architecture](docs/L4_PROXY_PLAN.md) — TCP/UDP runtime model and operational invariants.
-- [Performance baseline](docs/PERFORMANCE.md) — reproducible measurements and their limitations.
+- [Performance comparison](docs/PERFORMANCE.md) — the Docker comparison suite and normalized metrics.
 - [Release checklist](docs/RELEASE_CHECKLIST_v0.3.5.md) — historical release evidence.
 
 ## Build from source
