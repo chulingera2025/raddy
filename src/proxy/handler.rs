@@ -20,8 +20,9 @@
 //! so the upstream Connector's connection pools survive (ADR-011).
 
 use crate::config::ast::{
-    AccessLogFormat, Cidr, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec, TemplatePart,
-    Terminal, TerminalKind, UpstreamHttpVersion, UpstreamTls, ValueTemplate, Variable,
+    AccessLogFormat, Cidr, CompiledSite, Encoding, LbPolicy, Modifier, RateLimitKey, RateSpec,
+    TemplatePart, Terminal, TerminalKind, UpstreamHttpVersion, UpstreamTls, ValueTemplate,
+    Variable,
 };
 use crate::config::snapshot::{ConfigSnapshot, ConfigStore};
 use crate::proxy::compress;
@@ -197,6 +198,10 @@ pub struct ProxyCtx {
     terminal_index: usize,
     /// Whether the selected site disabled access logging.
     access_log_off: bool,
+    /// Whether the selected request uses the minimal reverse-proxy path.
+    simple_reverse_proxy: bool,
+    /// Whether response bytes are needed for an access-log entry.
+    track_response_bytes: bool,
     /// Balancer selected from the same immutable snapshot as the terminal.
     balancer: Option<Arc<dyn BackendSelector>>,
     /// Per-request streaming compression encoder, created in `response_filter`
@@ -240,7 +245,9 @@ impl ProxyHttp for ProxyHandler {
         ctx.start = Some(Instant::now());
         // The access log's `ts` documents the request start, so capture the wall
         // clock now rather than at logging time (latency still uses the Instant).
-        ctx.start_wall = Some(epoch_now_ms());
+        // Avoid a wall-clock syscall when access logging is disabled; the
+        // monotonic start below still feeds Prometheus latency metrics.
+        ctx.start_wall = self.access_log.as_ref().map(|_| epoch_now_ms());
         // ACME HTTP-01 challenge: serve `/.well-known/acme-challenge/<token>`
         // from the challenge store before any site selection, so the response
         // is served regardless of the site routing.
@@ -269,6 +276,37 @@ impl ProxyHttp for ProxyHandler {
                 Ok(true)
             }
             site::IndexedSelection::Site(site_index, site) => {
+                if self.access_log.is_none() || site.access_log_off {
+                    if let Some(terminal) = simple_reverse_proxy_terminal(site) {
+                        // The fast path is intentionally narrow: no matchers,
+                        // modifiers, path transformation, or request metadata
+                        // consumers can affect the forwarding decision.
+                        ctx.config = Some(config.clone());
+                        ctx.site_index = site_index;
+                        ctx.terminal_index = 0;
+                        ctx.access_log_off = site.access_log_off;
+                        ctx.track_response_bytes =
+                            self.access_log.is_some() && !site.access_log_off;
+                        let TerminalKind::ReverseProxy {
+                            upstreams,
+                            lb_policy,
+                            health_check,
+                            ..
+                        } = &terminal.kind
+                        else {
+                            unreachable!("simple proxy terminal pattern changed");
+                        };
+                        ctx.balancer = Some(self.pool.balancer_for_request(
+                            &site.key,
+                            0,
+                            upstreams,
+                            *lb_policy,
+                            *health_check,
+                        ));
+                        ctx.simple_reverse_proxy = true;
+                        return Ok(false);
+                    }
+                }
                 let is_tls = session_is_tls(session);
                 // Site-scoped `trusted_proxies` override the global list (§4).
                 let trusted = site
@@ -279,11 +317,16 @@ impl ProxyHttp for ProxyHandler {
                 // `ip_hash`, matchers, and the access log all consume this same
                 // value; requests that fail before a site is selected
                 // (ACME/400/404) fall back to the TCP peer.
-                ctx.effective_client_ip = client_ip(session, trusted);
+                ctx.effective_client_ip = if site_needs_client_ip(site, self.access_log.is_some()) {
+                    client_ip(session, trusted)
+                } else {
+                    None
+                };
                 // The site is recorded for every terminal (and the within-site
                 // 404), so `access_log off` (spec §5.13) excludes redir,
                 // file_server, respond, and error requests too (P2).
                 ctx.access_log_off = site.access_log_off;
+                ctx.track_response_bytes = self.access_log.is_some() && !site.access_log_off;
                 for (index, terminal) in site.terminals.iter().enumerate() {
                     if !matchers_match(&terminal.matchers, session, ctx.effective_client_ip, is_tls)
                     {
@@ -311,22 +354,26 @@ impl ProxyHttp for ProxyHandler {
                     }
                     // Auth guards (spec §5.10): `basic_auth` and `forward_auth`
                     // gate whichever terminal serves the block.
-                    if let Some(reject) = self.check_auth_guards(session, modifiers, ctx).await? {
-                        match reject {
-                            AuthReject::BasicUnauthorized => {
-                                let mut resp = ResponseHeader::build(401, None)?;
-                                resp.insert_header(
-                                    http::header::WWW_AUTHENTICATE,
-                                    "Basic realm=\"restricted\"",
-                                )?;
-                                resp.insert_header(http::header::CONTENT_LENGTH, "0")?;
-                                session.write_response_header(Box::new(resp), true).await?;
+                    if has_auth_guards(modifiers) {
+                        if let Some(reject) =
+                            self.check_auth_guards(session, modifiers, ctx).await?
+                        {
+                            match reject {
+                                AuthReject::BasicUnauthorized => {
+                                    let mut resp = ResponseHeader::build(401, None)?;
+                                    resp.insert_header(
+                                        http::header::WWW_AUTHENTICATE,
+                                        "Basic realm=\"restricted\"",
+                                    )?;
+                                    resp.insert_header(http::header::CONTENT_LENGTH, "0")?;
+                                    session.write_response_header(Box::new(resp), true).await?;
+                                }
+                                AuthReject::Status(status) => {
+                                    session.respond_error(status).await?;
+                                }
                             }
-                            AuthReject::Status(status) => {
-                                session.respond_error(status).await?;
-                            }
+                            return Ok(true);
                         }
-                        return Ok(true);
                     }
                     match &terminal.kind {
                         TerminalKind::Redir { to, code } => {
@@ -348,6 +395,7 @@ impl ProxyHttp for ProxyHandler {
                             ctx.config = Some(config.clone());
                             ctx.site_index = site_index;
                             ctx.terminal_index = index;
+                            ctx.simple_reverse_proxy = false;
                             let TerminalKind::ReverseProxy {
                                 upstreams,
                                 lb_policy,
@@ -387,7 +435,11 @@ impl ProxyHttp for ProxyHandler {
                                 &path,
                                 session,
                             );
-                            let encode = encode_algos(modifiers);
+                            let encode = if has_encode(modifiers) {
+                                encode_algos(modifiers)
+                            } else {
+                                Vec::new()
+                            };
                             crate::proxy::fs::serve(
                                 session,
                                 root,
@@ -538,6 +590,9 @@ impl ProxyHttp for ProxyHandler {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if ctx.simple_reverse_proxy {
+            return Ok(());
+        }
         let terminal = selected_terminal(ctx).ok_or_else(|| {
             Error::explain(
                 InternalError,
@@ -570,10 +625,12 @@ impl ProxyHttp for ProxyHandler {
                 let _ = upstream_request.insert_header(name, value);
             }
         }
-        let ops = header_ops(&terminal.modifiers, true, session);
-        apply_header_ops(&ops, |name, value| {
-            let _ = upstream_request.insert_header(name, value);
-        });
+        if has_header_up(&terminal.modifiers) {
+            let ops = header_ops(&terminal.modifiers, true, session);
+            apply_header_ops(&ops, |name, value| {
+                let _ = upstream_request.insert_header(name, value);
+            });
+        }
         Ok(())
     }
 
@@ -583,6 +640,9 @@ impl ProxyHttp for ProxyHandler {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if ctx.simple_reverse_proxy {
+            return Ok(());
+        }
         let terminal = selected_terminal(ctx).ok_or_else(|| {
             Error::explain(
                 InternalError,
@@ -590,9 +650,16 @@ impl ProxyHttp for ProxyHandler {
             )
         })?;
         let modifiers = &terminal.modifiers;
+        let has_header_down = has_header_down(modifiers);
+        let has_encode = has_encode(modifiers);
+        if !has_header_down && !has_encode {
+            return Ok(());
+        }
         // `header_down` is a declarative transform on the final response header,
         // shared with the `redir` and `file_server` terminals.
-        apply_header_down(modifiers, session, upstream_response);
+        if has_header_down {
+            apply_header_down(modifiers, session, upstream_response);
+        }
 
         // Compression (M5, B3b1): if the site enables `encode` and the client
         // accepts an algorithm, mark the response and stream it through a
@@ -606,8 +673,8 @@ impl ProxyHttp for ProxyHandler {
                 .contains_key(http::header::CONTENT_ENCODING)
             && !matches!(upstream_response.status.as_u16(), 204 | 304 | 206 | 1..=199)
             && !known_tiny_response(upstream_response);
-        let encode_algos = encode_algos(modifiers);
-        if compressible && !encode_algos.is_empty() {
+        if compressible && has_encode {
+            let encode_algos = encode_algos(modifiers);
             // The representation depends on the request's Accept-Encoding, so a
             // shared cache must vary on it (RFC 9110 §12.5.3) — even when this
             // particular client did not ask for compression.
@@ -643,10 +710,15 @@ impl ProxyHttp for ProxyHandler {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        if ctx.simple_reverse_proxy && !ctx.track_response_bytes {
+            return Ok(None);
+        }
         let Some(encoder) = ctx.encoder.as_mut() else {
             // Uncompressed chunk: count the bytes written downstream.
-            if let Some(chunk) = body {
-                ctx.response_bytes += chunk.len();
+            if ctx.track_response_bytes {
+                if let Some(chunk) = body {
+                    ctx.response_bytes += chunk.len();
+                }
             }
             return Ok(None);
         };
@@ -667,8 +739,10 @@ impl ProxyHttp for ProxyHandler {
         if !out.is_empty() {
             *body = Some(Bytes::from(out));
         }
-        if let Some(chunk) = body {
-            ctx.response_bytes += chunk.len();
+        if ctx.track_response_bytes {
+            if let Some(chunk) = body {
+                ctx.response_bytes += chunk.len();
+            }
         }
         Ok(None)
     }
@@ -711,6 +785,95 @@ fn selected_terminal(ctx: &ProxyCtx) -> Option<&Terminal> {
         .get(ctx.site_index)?
         .terminals
         .get(ctx.terminal_index)
+}
+
+/// Return the sole terminal when a site can use the minimal proxy path.
+///
+/// This deliberately excludes every request-time feature that can alter
+/// routing, identity, headers, or the response representation. The caller may
+/// therefore bypass the generic matcher and modifier pipeline safely.
+fn simple_reverse_proxy_terminal(site: &CompiledSite) -> Option<&Terminal> {
+    if !site.modifiers.is_empty() || site.terminals.len() != 1 || site_needs_client_ip(site, false)
+    {
+        return None;
+    }
+    let terminal = site.terminals.first()?;
+    if !terminal.matchers.is_empty()
+        || !terminal.modifiers.is_empty()
+        || terminal.strip_prefix.is_some()
+    {
+        return None;
+    }
+    matches!(&terminal.kind, TerminalKind::ReverseProxy { .. }).then_some(terminal)
+}
+
+/// Whether a modifier list contains an authentication guard.
+fn has_auth_guards(modifiers: &[Modifier]) -> bool {
+    modifiers.iter().any(|modifier| {
+        matches!(
+            modifier,
+            Modifier::BasicAuth { .. } | Modifier::ForwardAuth { .. }
+        )
+    })
+}
+
+/// Whether a modifier list contains an upstream header rewrite.
+fn has_header_up(modifiers: &[Modifier]) -> bool {
+    modifiers
+        .iter()
+        .any(|modifier| matches!(modifier, Modifier::HeaderUp { .. }))
+}
+
+/// Whether a modifier list contains a downstream header rewrite.
+fn has_header_down(modifiers: &[Modifier]) -> bool {
+    modifiers
+        .iter()
+        .any(|modifier| matches!(modifier, Modifier::HeaderDown { .. }))
+}
+
+/// Whether a modifier list contains response compression configuration.
+fn has_encode(modifiers: &[Modifier]) -> bool {
+    modifiers
+        .iter()
+        .any(|modifier| matches!(modifier, Modifier::Encode { .. }))
+}
+
+/// Whether the request must resolve its effective client IP.
+fn site_needs_client_ip(site: &crate::config::ast::CompiledSite, access_log_enabled: bool) -> bool {
+    if access_log_enabled && !site.access_log_off {
+        return true;
+    }
+    site.terminals.iter().any(|terminal| {
+        let matcher_needs_ip = terminal.matchers.iter().any(matcher_needs_client_ip);
+        let modifier_needs_ip = terminal.modifiers.iter().any(|modifier| {
+            matches!(
+                modifier,
+                Modifier::RateLimit {
+                    spec: RateSpec {
+                        key: RateLimitKey::RemoteIp,
+                        ..
+                    }
+                }
+            )
+        });
+        let upstream_needs_ip = matches!(
+            &terminal.kind,
+            TerminalKind::ReverseProxy {
+                lb_policy: LbPolicy::IpHash,
+                ..
+            }
+        );
+        matcher_needs_ip || modifier_needs_ip || upstream_needs_ip
+    })
+}
+
+/// Whether a matcher or any nested negation consumes the effective client IP.
+fn matcher_needs_client_ip(matcher: &crate::config::ast::Matcher) -> bool {
+    match matcher {
+        crate::config::ast::Matcher::RemoteIp(_) => true,
+        crate::config::ast::Matcher::Not(inner) => matcher_needs_client_ip(inner),
+        _ => false,
+    }
 }
 
 /// Build a TLS `HttpPeer` to a `https://` upstream (spec §5.4): SNI from the
@@ -1324,6 +1487,9 @@ pub(super) fn apply_header_down(
     session: &Session,
     resp: &mut ResponseHeader,
 ) {
+    if !has_header_down(modifiers) {
+        return;
+    }
     let ops = header_ops(modifiers, false, session);
     apply_header_ops(&ops, |name, value| {
         // The name and value are pre-validated by apply_header_ops, so pingora's
@@ -1403,6 +1569,129 @@ pub(super) fn merge_vary_accept_encoding(resp: &mut ResponseHeader) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ast::{CompiledSite, Matcher, RateUnit, SiteKey, Terminal};
+
+    fn empty_site() -> CompiledSite {
+        CompiledSite {
+            key: SiteKey::CatchAll { port: 8080 },
+            terminals: Vec::new(),
+            modifiers: Vec::new(),
+            trusted_proxies: None,
+            tls: None,
+            access_log_off: false,
+        }
+    }
+
+    #[test]
+    fn request_feature_checks_skip_empty_modifier_work() {
+        let modifiers = [];
+        assert!(!has_auth_guards(&modifiers));
+        assert!(!has_header_up(&modifiers));
+        assert!(!has_header_down(&modifiers));
+        assert!(!has_encode(&modifiers));
+        assert!(!site_needs_client_ip(&empty_site(), false));
+    }
+
+    #[test]
+    fn simple_reverse_proxy_requires_no_request_features() {
+        let mut site = empty_site();
+        site.terminals.push(Terminal {
+            matchers: Vec::new(),
+            kind: TerminalKind::ReverseProxy {
+                upstreams: vec![crate::config::ast::UpstreamPeer {
+                    addr: "127.0.0.1:9000".parse().expect("test upstream"),
+                    tls: false,
+                    http_version: UpstreamHttpVersion::Auto,
+                    host: String::new(),
+                }],
+                lb_policy: LbPolicy::RoundRobin,
+                health_check: None,
+                tls: None,
+            },
+            modifiers: Vec::new(),
+            strip_prefix: None,
+        });
+        assert!(simple_reverse_proxy_terminal(&site).is_some());
+
+        site.terminals[0]
+            .matchers
+            .push(Matcher::Path("/api".into()));
+        assert!(simple_reverse_proxy_terminal(&site).is_none());
+    }
+
+    #[test]
+    fn request_feature_checks_keep_all_client_ip_consumers() {
+        let mut site = empty_site();
+        site.terminals.push(Terminal {
+            matchers: vec![Matcher::RemoteIp(trusted(&["10.0.0.0/8"]))],
+            kind: TerminalKind::Respond {
+                status: 200,
+                body: None,
+            },
+            modifiers: Vec::new(),
+            strip_prefix: None,
+        });
+        assert!(site_needs_client_ip(&site, false));
+
+        let mut site = empty_site();
+        site.terminals.push(Terminal {
+            matchers: Vec::new(),
+            kind: TerminalKind::ReverseProxy {
+                upstreams: Vec::new(),
+                lb_policy: LbPolicy::IpHash,
+                health_check: None,
+                tls: None,
+            },
+            modifiers: Vec::new(),
+            strip_prefix: None,
+        });
+        assert!(site_needs_client_ip(&site, false));
+
+        let mut site = empty_site();
+        site.modifiers.push(Modifier::RateLimit {
+            spec: RateSpec {
+                key: RateLimitKey::RemoteIp,
+                count: 1,
+                unit: RateUnit::Second,
+                burst: 1,
+            },
+        });
+        site.terminals.push(Terminal {
+            matchers: Vec::new(),
+            kind: TerminalKind::Respond {
+                status: 200,
+                body: None,
+            },
+            modifiers: site.modifiers.clone(),
+            strip_prefix: None,
+        });
+        assert!(site_needs_client_ip(&site, false));
+    }
+
+    #[test]
+    fn request_feature_checks_detect_modifier_categories() {
+        let modifiers = vec![
+            Modifier::BasicAuth { users: Vec::new() },
+            Modifier::ForwardAuth {
+                target: "127.0.0.1:9000".to_string(),
+            },
+            Modifier::HeaderUp {
+                name: "X-Test".to_string(),
+                value: ValueTemplate::new(vec![TemplatePart::Literal("yes".to_string())]),
+            },
+            Modifier::HeaderDown {
+                name: "X-Test".to_string(),
+                value: ValueTemplate::new(vec![TemplatePart::Literal("yes".to_string())]),
+            },
+            Modifier::Encode {
+                algorithms: vec![Encoding::Gzip],
+            },
+        ];
+        assert!(has_auth_guards(&modifiers));
+        assert!(has_header_up(&modifiers));
+        assert!(has_header_down(&modifiers));
+        assert!(has_encode(&modifiers));
+    }
 
     #[test]
     fn prefix_matcher_boundaries() {
