@@ -34,13 +34,13 @@ description: 使用可复现的 Docker 测试套件比较 Nginx、Caddy 与 Radd
 Nginx = 1.00x = 100%
 ```
 
-![相对最大稳定吞吐](../benchmarks/throughput.svg)
+![相对最大稳定吞吐](/benchmarks/throughput.svg)
 
-![相对 p99 延迟](../benchmarks/latency-p99.svg)
+![相对 p99 延迟](/benchmarks/latency-p99.svg)
 
-![相对单请求 CPU 成本](../benchmarks/cpu-per-request.svg)
+![相对单请求 CPU 成本](/benchmarks/cpu-per-request.svg)
 
-![相对峰值内存](../benchmarks/memory.svg)
+![相对峰值内存](/benchmarks/memory.svg)
 
 吞吐越高越好；延迟、CPU 与内存越低越好。错误率显示绝对百分比，不做
 归一化。报告不计算综合分数。

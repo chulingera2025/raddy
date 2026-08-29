@@ -38,13 +38,13 @@ Each scenario is normalized independently:
 Nginx = 1.00x = 100%
 ```
 
-![Relative maximum stable throughput](../benchmarks/throughput.svg)
+![Relative maximum stable throughput](/benchmarks/throughput.svg)
 
-![Relative p99 latency](../benchmarks/latency-p99.svg)
+![Relative p99 latency](/benchmarks/latency-p99.svg)
 
-![Relative CPU cost per request](../benchmarks/cpu-per-request.svg)
+![Relative CPU cost per request](/benchmarks/cpu-per-request.svg)
 
-![Relative peak memory](../benchmarks/memory.svg)
+![Relative peak memory](/benchmarks/memory.svg)
 
 Throughput is higher-is-better. Latency, CPU per request, and memory are
 lower-is-better. Error rate is shown as an absolute percentage and is not
