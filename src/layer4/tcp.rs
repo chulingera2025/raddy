@@ -1834,6 +1834,35 @@ fn epoch_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// A loopback address on a free port, for the bind tests.
+    fn free_addr() -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        probe.local_addr().expect("probe address")
+    }
+
+    #[test]
+    fn reuse_port_lets_every_accept_loop_own_a_socket() {
+        // The scalability fix depends on this: N accept loops each need their
+        // own listening socket on the same address.
+        let addr = free_addr();
+        let first = bind_listener(addr, true).expect("first reuseport bind");
+        let second = bind_listener(addr, true).expect("second reuseport bind");
+        assert_eq!(
+            first.local_addr().expect("addr"),
+            second.local_addr().expect("addr")
+        );
+    }
+
+    #[test]
+    fn a_single_loop_listener_still_rejects_a_port_conflict() {
+        // Without SO_REUSEPORT a second bind must fail, so a genuine port
+        // conflict is still reported instead of being silently shared.
+        let addr = free_addr();
+        let _held = bind_listener(addr, false).expect("first bind");
+        let error = bind_listener(addr, false).expect_err("a conflicting bind must fail");
+        assert!(error.contains("bind TCP listener"), "got: {error}");
+    }
+
     #[test]
     fn resolve_upstream_accepts_ip_literals() {
         let addrs = resolve_upstream("127.0.0.1", 9000).unwrap();
