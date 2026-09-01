@@ -1,0 +1,21 @@
+# Benchmark configuration for Raddex.
+#
+# Kept deliberately minimal and matched to the Nginx and Caddy configs beside
+# it. `recv_buffer` / `send_buffer` are intentionally NOT set: neither Nginx
+# stream nor Caddy layer4 exposes an equivalent per-listener UDP socket buffer
+# knob, so setting them here would hand Raddex an advantage the other targets
+# cannot be given. All three run on the OS default socket buffers.
+
+tcp :18000 {
+    to origin:19000
+    connect_timeout 5s
+    idle_timeout 1h
+    max_connections 100000
+}
+
+udp :18001 {
+    to origin:19001
+    idle_timeout 1h
+    max_flows 100000
+    max_datagram_size 65507
+}
