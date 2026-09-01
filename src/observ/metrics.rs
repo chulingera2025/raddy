@@ -23,19 +23,19 @@ use std::sync::LazyLock;
 /// Total HTTP requests served by the proxy (QPS source).
 pub static REQUESTS: LazyLock<IntCounter> = LazyLock::new(|| {
     prometheus::register_int_counter!(
-        "raddy_requests_total",
-        "Total HTTP requests served by raddy"
+        "raddex_requests_total",
+        "Total HTTP requests served by raddex"
     )
-    .expect("register raddy_requests_total")
+    .expect("register raddex_requests_total")
 });
 
 /// Request duration in seconds.
 pub static DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     prometheus::register_histogram!(
-        "raddy_request_duration_seconds",
+        "raddex_request_duration_seconds",
         "HTTP request duration in seconds"
     )
-    .expect("register raddy_request_duration_seconds")
+    .expect("register raddex_request_duration_seconds")
 });
 
 /// Record one completed request: bump the counter and observe the duration.

@@ -1,5 +1,5 @@
 ---
-title: Raddy
+title: Raddex
 description: A predictable reverse-proxy gateway in Rust, built on Cloudflare Pingora.
 template: splash
 hero:
@@ -8,18 +8,18 @@ hero:
     - text: Quick start
       link: quickstart/
       variant: primary
-    - text: Install Raddy
+    - text: Install Raddex
       link: install/
 ---
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-Raddy is a reverse-proxy gateway built on
+Raddex is a reverse-proxy gateway built on
 [Cloudflare Pingora](https://github.com/cloudflare/pingora). It provides one
 readable configuration file for HTTP/HTTPS routing, automatic TLS, static
 files, upstream balancing, and selected TCP/UDP services.
 
-## Why Raddy?
+## Why Raddex?
 
 - **Predictable configuration.** Site directives follow the order you write;
   there is no hidden global ordering table.
@@ -27,9 +27,9 @@ files, upstream balancing, and selected TCP/UDP services.
   available alongside static certificates, internal certificates, and mTLS.
   TLS-ALPN-01 is limited to eligible ACME sites on port 443 and cannot be
   combined with DNS-01.
-- **A small operational surface.** Validate with `raddy check`, reload with
+- **A small operational surface.** Validate with `raddex check`, reload with
   SIGHUP, and upgrade the binary without dropping the listener topology.
-- **A clear protocol boundary.** Raddy can pass UDP traffic, including QUIC
+- **A clear protocol boundary.** Raddex can pass UDP traffic, including QUIC
   datagrams, but HTTP/3 termination remains a separate QUIC service.
 
 ## What is included in v0.3.5?
@@ -44,13 +44,13 @@ files, upstream balancing, and selected TCP/UDP services.
 | Transparent TCP and UDP flow handoff | Linux-only |
 | QUIC / HTTP/3 termination | Separate sidecar required |
 
-Raddy is still pre-1.0. "Supported" means the behavior is implemented and
+Raddex is still pre-1.0. "Supported" means the behavior is implemented and
 covered by the v0.3.5 verification suite; consult the [capability matrix](architecture/capabilities/)
 for deployment prerequisites and exclusions.
 
 <CardGrid>
 	<Card title="Readable configuration" icon="cursor-click">
-		Raddyfile directives have explicit scopes and write-order semantics.
+		Raddexfile directives have explicit scopes and write-order semantics.
 	</Card>
 	<Card title="TLS without glue code" icon="lock">
 		Automatic ACME certificates and per-site TLS settings live beside routing.
@@ -73,5 +73,5 @@ for deployment prerequisites and exclusions.
 	<LinkCard title="Layer 4" href="guides/layer4/" description="Proxy TCP and UDP with explicit limits and boundaries." />
 	<LinkCard title="Operations" href="operations/deployment/" description="Run, observe, reload, upgrade, and troubleshoot a deployment." />
 	<LinkCard title="Directive reference" href="config/directives/" description="Look up syntax, scope, defaults, and examples." />
-	<LinkCard title="Capability matrix" href="architecture/capabilities/" description="See what is supported, Linux-only, or outside Raddy." />
+	<LinkCard title="Capability matrix" href="architecture/capabilities/" description="See what is supported, Linux-only, or outside Raddex." />
 </CardGrid>

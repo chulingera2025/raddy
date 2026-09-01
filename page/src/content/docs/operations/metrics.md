@@ -1,12 +1,12 @@
 ---
 title: Metrics
-description: Prometheus metrics exposed by raddy on the --metrics-addr listener.
+description: Prometheus metrics exposed by raddex on the --metrics-addr listener.
 ---
 
-Start raddy with `--metrics-addr` to expose Prometheus metrics over HTTP:
+Start raddex with `--metrics-addr` to expose Prometheus metrics over HTTP:
 
 ```bash
-raddy run -c Raddyfile --metrics-addr 127.0.0.1:9100
+raddex run -c Raddexfile --metrics-addr 127.0.0.1:9100
 ```
 
 The metrics listener serves Prometheus text format at `/metrics`:
@@ -22,27 +22,27 @@ every completed request:
 
 | Metric | Type | Description |
 |---|---|---|
-| `raddy_requests_total` | Counter | Total HTTP requests served by raddy (the QPS source) |
-| `raddy_request_duration_seconds` | Histogram | HTTP request duration in seconds |
+| `raddex_requests_total` | Counter | Total HTTP requests served by raddex (the QPS source) |
+| `raddex_request_duration_seconds` | Histogram | HTTP request duration in seconds |
 
 ```text
-# HELP raddy_requests_total Total HTTP requests served by raddy
-# TYPE raddy_requests_total counter
-raddy_requests_total 123456
+# HELP raddex_requests_total Total HTTP requests served by raddex
+# TYPE raddex_requests_total counter
+raddex_requests_total 123456
 
-# HELP raddy_request_duration_seconds HTTP request duration in seconds
-# TYPE raddy_request_duration_seconds histogram
-raddy_request_duration_seconds_bucket{le="0.005"} 90000
-raddy_request_duration_seconds_bucket{le="0.01"} 120000
-raddy_request_duration_seconds_sum 620.5
-raddy_request_duration_seconds_count 123456
+# HELP raddex_request_duration_seconds HTTP request duration in seconds
+# TYPE raddex_request_duration_seconds histogram
+raddex_request_duration_seconds_bucket{le="0.005"} 90000
+raddex_request_duration_seconds_bucket{le="0.01"} 120000
+raddex_request_duration_seconds_sum 620.5
+raddex_request_duration_seconds_count 123456
 ```
 
 The histogram uses the default Prometheus buckets. Compute latency percentiles
 (p50 / p99) from the buckets with the usual `histogram_quantile()` PromQL:
 
 ```text
-histogram_quantile(0.99, sum by (le) (rate(raddy_request_duration_seconds_bucket[5m])))
+histogram_quantile(0.99, sum by (le) (rate(raddex_request_duration_seconds_bucket[5m])))
 ```
 
 ## What is not measured yet

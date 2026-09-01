@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Raddy installer.
+# Raddex installer.
 #
 # Downloads the release binary for the current architecture, verifies its
 # sha256 checksum against the release's SHA256SUMS, and installs it — never
@@ -11,15 +11,15 @@
 #     prefix:  install prefix (default: /usr/local)
 #
 # Manual install (no script):
-#   Download raddy-<arch>.tar.gz + SHA256SUMS from the release, then:
+#   Download raddex-<arch>.tar.gz + SHA256SUMS from the release, then:
 #     shasum -a 256 -c SHA256SUMS
-#     tar -xzf raddy-<arch>.tar.gz -C /usr/local
+#     tar -xzf raddex-<arch>.tar.gz -C /usr/local
 set -euo pipefail
 
 VERSION="${1:-latest}"
 PREFIX="${2:-/usr/local}"
 # Overridable so forks can repoint the installer.
-BASE_URL="${RADDY_RELEASE_BASE:-https://github.com/chulingera2025/raddy/releases/download}"
+BASE_URL="${RADDEX_RELEASE_BASE:-https://github.com/chulingera2025/raddex/releases/download}"
 
 case "$(uname -m)" in
   x86_64 | amd64) ARCH="x86_64-unknown-linux-gnu" ;;
@@ -37,13 +37,13 @@ release() {
     echo "$BASE_URL/$VERSION"
   fi
 }
-URL="$(release)/raddy-$ARCH.tar.gz"
+URL="$(release)/raddex-$ARCH.tar.gz"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "downloading $URL"
-curl -fsSL -o "$TMP/raddy-$ARCH.tar.gz" "$URL"
+curl -fsSL -o "$TMP/raddex-$ARCH.tar.gz" "$URL"
 curl -fsSL -o "$TMP/SHA256SUMS" "$(release)/SHA256SUMS"
 
 echo "verifying checksum..."
@@ -52,7 +52,7 @@ echo "verifying checksum..."
   # The release SHA256SUMS lists every architecture's tarball, but only the
   # tarball for THIS architecture was downloaded — a full `shasum -c` would
   # fail on the missing files. Extract the matching line and verify it alone.
-  line="$(grep "  raddy-$ARCH.tar.gz$" SHA256SUMS || true)"
+  line="$(grep "  raddex-$ARCH.tar.gz$" SHA256SUMS || true)"
   [ -n "$line" ] || exit 1
   printf '%s\n' "$line" | shasum -a 256 -c
 ) || {
@@ -60,6 +60,6 @@ echo "verifying checksum..."
   exit 1
 }
 
-tar -xzf "$TMP/raddy-$ARCH.tar.gz" -C "$TMP"
-install -Dm755 "$TMP/raddy" "$PREFIX/bin/raddy"
-echo "installed raddy to $PREFIX/bin/raddy"
+tar -xzf "$TMP/raddex-$ARCH.tar.gz" -C "$TMP"
+install -Dm755 "$TMP/raddex" "$PREFIX/bin/raddex"
+echo "installed raddex to $PREFIX/bin/raddex"

@@ -1,6 +1,6 @@
 # Documentation map and maintenance
 
-Raddy has two documentation surfaces with different audiences.
+Raddex has two documentation surfaces with different audiences.
 
 ## Public documentation site
 
@@ -12,13 +12,13 @@ boundary:
 quickstart.md                 first successful local proxy
 install.md                    release installation
 guides/                       task and protocol recipes
-config/                       Raddyfile concepts and reference
+config/                       Raddexfile concepts and reference
 operations/                   deployment, observation, and troubleshooting
 architecture/                 capability and protocol boundaries
 ```
 
 Keep links relative so the site continues to work under the GitHub Pages base
-path. Raddyfile examples use the `caddyfile` syntax tag.
+path. Raddexfile examples use the `caddyfile` syntax tag.
 
 ## Repository documentation
 
@@ -28,7 +28,7 @@ so existing links do not break; the table below is the logical grouping:
 
 | File | Role |
 | --- | --- |
-| Specification | `RADDYFILE_SPEC.md` — configuration compatibility source of truth |
+| Specification | `RADDEXFILE_SPEC.md` — configuration compatibility source of truth |
 | Architecture | `PINGORA_CAPABILITY_RESEARCH.md` and `L4_PROXY_PLAN.md` — runtime boundaries and invariants |
 | Operations | `INSTALL.md` and `PERFORMANCE.md` — deployment and benchmark records |
 | Releases | `RELEASE_CHECKLIST_*.md` — historical release evidence |
@@ -43,7 +43,7 @@ architecture record before it is advertised as supported.
 When pages disagree, resolve the conflict in this order:
 
 1. Current parser and validator behavior.
-2. `docs/RADDYFILE_SPEC.md` for configuration semantics.
+2. `docs/RADDEXFILE_SPEC.md` for configuration semantics.
 3. Focused integration tests for runtime behavior.
 4. Public guides and README summaries.
 
@@ -57,7 +57,7 @@ Use these terms consistently:
 - **Supported** — implemented and verified in the stated release.
 - **Linux-only** — supported with host kernel or privilege requirements.
 - **Passthrough** — forwarded without terminating the higher-level protocol.
-- **Sidecar required** — outside the current Raddy/Pingora protocol stack.
+- **Sidecar required** — outside the current Raddex/Pingora protocol stack.
 
 Avoid broad claims such as "supports HTTP/3" when only UDP datagram passthrough
 exists.
@@ -73,4 +73,4 @@ node page/scripts/check-links.mjs
 
 The content must remain English-only for new or rewritten documentation, use
 relative internal links in the site, and keep examples consistent with the
-Raddyfile specification and CLI help output.
+Raddexfile specification and CLI help output.

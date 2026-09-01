@@ -39,8 +39,8 @@ example.com {
 ## Run it
 
 ```bash
-raddy check -c Raddyfile
-raddy run -c Raddyfile
+raddex check -c Raddexfile
+raddex run -c Raddexfile
 ```
 
 ## What you get

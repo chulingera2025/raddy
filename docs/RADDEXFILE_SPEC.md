@@ -1,6 +1,6 @@
-# Raddyfile Specification
+# Raddexfile Specification
 
-> The Raddyfile is a **public interface** that is hard to change after release.
+> The Raddexfile is a **public interface** that is hard to change after release.
 > This document is the source of truth.
 >
 > **Red line**: any syntax not specified here must be added here before it is
@@ -86,7 +86,7 @@ api.example.com {
 Rate limiting, access logging, and WAF all depend on whether the client IP is
 trusted, so the default must be pinned down:
 
-- By default, raddy **does not trust** any upstream `X-Forwarded-For`; it uses
+- By default, raddex **does not trust** any upstream `X-Forwarded-For`; it uses
   the TCP peer address directly.
 - Only after `trusted_proxies` networks are configured does it parse the
   `X-Forwarded-For` chain from the rightmost untrusted address.
@@ -171,7 +171,7 @@ codec framing would make it larger).
   - `<dur>` is a number plus a unit (`ms` / `s` / `m` / `h`), or a bare number
     meaning seconds.
 - Runtime semantics: an upstream marked unhealthy is never selected; it flows
-  back automatically once restored. **If every upstream is unhealthy, raddy
+  back automatically once restored. **If every upstream is unhealthy, raddex
   returns 502.** Health state is process-lifetime and survives SIGHUP reloads
 ; it is rebuilt only when the upstream list, policy, or health-check
   parameters change.
@@ -218,7 +218,7 @@ api.example.com {
 
 ### 5.3 `dns_challenge` (DNS-01 via a DNS provider)
 
-By default, raddy proves domain control with **HTTP-01** on its plain-HTTP
+By default, raddex proves domain control with **HTTP-01** on its plain-HTTP
 listener. When port 80 is unreachable (a network that blocks it, or a
 DNS-only deployment), set `dns_challenge` to prove control by publishing a DNS
 TXT record instead:
@@ -227,10 +227,10 @@ TXT record instead:
 - **Provider**: `cloudflare` (the only provider today). The token must have
   **Zone: DNS: Edit** permission.
 - **Semantics**: when set, every certificate on this instance is issued via
-  **DNS-01** — raddy publishes `_acme-challenge.<host>` TXT records through the
+  **DNS-01** — raddex publishes `_acme-challenge.<host>` TXT records through the
   provider's API while the order is being validated, then removes them. Without
   `dns_challenge`, behavior is unchanged (HTTP-01).
-- **Security**: the API token is a secret — keep the Raddyfile out of version
+- **Security**: the API token is a secret — keep the Raddexfile out of version
   control or protect it accordingly.
 
 ```caddyfile
@@ -260,7 +260,7 @@ reverse_proxy h2c://127.0.0.1:9080
 reverse_proxy {
     to https://10.0.0.1:8443 https://10.0.0.2:8443
     tls_servername api.internal
-    tls_ca /etc/raddy/root-ca.pem
+    tls_ca /etc/raddex/root-ca.pem
 }
 ```
 
@@ -290,12 +290,12 @@ reverse_proxy {
 
 `reverse_proxy` forwards HTTP `Upgrade` requests (WebSocket and similar
 `Connection: upgrade` protocols) transparently: the client's upgrade request
-goes upstream, and once the upstream answers `101 Switching Protocols` raddy
+goes upstream, and once the upstream answers `101 Switching Protocols` raddex
 tunnels the connection bidirectionally.
 
 - No directive is needed — this is the default behavior of `reverse_proxy` for
   HTTP/1.1 upgrade requests.
-- Upgrades are end-to-end: raddy does not terminate the upgraded protocol; the
+- Upgrades are end-to-end: raddex does not terminate the upgraded protocol; the
   backend must speak it.
 - `header_up` / `header_down` still apply to the upgrade request/response
   headers; `encode` never applies to a `101` (upgraded) response.
@@ -378,7 +378,7 @@ port 443 is reachable:
 - **Syntax**: `tls_alpn_challenge`, in the **global block**.
 - **Semantics**: when set, certificate issuance uses **TLS-ALPN-01**: the ACME
   server opens a TLS connection to port 443 offering only `acme-tls/1`, and
-  raddy answers with a short-lived validation certificate containing the
+  raddex answers with a short-lived validation certificate containing the
   `acmeIdentifier` extension. HTTP-01 is not enabled as a fallback.
 
 ### 5.9 Matchers, `rewrite`, `handle_path`, `respond`, `error`
@@ -422,7 +422,7 @@ New directives introduced with matchers:
 - `respond <matcher> <status> [<body>]`: a **terminal** that answers directly
   with the given status and optional body (the matcher is optional — omitted
   means always match).
-- `error <matcher> [<status>] [<message>]`: a **terminal** that triggers raddy's
+- `error <matcher> [<status>] [<message>]`: a **terminal** that triggers raddex's
   internal error response with the given status (default **500**) and optional
   message.
 
@@ -453,7 +453,7 @@ api.example.com {
   bcrypt hash, otherwise **401** with `WWW-Authenticate: Basic`. Generate hashes
   with `htpasswd -B`.
 - `forward_auth <target>`: a **guard** that delegates authentication to upstream
-  `target` (`host:port`): raddy forwards a request (carrying the original
+  `target` (`host:port`): raddex forwards a request (carrying the original
   `Authorization` and `X-Forwarded-For`) and grants access only on a **2xx**
   response; a **403** is passed through and anything else yields **401**. Response
   headers from the auth upstream (e.g. an identity header) are copied onto the
@@ -482,7 +482,7 @@ algorithm is used only when listed; it is negotiated against the client's
 
 **Status: Available.**
 
-- **`import <file>`**: splices the contents of another Raddyfile at that point.
+- **`import <file>`**: splices the contents of another Raddexfile at that point.
   Paths are relative to the importing file. Imports may nest only to a bounded
   depth; an import cycle (tracked by canonical path) and an imported file over
   the size limit are **errors** — never a silent truncation. A site block may
@@ -500,7 +500,7 @@ algorithm is used only when listed; it is negotiated against the client's
 ```caddyfile
 (base) {
     rate_limit remote_ip 100r/s
-    header_up X-Raddy true
+    header_up X-Raddex true
 }
 
 {
@@ -517,7 +517,7 @@ api.example.com {
 
 **Status: Available.**
 
-The `--access-log` CLI flag appends JSON access logs. The Raddyfile can
+The `--access-log` CLI flag appends JSON access logs. The Raddexfile can
 configure access logging more precisely:
 
 - Global block: `access_log <path> [format=<json|common>]` sets the log file and
@@ -542,10 +542,10 @@ configure access logging more precisely:
   or TLS-ALPN-01 when `tls_alpn_challenge` is configured (Section 5.8). A `tls` source
   of static or internal certs (Section 5.7) opts a site out of ACME. SNI returns
   the matching certificate, and the 443 listener uses SNI dynamic certificates
-  (cached in `raddy_certs/`, reused on restart). Certificates are renewed
+  (cached in `raddex_certs/`, reused on restart). Certificates are renewed
   automatically within 30 days of expiry.
 - **Implicit HTTP-01 listener on :80**: HTTP-01 is answered on a plain-HTTP
-  listener, so when a config has named sites but no site on port 80, raddy
+  listener, so when a config has named sites but no site on port 80, raddex
   binds an implicit plain-HTTP `:80` listener that serves only the ACME
   challenge (other requests to it get 404). Without it, the ACME server could
   never reach the challenge and issuance would hang. Configuring `dns_challenge`
@@ -646,7 +646,7 @@ tcp :8443 {
 - **`to <host>:<port>...`**: at least one upstream. Hostnames are resolved at
   startup and re-resolved periodically (default 60s; the resolved address set
   is swapped for new connections only); a transient refresh failure keeps the
-  last-known-good addresses (`raddy_l4_tcp_dns_refresh_failures_total` counts
+  last-known-good addresses (`raddex_l4_tcp_dns_refresh_failures_total` counts
   it). An unresolvable upstream at startup is an error.
 - **SNI routing** (`sni <name> <host:port>` + optional
   `fallback <host:port>`, L4 P1): a `tcp` listener with `sni` lines routes TLS
@@ -662,14 +662,14 @@ tcp :8443 {
   uses the shared `to` upstream set and cannot be combined with SNI
   passthrough or `transparent`.
 - **Transparent TCP mode**: add `transparent` to a `tcp` block together
-  with a `to` fallback. On Linux, raddy binds a socket with
+  with a `to` fallback. On Linux, raddex binds a socket with
   `IP_TRANSPARENT`, reads the original destination from the Pingora socket
   digest, and binds outbound connections to the original client address. It
   requires `CAP_NET_ADMIN` (or an equivalent service capability),
   netfilter TPROXY rules, and policy routing. It is custom Linux integration
   and is not available on Windows. Because the listener is custom-owned, a
   transparent TCP configuration must use a normal restart rather than
-  `raddy upgrade`.
+  `raddex upgrade`.
 - **`lb_policy`** reuses the HTTP policies: `round_robin` (default), `random`,
   and `ip_hash` (source-IP stickiness — the same client stays on the same
   upstream).
@@ -683,7 +683,7 @@ tcp :8443 {
   `2` consecutive successes). An unhealthy upstream is skipped; when every
   upstream is unhealthy the connection is refused.
 - Each closed connection emits a typed access-log line (JSON, distinct from the
-  HTTP access log) and Prometheus metrics (`raddy_l4_tcp_*`, labelled by
+  HTTP access log) and Prometheus metrics (`raddex_l4_tcp_*`, labelled by
   listener).
 - **UDP proxying** (`udp <address> { to ... lb_policy idle_timeout max_flows
   max_datagram_size recv_buffer send_buffer }`, L4 P2): proxies datagrams. Each
@@ -695,8 +695,8 @@ tcp :8443 {
   counts oversized datagrams, and `recv_buffer`/`send_buffer` size the sockets
   (0 = OS default). IPv4 and IPv6 upstreams are supported. UDP and TCP may
   share an address and port. Metrics:
-  `raddy_l4_udp_*`. UDP zero-downtime upgrades are available on Linux:
-  raddy transfers the listener fd, every connected upstream flow fd, and
+  `raddex_l4_udp_*`. UDP zero-downtime upgrades are available on Linux:
+  raddex transfers the listener fd, every connected upstream flow fd, and
   bounded flow metadata through a private handoff manifest. The kernel receive
   queue remains attached to the transferred listener, so flows continue without
   a rebind gap. If the handoff fails, the upgrade fails closed rather than

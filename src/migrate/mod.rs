@@ -11,11 +11,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Migration: convert a common Caddyfile / nginx.conf subset into a Raddyfile.
+//! Migration: convert a common Caddyfile / nginx.conf subset into a Raddexfile.
 //!
 //! This is an **independent external converter** (ARCHITECTURE §7): it emits
-//! Raddyfile text using only existing directives and never back-influences the
-//! Raddyfile grammar or parser. The CLI validates the emitted Raddyfile before
+//! Raddexfile text using only existing directives and never back-influences the
+//! Raddexfile grammar or parser. The CLI validates the emitted Raddexfile before
 //! printing, so a converter bug surfaces as an error rather than an unparseable
 //! config. Unsupported source syntax is skipped and reported as a warning —
 //! nothing is silently dropped.
@@ -26,7 +26,7 @@ use std::path::Path;
 pub mod caddy;
 pub mod nginx;
 
-/// The source configuration format for `raddy import`.
+/// The source configuration format for `raddex import`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ImportFormat {
     Caddyfile,
@@ -42,11 +42,11 @@ impl fmt::Display for ImportFormat {
     }
 }
 
-/// A converted Raddyfile plus warnings about skipped or approximated syntax.
+/// A converted Raddexfile plus warnings about skipped or approximated syntax.
 #[derive(Debug, Default)]
 pub struct Converted {
-    /// The emitted Raddyfile (clean; a valid config when non-empty).
-    pub raddyfile: String,
+    /// The emitted Raddexfile (clean; a valid config when non-empty).
+    pub raddexfile: String,
     /// Human-readable warnings, one per skipped/approximated source item.
     pub warnings: Vec<String>,
 }
@@ -83,7 +83,7 @@ impl std::error::Error for MigrateError {
     }
 }
 
-/// Convert a source config file into a Raddyfile.
+/// Convert a source config file into a Raddexfile.
 pub fn import(format: ImportFormat, path: &Path) -> Result<Converted, MigrateError> {
     let input = std::fs::read_to_string(path).map_err(|source| MigrateError::Io {
         file: path.display().to_string(),

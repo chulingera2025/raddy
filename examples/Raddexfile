@@ -1,4 +1,4 @@
-# Raddyfile example — mirrors RADDYFILE_SPEC §7.
+# Raddexfile example — mirrors RADDEXFILE_SPEC §7.
 # Global block (must be first if present).
 {
     acme_email ops@example.com

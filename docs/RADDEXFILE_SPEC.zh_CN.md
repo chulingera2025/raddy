@@ -1,6 +1,6 @@
-# Raddyfile 设计规范
+# Raddexfile 设计规范
 
-> Raddyfile 是发布后很难再改的**公共接口**。本文档是唯一事实来源。
+> Raddexfile 是发布后很难再改的**公共接口**。本文档是唯一事实来源。
 >
 > **红线**：任何未在本文档明确的语法，实现前必须先补充到本文档，不得"顺手决定"。
 
@@ -145,17 +145,17 @@ api.example.com {
 
 ### 5.3 `dns_challenge`（经 DNS 服务商的 DNS-01）
 
-默认情况下，raddy 在纯 HTTP 监听器上用 **HTTP-01** 证明域名控制权。当 80
+默认情况下，raddex 在纯 HTTP 监听器上用 **HTTP-01** 证明域名控制权。当 80
 端口不可达（网络屏蔽，或纯 DNS 部署）时，改用 `dns_challenge` 通过发布 DNS
 TXT 记录证明控制权：
 
 - **语法**：`dns_challenge <provider> <api_token>`，位于**全局块**。
 - **服务商**：`cloudflare`（目前唯一支持）。令牌需要 **Zone: DNS: Edit**
   权限。
-- **语义**：配置后，本实例上所有证书签发走 **DNS-01**——raddy 在校验订单
+- **语义**：配置后，本实例上所有证书签发走 **DNS-01**——raddex 在校验订单
   期间通过服务商 API 发布 `_acme-challenge.<host>` TXT 记录，完成后移除。未
   配置 `dns_challenge` 时行为不变（HTTP-01）。
-- **安全**：API 令牌是机密——注意不要让 Raddyfile 落入版本控制。
+- **安全**：API 令牌是机密——注意不要让 Raddexfile 落入版本控制。
 
 ```caddyfile
 {
@@ -183,7 +183,7 @@ reverse_proxy h2c://127.0.0.1:9080
 reverse_proxy {
     to https://10.0.0.1:8443 https://10.0.0.2:8443
     tls_servername api.internal
-    tls_ca /etc/raddy/root-ca.pem
+    tls_ca /etc/raddex/root-ca.pem
 }
 ```
 
@@ -206,10 +206,10 @@ reverse_proxy {
 
 `reverse_proxy` 透明转发 HTTP `Upgrade` 请求（WebSocket 及类似的
 `Connection: upgrade` 协议）：客户端的升级请求原样发往上游，上游应答
-`101 Switching Protocols` 后 raddy 双向隧道转发该连接。
+`101 Switching Protocols` 后 raddex 双向隧道转发该连接。
 
 - 无需任何指令——这是 `reverse_proxy` 对 HTTP/1.1 升级请求的默认行为。
-- 升级是端到端的：raddy 不终结升级后的协议，后端必须自行实现该协议。
+- 升级是端到端的：raddex 不终结升级后的协议，后端必须自行实现该协议。
 - `header_up` / `header_down` 对升级请求/响应头仍然生效；`encode` 绝不作用
   于 `101`（已升级）响应。
 
@@ -284,7 +284,7 @@ ClientHello/ALPN 回调和临时 RFC 8737 challenge 证书。它与
 
 - **语法**：`tls_alpn_challenge`，位于**全局块**。
 - **语义**：设置后，证书签发使用 **TLS-ALPN-01**：ACME 服务器向 443 端口
-  发起只携带 `acme-tls/1` 的 TLS 连接，raddy 返回带有
+  发起只携带 `acme-tls/1` 的 TLS 连接，raddex 返回带有
   `acmeIdentifier` 扩展的短期校验证书。不会回退到 HTTP-01。
 
 ### 5.9 Matchers、`rewrite`、`handle_path`、`respond`、`error`
@@ -322,7 +322,7 @@ Matcher 附加到指令或 `handle` 块：`handle <matcher> { ... }`、
 - `respond <matcher> <status> [<body>]`：**终端指令**，直接以给定状态与可选
   响应体应答（matcher 可选——省略即始终匹配）。
 - `error <matcher> [<status>] [<message>]`：**终端指令**，以给定状态（默认
-  **500**）与可选消息触发 raddy 的内部错误响应。
+  **500**）与可选消息触发 raddex 的内部错误响应。
 
 ```caddyfile
 api.example.com {
@@ -350,7 +350,7 @@ api.example.com {
   校验通过，否则返回 **401** 并带 `WWW-Authenticate: Basic`。用
   `htpasswd -B` 生成哈希。
 - `forward_auth <target>`：把认证委托给上游 `target`（`host:port`）的
-  **守卫**：raddy 转发请求（携带原始 `Authorization` 与 `X-Forwarded-For`），
+  **守卫**：raddex 转发请求（携带原始 `Authorization` 与 `X-Forwarded-For`），
   仅在 **2xx** 响应时放行；**403** 原样透传，其余返回 **401**。来自认证上游
   的响应头（如身份头）会在真实上游看到请求前复制到请求上。
 
@@ -376,7 +376,7 @@ api.example.com {
 
 **状态：可用。**
 
-- **`import <file>`**：在该位置拼入另一个 Raddyfile 的内容。路径相对于导入方
+- **`import <file>`**：在该位置拼入另一个 Raddexfile 的内容。路径相对于导入方
   文件。import 只能嵌套到有界深度；import 环（按规范化路径检测）与超过大小
   限制的导入文件都是**错误**——绝不会静默截断。站点块可以导入属于该站点的
   指令文件。
@@ -390,7 +390,7 @@ api.example.com {
 ```caddyfile
 (base) {
     rate_limit remote_ip 100r/s
-    header_up X-Raddy true
+    header_up X-Raddex true
 }
 
 {
@@ -407,7 +407,7 @@ api.example.com {
 
 **状态：可用。**
 
-`--access-log` CLI 参数追加 JSON 访问日志。Raddyfile 可以更精细地配置访问
+`--access-log` CLI 参数追加 JSON 访问日志。Raddexfile 可以更精细地配置访问
 日志：
 
 - 全局块：`access_log <path> [format=<json|common>]` 设置日志文件与格式
@@ -421,8 +421,8 @@ api.example.com {
 ## 6. 站点选择、端口、catch-all 与多站点
 
 - **站点选择按监听器收敛**：请求到达某监听器后，仅在该监听器的候选站点集合内匹配——TLS 监听器按 SNI、纯 HTTP 监听器按规范化 Host（去端口、去尾点、ASCII 小写）。候选集合 = 地址落在该端口的具名站点 + 该端口的 `:port` 兜底块。
-- **具名站点默认端口 443**：`api.example.com`（不带端口）默认绑 443（TLS）。自动 HTTPS 生效：具名站点通过 ACME 签发证书——默认 HTTP-01，配置 `dns_challenge` 后走 DNS-01（见 第 5.3 节），配置 `tls_alpn_challenge` 后走 TLS-ALPN-01（见 第 5.8 节）。`tls` 来源为静态或 internal 证书的站点（见 第 5.7 节）被排除在 ACME 之外。SNI 按域名返回对应证书；端口 443 监听器使用 SNI 动态证书（`raddy_certs/` 目录缓存，重启复用）。证书在到期前 30 天内自动续期。
-- **隐式 HTTP-01 监听器（:80）**：HTTP-01 挑战在明文 HTTP 监听器上应答，因此当配置含具名站点但没有任何站点绑定端口 80 时，raddy 会隐式绑定一个仅服务 ACME 挑战的明文 `:80` 监听器（其余请求返回 404）。没有它，ACME 服务器永远无法触达挑战，签发会一直挂起。配置 `dns_challenge`（DNS-01）时跳过该隐式监听器——选择 DNS 部署正是因为端口 80 不可用。显式配置 `:80` catch-all 已能应答挑战，因此不会重复绑定。
+- **具名站点默认端口 443**：`api.example.com`（不带端口）默认绑 443（TLS）。自动 HTTPS 生效：具名站点通过 ACME 签发证书——默认 HTTP-01，配置 `dns_challenge` 后走 DNS-01（见 第 5.3 节），配置 `tls_alpn_challenge` 后走 TLS-ALPN-01（见 第 5.8 节）。`tls` 来源为静态或 internal 证书的站点（见 第 5.7 节）被排除在 ACME 之外。SNI 按域名返回对应证书；端口 443 监听器使用 SNI 动态证书（`raddex_certs/` 目录缓存，重启复用）。证书在到期前 30 天内自动续期。
+- **隐式 HTTP-01 监听器（:80）**：HTTP-01 挑战在明文 HTTP 监听器上应答，因此当配置含具名站点但没有任何站点绑定端口 80 时，raddex 会隐式绑定一个仅服务 ACME 挑战的明文 `:80` 监听器（其余请求返回 404）。没有它，ACME 服务器永远无法触达挑战，签发会一直挂起。配置 `dns_challenge`（DNS-01）时跳过该隐式监听器——选择 DNS 部署正是因为端口 80 不可用。显式配置 `:80` catch-all 已能应答挑战，因此不会重复绑定。
 - **具名站点显式端口**：`api.example.com:8081 { ... }` 将具名站点绑定到非标端口（用于本地多端口部署与测试）；省略端口时默认 443。IPv6 字面量地址（`[::1]:8080`）已支持，Host 头也必须使用方括号形式。带 `tls` 指令的具名站点（见 第 5.7 节）即使端口不是 443 也以 TLS 提供。
 - **选不中兜底**：Host 缺失或畸形 → `400 Bad Request`；Host 合法但不匹配任何站点、且无兜底块 → `404 Not Found`。不提供可配置错误页。
 - **非标端口**：`:8443`。
@@ -498,7 +498,7 @@ tcp :8443 {
   裸 TCP 监听器同样被拒绝。
 - **`to <host>:<port>...`**：至少一个上游。主机名在启动时解析，并按周期
   重新解析（默认 60s；新的地址集合仅对*新*连接生效）；瞬时刷新失败会保留
-  最后可用地址（`raddy_l4_tcp_dns_refresh_failures_total` 计数）。启动时无法
+  最后可用地址（`raddex_l4_tcp_dns_refresh_failures_total` 计数）。启动时无法
   解析的上游是错误。
 - **SNI 路由**（`sni <name> <host:port>` + 可选 `fallback <host:port>`，L4 P1）：
   含 `sni` 行的 `tcp` 监听器按 ClientHello 的精确或单标签通配符 SNI 路由
@@ -513,7 +513,7 @@ tcp :8443 {
   Linux 下监听 socket 设置 `IP_TRANSPARENT`，从 Pingora socket digest 读取原始目的地址，
   并用原始客户端地址建立出站连接。需要 `CAP_NET_ADMIN`、TPROXY 规则和策略路由，
   Windows 不支持。由于监听器由自定义服务持有，透明 TCP 配置必须使用普通重启，
-  不能使用 `raddy upgrade`。
+  不能使用 `raddex upgrade`。
 - **`lb_policy`** 复用 HTTP 策略：`round_robin`（默认）、`random`、`ip_hash`
   （源 IP 粘滞——同一客户端固定到同一上游）。
 - **`connect_timeout`** 限制单次上游连接的时长（默认 `5s`）；**`idle_timeout`**
@@ -524,7 +524,7 @@ tcp :8443 {
   （`5s` 间隔、`2s` 超时、连续 `3` 次失败 / `2` 次成功）。不健康的上游会被
   跳过；全部不健康时连接被拒绝。
 - 每条关闭的连接输出一条类型化访问日志行（JSON，与 HTTP 访问日志相互独立）
-  及 Prometheus 指标（`raddy_l4_tcp_*`，按监听器打标签）。
+  及 Prometheus 指标（`raddex_l4_tcp_*`，按监听器打标签）。
 - **UDP 代理**（`udp <address> { to ... lb_policy idle_timeout max_flows
   max_datagram_size recv_buffer send_buffer }`，L4 P2）：代理数据报。每个客户端
   （地址 + 端口）映射为一个 **flow**，各自持有与所选上游相连的 socket（本地
@@ -532,9 +532,9 @@ tcp :8443 {
   *IP* 钉住，flow 身份仍含端口。上限：`max_flows` 限制表大小（最旧优先驱逐）、
   `idle_timeout` 驱逐空闲 flow、`max_datagram_size` 丢弃并计数超大报文、
   `recv_buffer`/`send_buffer` 设置 socket 缓冲（0 = 系统默认）。IPv4 与 IPv6
-  上游均支持。UDP 与 TCP 可共享同一地址端口。指标：`raddy_l4_udp_*`。Linux
+  上游均支持。UDP 与 TCP 可共享同一地址端口。指标：`raddex_l4_udp_*`。Linux
   下 UDP 支持零停机升级：
-  raddy 通过私有 handoff manifest 交接监听 fd、每个已连接上游 flow fd 以及有界的 flow 元数据，
+  raddex 通过私有 handoff manifest 交接监听 fd、每个已连接上游 flow fd 以及有界的 flow 元数据，
   因而内核接收队列不会因重新 bind 而丢失。交接失败时升级不会报告成功。
 - **QUIC 透传**：UDP 代理可以把 QUIC 包当作普通数据报转发，但 Pingora 0.8.1 没有原生
   QUIC/HTTP/3 协议栈。这不提供 QUIC 终止、HTTP/3 请求路由或 QUIC 连接迁移；这些功能

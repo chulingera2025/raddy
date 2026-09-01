@@ -1,11 +1,11 @@
 ---
 title: Quick start
-description: Put a local service behind Raddy, validate the configuration, and send the first request.
+description: Put a local service behind Raddex, validate the configuration, and send the first request.
 ---
 
-This guide gets a local HTTP service behind Raddy without requiring a public
+This guide gets a local HTTP service behind Raddex without requiring a public
 domain or privileged ports. It uses one terminal for the upstream and one for
-Raddy.
+Raddex.
 
 ## 1. Start an upstream
 
@@ -17,9 +17,9 @@ python3 -m http.server 8080 --bind 127.0.0.1
 
 Keep that terminal open.
 
-## 2. Write a Raddyfile
+## 2. Write a Raddexfile
 
-Create `Raddyfile`:
+Create `Raddexfile`:
 
 ```caddyfile
 example.local:8090 {
@@ -34,13 +34,13 @@ uses port 443 and enters the automatic HTTPS path, which is covered in
 ## 3. Validate before starting
 
 ```bash
-raddy check -c Raddyfile
+raddex check -c Raddexfile
 ```
 
 The command must exit with status 0 and print:
 
 ```text
-Raddyfile: ok
+Raddexfile: ok
 ```
 
 The same validation is used by a reload, so this is the right check for CI and
@@ -48,10 +48,10 @@ deployment scripts.
 
 ## 4. Run and send a request
 
-Start Raddy in a second terminal:
+Start Raddex in a second terminal:
 
 ```bash
-raddy run -c Raddyfile
+raddex run -c Raddexfile
 ```
 
 Then send a request with the site Host header:
@@ -60,7 +60,7 @@ Then send a request with the site Host header:
 curl -H 'Host: example.local' http://127.0.0.1:8090/
 ```
 
-The Host header matters because Raddy selects an HTTP site per listener. These
+The Host header matters because Raddex selects an HTTP site per listener. These
 two requests deliberately exercise the fixed fallbacks:
 
 ```bash
@@ -83,12 +83,12 @@ static.local:8090 {
 }
 ```
 
-Create a file and restart Raddy with the updated configuration:
+Create a file and restart Raddex with the updated configuration:
 
 ```bash
 mkdir -p public
-printf '%s\n' 'hello from raddy' > public/hello.txt
-raddy check -c Raddyfile
+printf '%s\n' 'hello from raddex' > public/hello.txt
+raddex check -c Raddexfile
 ```
 
 Fetch it through the second site:
@@ -101,7 +101,7 @@ For a running service, send `SIGHUP` instead of restarting. The routing
 snapshot is replaced atomically and existing connections remain open:
 
 ```bash
-kill -HUP <raddy-pid>
+kill -HUP <raddex-pid>
 ```
 
 ## Try HTTPS locally
@@ -116,8 +116,8 @@ dev.local:8443 {
 ```
 
 ```bash
-raddy check -c Raddyfile
-raddy run -c Raddyfile
+raddex check -c Raddexfile
+raddex run -c Raddexfile
 curl -k -H 'Host: dev.local' https://127.0.0.1:8443/
 ```
 

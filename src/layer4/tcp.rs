@@ -55,7 +55,7 @@ const RELAY_CHUNK: usize = 16 * 1024;
 
 /// How often hostname upstreams are re-resolved (L4 plan: refresh, keep
 /// last-known-good on a transient failure). Overridable via
-/// `RADDY_DNS_REFRESH_SECS` (a test hook). TTL-aware scheduling is a follow-up;
+/// `RADDEX_DNS_REFRESH_SECS` (a test hook). TTL-aware scheduling is a follow-up;
 /// this fixed period is a safe, simple refresh.
 const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -88,7 +88,7 @@ use std::sync::LazyLock;
 
 static ACCEPTED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_accepted_total",
+        "raddex_l4_tcp_accepted_total",
         "TCP connections accepted",
         &["listener"]
     )
@@ -96,7 +96,7 @@ static ACCEPTED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static REJECTED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_rejected_total",
+        "raddex_l4_tcp_rejected_total",
         "TCP connections rejected by the admission limit",
         &["listener"]
     )
@@ -104,7 +104,7 @@ static REJECTED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static NO_UPSTREAM: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_no_upstream_total",
+        "raddex_l4_tcp_no_upstream_total",
         "TCP connections closed because no upstream was available",
         &["listener"]
     )
@@ -112,7 +112,7 @@ static NO_UPSTREAM: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static CONNECT_FAILURES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_connect_failures_total",
+        "raddex_l4_tcp_connect_failures_total",
         "Upstream TCP connect failures",
         &["listener"]
     )
@@ -120,7 +120,7 @@ static CONNECT_FAILURES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| 
 });
 static C2U_BYTES: LazyLock<prometheus::CounterVec> = LazyLock::new(|| {
     prometheus::register_counter_vec!(
-        "raddy_l4_tcp_client_to_upstream_bytes_total",
+        "raddex_l4_tcp_client_to_upstream_bytes_total",
         "Bytes relayed client to upstream",
         &["listener"]
     )
@@ -128,7 +128,7 @@ static C2U_BYTES: LazyLock<prometheus::CounterVec> = LazyLock::new(|| {
 });
 static U2C_BYTES: LazyLock<prometheus::CounterVec> = LazyLock::new(|| {
     prometheus::register_counter_vec!(
-        "raddy_l4_tcp_upstream_to_client_bytes_total",
+        "raddex_l4_tcp_upstream_to_client_bytes_total",
         "Bytes relayed upstream to client",
         &["listener"]
     )
@@ -136,7 +136,7 @@ static U2C_BYTES: LazyLock<prometheus::CounterVec> = LazyLock::new(|| {
 });
 static IDLE_TIMEOUTS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_idle_timeouts_total",
+        "raddex_l4_tcp_idle_timeouts_total",
         "Connections closed by the inactivity timeout",
         &["listener"]
     )
@@ -144,7 +144,7 @@ static IDLE_TIMEOUTS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static SHUTDOWN_CANCELLATIONS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_shutdown_cancellations_total",
+        "raddex_l4_tcp_shutdown_cancellations_total",
         "Connections cancelled during shutdown",
         &["listener"]
     )
@@ -152,7 +152,7 @@ static SHUTDOWN_CANCELLATIONS: LazyLock<prometheus::IntCounterVec> = LazyLock::n
 });
 static DNS_REFRESH_FAILURES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_dns_refresh_failures_total",
+        "raddex_l4_tcp_dns_refresh_failures_total",
         "Background DNS refreshes that failed (last-known-good kept serving)",
         &["listener"]
     )
@@ -1223,10 +1223,10 @@ fn has_hostname_upstreams(tcp: &TcpProxyConfig) -> bool {
         .any(|u| u.host.parse::<std::net::IpAddr>().is_err())
 }
 
-/// The DNS refresh period, overridable via `RADDY_DNS_REFRESH_SECS` (a test
+/// The DNS refresh period, overridable via `RADDEX_DNS_REFRESH_SECS` (a test
 /// hook so a short-lived CI run can observe a refresh).
 fn dns_refresh_interval() -> Duration {
-    std::env::var("RADDY_DNS_REFRESH_SECS")
+    std::env::var("RADDEX_DNS_REFRESH_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_secs)

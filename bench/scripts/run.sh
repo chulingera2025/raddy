@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the containerized Nginx/Caddy/Raddy benchmark matrix.
+# Run the containerized Nginx/Caddy/Raddex benchmark matrix.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,8 +19,8 @@ export BENCH_CPUS="${BENCH_CPUS:-2.0}"
 export BENCH_MEMORY_LIMIT="${BENCH_MEMORY_LIMIT:-1g}"
 # Match the two Nginx workers under the default two-CPU benchmark quota. The
 # production CLI keeps its conservative one-worker default independently.
-export RADDY_THREADS="${RADDY_THREADS:-2}"
-PROJECT_NAME="${COMPOSE_PROJECT_NAME:-raddy-bench}"
+export RADDEX_THREADS="${RADDEX_THREADS:-2}"
+PROJECT_NAME="${COMPOSE_PROJECT_NAME:-raddex-bench}"
 COMPOSE=(docker compose --env-file "$BENCH_DIR/versions.env" -f "$BENCH_DIR/compose.yaml" -p "$PROJECT_NAME")
 
 die() {
@@ -75,13 +75,13 @@ RUN_DIR="$BENCH_DIR/results/$RUN_ID"
 RAW_DIR="$RUN_DIR/raw"
 mkdir -p "$RAW_DIR"
 
-RADDY_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+RADDEX_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || printf 'unknown')"
 if [[ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
-    RADDY_COMMIT="${RADDY_COMMIT}-dirty"
+    RADDEX_COMMIT="${RADDEX_COMMIT}-dirty"
 fi
 
 printf 'Building pinned benchmark images...\n'
-"${COMPOSE[@]}" build --pull origin loadgen reporter raddy
+"${COMPOSE[@]}" build --pull origin loadgen reporter raddex
 "${COMPOSE[@]}" pull nginx caddy
 ensure_tls_material
 
@@ -92,8 +92,8 @@ printf 'Starting the shared origin...\n'
     --bench-root /bench \
     --run-id "$RUN_ID" \
     --profile "$MODE" \
-    --raddy-commit "$RADDY_COMMIT" \
-    --raddy-threads "$RADDY_THREADS"
+    --raddex-commit "$RADDEX_COMMIT" \
+    --raddex-threads "$RADDEX_THREADS"
 
 PLAN_FILE="$RUN_DIR/plan.txt"
 "${COMPOSE[@]}" run --rm --no-deps reporter /bench/scripts/collect.py \
@@ -277,7 +277,7 @@ run_plan_point() {
     local reference_load="${13}"
     local target
 
-    for target in nginx caddy raddy; do
+    for target in nginx caddy raddex; do
         start_target "$target" "$scheme" "$protocol"
         local container_id
         container_id="$("${COMPOSE[@]}" ps -q "$target")"

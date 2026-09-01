@@ -130,7 +130,7 @@ use std::sync::LazyLock;
 
 static CLIENT_DATAGRAMS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_udp_client_datagrams_total",
+        "raddex_l4_udp_client_datagrams_total",
         "UDP datagrams received from clients",
         &["listener"]
     )
@@ -138,7 +138,7 @@ static CLIENT_DATAGRAMS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| 
 });
 static UPSTREAM_DATAGRAMS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_udp_upstream_datagrams_total",
+        "raddex_l4_udp_upstream_datagrams_total",
         "UDP datagrams sent to clients (upstream responses)",
         &["listener"]
     )
@@ -146,7 +146,7 @@ static UPSTREAM_DATAGRAMS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|
 });
 static FLOWS_CREATED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_udp_flows_created_total",
+        "raddex_l4_udp_flows_created_total",
         "UDP flows created",
         &["listener"]
     )
@@ -154,7 +154,7 @@ static FLOWS_CREATED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static CAPACITY_EVICTIONS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_udp_capacity_evictions_total",
+        "raddex_l4_udp_capacity_evictions_total",
         "UDP flows evicted because the table was full",
         &["listener"]
     )
@@ -162,7 +162,7 @@ static CAPACITY_EVICTIONS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|
 });
 static IDLE_EVICTIONS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_udp_idle_evictions_total",
+        "raddex_l4_udp_idle_evictions_total",
         "UDP flows evicted because they were idle too long",
         &["listener"]
     )
@@ -170,7 +170,7 @@ static IDLE_EVICTIONS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static OVERSIZED_DROPS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_udp_oversized_drops_total",
+        "raddex_l4_udp_oversized_drops_total",
         "UDP datagrams dropped because they exceeded max_datagram_size",
         &["listener"]
     )
@@ -178,7 +178,7 @@ static OVERSIZED_DROPS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static NO_UPSTREAM_DROPS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_udp_no_upstream_drops_total",
+        "raddex_l4_udp_no_upstream_drops_total",
         "UDP datagrams dropped because no upstream could be selected",
         &["listener"]
     )
@@ -186,7 +186,7 @@ static NO_UPSTREAM_DROPS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(||
 });
 static SOCKET_ERRORS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_udp_socket_errors_total",
+        "raddex_l4_udp_socket_errors_total",
         "UDP socket errors",
         &["listener"]
     )

@@ -1,4 +1,4 @@
-# Raddy v0.3.0 Release Checklist
+# Raddex v0.3.0 Release Checklist
 
 This is a historical record of the `v0.3.0` release. Its follow-up items and
 known limitations describe that release, not the current `v0.3.5` tree. See

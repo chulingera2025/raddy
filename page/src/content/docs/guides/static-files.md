@@ -1,6 +1,6 @@
 ---
 title: Serve static files
-description: Host a static site from disk with raddy, with compression.
+description: Host a static site from disk with raddex, with compression.
 ---
 
 ## Goal
@@ -20,7 +20,7 @@ static.example.com {
 ```
 
 `root` sets the directory; `file_server` serves it. A relative path like
-`./public` is resolved from raddy's working directory.
+`./public` is resolved from raddex's working directory.
 
 To send compressed responses, add `encode` — the first algorithm the client also
 supports wins. `gzip`, `zstd`, and Brotli (`br`) are available:
@@ -39,8 +39,8 @@ and how to choose algorithms.
 ## Run it
 
 ```bash
-raddy check -c Raddyfile
-raddy run -c Raddyfile
+raddex check -c Raddexfile
+raddex run -c Raddexfile
 ```
 
 ## What you get

@@ -1,16 +1,16 @@
 ---
 title: 核心概念
-description: Raddyfile 背后的心智模型 —— 指令如何执行、请求如何流经你的配置。
+description: Raddexfile 背后的心智模型 —— 指令如何执行、请求如何流经你的配置。
 ---
 
-Raddyfile 是 raddy 的核心:一份纯文本配置,采用 Caddyfile 风格的语法,用
-`raddy check` 校验、用 `raddy run` 服务。本页给你心智模型;[指令
+Raddexfile 是 raddex 的核心:一份纯文本配置,采用 Caddyfile 风格的语法,用
+`raddex check` 校验、用 `raddex run` 服务。本页给你心智模型;[指令
 参考](directives/)有完整语法,[站点 · 端口 · HTTPS](sites/)介绍请求如何匹配到
 站点。
 
 ## 配置一览
 
-一份 Raddyfile 由一个可选的**全局块**和若干**站点块**组成:
+一份 Raddexfile 由一个可选的**全局块**和若干**站点块**组成:
 
 ```caddyfile
 {
@@ -33,7 +33,7 @@ static.example.com {
 
 ## 两类指令
 
-请求匹配到站点后,raddy **严格按书写顺序**执行该站点的每一行。每行要么是
+请求匹配到站点后,raddex **严格按书写顺序**执行该站点的每一行。每行要么是
 终端、修饰符,要么是守卫:
 
 - **终端指令**决定*由谁服务*请求:`reverse_proxy`、`file_server`、`redir`、
@@ -45,7 +45,7 @@ static.example.com {
   它们像修饰指令一样——作用于服务该块的任意终端——并在守卫失败时拒绝请求
   (`429`、`401`)。
 
-> **Caddy 用户:** Caddy 会在后台重排指令顺序;raddy 不会。顺序由你控制,
+> **Caddy 用户:** Caddy 会在后台重排指令顺序;raddex 不会。顺序由你控制,
 > 第一个匹配者胜出。
 
 ### 匹配器选择哪些请求由指令服务

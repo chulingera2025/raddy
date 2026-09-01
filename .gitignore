@@ -10,7 +10,7 @@ CLAUDE.md
 /data/
 
 # ACME certificates and account credentials
-/raddy_certs
+/raddex_certs
 
 # Pebble test server artifacts (download + generated certs/config/logs)
 /tests/pebble/pebble*.tar.gz

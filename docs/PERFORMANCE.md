@@ -1,7 +1,7 @@
 # Performance comparison
 
 The supported cross-proxy benchmark lives in [`bench/`](../bench/). It runs
-Nginx, Caddy, and Raddy in isolated Docker target runs and compares them against
+Nginx, Caddy, and Raddex in isolated Docker target runs and compares them against
 the same origin and scenario definition.
 
 ## Run the suite
@@ -47,4 +47,4 @@ separate protocol or feature benchmarks with their own fairness definition.
 
 The existing `examples/loadtest.rs` remains useful as a small developer smoke
 test, but it uses a fresh connection per request and is not the formal
-Nginx/Caddy/Raddy comparison benchmark.
+Nginx/Caddy/Raddex comparison benchmark.

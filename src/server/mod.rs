@@ -15,7 +15,7 @@
 //! zero-downtime binary upgrade.
 //!
 //! Reload never changes listener topology (ADR-010); topology changes go through
-//! the zero-downtime binary upgrade (`raddy upgrade`, ADR-008).
+//! the zero-downtime binary upgrade (`raddex upgrade`, ADR-008).
 
 pub mod acme;
 pub mod cli;

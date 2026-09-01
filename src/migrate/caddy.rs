@@ -11,20 +11,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Caddyfile → Raddyfile converter (common subset, ARCHITECTURE §7).
+//! Caddyfile → Raddexfile converter (common subset, ARCHITECTURE §7).
 //!
 //! The supported subset is intentionally small: single-domain sites with
 //! `reverse_proxy` (inline or `to` block form), `root` + `file_server`,
 //! `handle` blocks, `header_up`/`header_down`, `encode`, and `redir`. Anything
 //! else is skipped and reported as a warning so no config is silently dropped.
-//! Raddy's site address and placeholder semantics differ slightly from Caddy's,
+//! Raddex's site address and placeholder semantics differ slightly from Caddy's,
 //! so the converter approximates: `http://` becomes an explicit `:80` port,
-//! Caddy placeholders are mapped to the Raddy equivalents, and a `redir`
+//! Caddy placeholders are mapped to the Raddex equivalents, and a `redir`
 //! without a status code gets Caddy's default `temporary` (302).
 
 use super::{parse_stmts, Converted, Stmt};
 
-/// Convert a Caddyfile to a Raddyfile.
+/// Convert a Caddyfile to a Raddexfile.
 pub fn convert(input: &str) -> Result<Converted, String> {
     let lines: Vec<&str> = input.lines().collect();
     let stmts = parse_stmts(&lines)?;
@@ -49,7 +49,7 @@ pub fn convert(input: &str) -> Result<Converted, String> {
         conv.site(stmt);
     }
     Ok(Converted {
-        raddyfile: conv.out,
+        raddexfile: conv.out,
         warnings: conv.warnings,
     })
 }
@@ -128,7 +128,7 @@ impl CaddyConv {
             "redir" => self.redir(stmt, out, &pad),
             "tls" => self.warn(
                 stmt.line,
-                "tls directive skipped; raddy handles certificates via ACME automatically",
+                "tls directive skipped; raddex handles certificates via ACME automatically",
             ),
             other => self.warn(
                 stmt.line,
@@ -139,7 +139,7 @@ impl CaddyConv {
 
     fn header(&mut self, stmt: &Stmt, out: &mut String, pad: &str, name: &str) {
         let mut args = stmt.words[1..].to_vec();
-        // Caddy allows an inline matcher (`header_up /api/* X-Foo bar`); Raddy
+        // Caddy allows an inline matcher (`header_up /api/* X-Foo bar`); Raddex
         // header directives have none, so a leading `/`-path is dropped.
         if args.first().map(|w| w.starts_with('/')).unwrap_or(false) {
             self.warn(stmt.line, "inline matcher on header directive dropped");
@@ -202,7 +202,7 @@ impl CaddyConv {
                 return;
             }
         };
-        // Caddy's default is 302 (temporary); Raddy's is 308, so be explicit.
+        // Caddy's default is 302 (temporary); Raddex's is 308, so be explicit.
         out.push_str(&format!(
             "{pad}redir {target} {}\n",
             code.unwrap_or_else(|| "temporary".into())
@@ -237,7 +237,7 @@ impl CaddyConv {
                     targets[0]
                 ));
             } else {
-                // Raddy's inline form takes one target; several need `to`.
+                // Raddex's inline form takes one target; several need `to`.
                 out.push_str(&format!("{pad}reverse_proxy {matcher_prefix}{{\n"));
                 out.push_str(&format!("{pad}    to {}\n", targets.join(" ")));
                 out.push_str(&format!("{pad}}}\n"));
@@ -301,7 +301,7 @@ impl CaddyConv {
     }
 }
 
-/// Map a Caddy site address to a Raddy site key.
+/// Map a Caddy site address to a Raddex site key.
 fn map_site_addr(words: &[String]) -> Result<String, String> {
     let joined = words.join("");
     let first = joined.split(',').next().unwrap_or("").trim();
@@ -313,7 +313,7 @@ fn map_site_addr(words: &[String]) -> Result<String, String> {
         None => (None, first),
     };
     match scheme {
-        // `http://` implies plain HTTP on 80; Raddy named sites default to 443.
+        // `http://` implies plain HTTP on 80; Raddex named sites default to 443.
         Some("http") if !rest.contains(':') => Ok(format!("{rest}:80")),
         Some("https") if !rest.contains(':') => Ok(rest.to_string()),
         Some(other) => Err(format!("unsupported site scheme '{other}'")),
@@ -322,7 +322,7 @@ fn map_site_addr(words: &[String]) -> Result<String, String> {
 }
 
 /// Normalize a reverse-proxy upstream: strip the `http://` scheme, keep the
-/// `https://` scheme (raddy supports TLS upstreams, spec §5.4), default the
+/// `https://` scheme (raddex supports TLS upstreams, spec §5.4), default the
 /// port, and drop any URI path (unusual for Caddy; dropped like nginx).
 fn normalize_upstream(target: &str) -> Result<String, String> {
     if target.starts_with('[') {
@@ -347,7 +347,7 @@ fn normalize_upstream(target: &str) -> Result<String, String> {
     }
 }
 
-/// Map Caddy `{...}` placeholders to their Raddy equivalents.
+/// Map Caddy `{...}` placeholders to their Raddex equivalents.
 fn map_value(raw: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = raw;
@@ -392,7 +392,7 @@ mod tests {
     fn converts_simple_reverse_proxy() {
         let c = convert("example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n").unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n"
         );
         assert!(
@@ -406,7 +406,7 @@ mod tests {
     fn http_scheme_becomes_explicit_port_80() {
         let c = convert("http://example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n").unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com:80 {\n    reverse_proxy 127.0.0.1:8080\n}\n"
         );
     }
@@ -415,7 +415,7 @@ mod tests {
     fn redir_without_code_defaults_to_temporary() {
         let c = convert(":80 {\n    redir https://{host}{uri}\n}\n").unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             ":80 {\n    redir https://{host}{uri} temporary\n}\n"
         );
     }
@@ -425,7 +425,7 @@ mod tests {
         let c =
             convert("example.com {\n    reverse_proxy 127.0.0.1:8080 127.0.0.1:8081\n}\n").unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com {\n    reverse_proxy {\n        to 127.0.0.1:8080 127.0.0.1:8081\n    }\n}\n"
         );
     }
@@ -435,7 +435,7 @@ mod tests {
         let input = "example.com {\n    handle /static/* {\n        root /var/www/static\n        file_server\n    }\n    reverse_proxy /api/* 127.0.0.1:9000\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com {\n    handle /static/* {\n        root /var/www/static\n        file_server\n    }\n    reverse_proxy /api/* 127.0.0.1:9000\n}\n"
         );
     }
@@ -444,16 +444,16 @@ mod tests {
     fn root_star_matcher_is_dropped() {
         let c = convert("example.com {\n    root * /var/www/html\n    file_server\n}\n").unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com {\n    root /var/www/html\n    file_server\n}\n"
         );
     }
 
     #[test]
-    fn caddy_placeholders_map_to_raddy() {
+    fn caddy_placeholders_map_to_raddex() {
         let input = "example.com {\n    header_up X-Real-IP {http.request.remote}\n    reverse_proxy 127.0.0.1:8080\n}\n";
         let c = convert(input).unwrap();
-        assert!(c.raddyfile.contains("header_up X-Real-IP {remote_host}"));
+        assert!(c.raddexfile.contains("header_up X-Real-IP {remote_host}"));
         assert!(c.warnings.is_empty());
     }
 
@@ -461,8 +461,8 @@ mod tests {
     fn tls_directive_warns_and_is_skipped() {
         let c = convert("example.com {\n    tls internal\n    reverse_proxy 127.0.0.1:8080\n}\n")
             .unwrap();
-        assert!(c.raddyfile.contains("reverse_proxy"));
-        assert!(!c.raddyfile.contains("tls"));
+        assert!(c.raddexfile.contains("reverse_proxy"));
+        assert!(!c.raddexfile.contains("tls"));
         assert!(c
             .warnings
             .iter()
@@ -474,7 +474,7 @@ mod tests {
         let c =
             convert("example.com {\n    reverse_proxy 127.0.0.1:8080\n    websocket\n}\n").unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n"
         );
         assert!(c
@@ -488,7 +488,7 @@ mod tests {
         let input =
             "{\n    email ops@example.com\n}\nexample.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
         let c = convert(input).unwrap();
-        assert!(c.raddyfile.contains("example.com"));
+        assert!(c.raddexfile.contains("example.com"));
         assert!(c
             .warnings
             .iter()
@@ -498,16 +498,16 @@ mod tests {
     #[test]
     fn site_with_nothing_convertible_is_skipped() {
         let c = convert("example.com {\n    websocket /path\n}\n").unwrap();
-        assert!(c.raddyfile.trim().is_empty());
+        assert!(c.raddexfile.trim().is_empty());
         assert!(!c.warnings.is_empty());
     }
 
     #[test]
     fn https_upstream_is_converted_with_scheme() {
-        // raddy supports `https://` upstreams (spec §5.4), so the converter
+        // raddex supports `https://` upstreams (spec §5.4), so the converter
         // passes the TLS target through rather than skipping it.
         let c = convert("example.com {\n    reverse_proxy https://127.0.0.1:8443\n}\n").unwrap();
-        assert!(c.raddyfile.contains("https://127.0.0.1:8443"));
+        assert!(c.raddexfile.contains("https://127.0.0.1:8443"));
         assert!(c.warnings.iter().all(|w| !w.contains("https upstream")));
     }
 
@@ -515,17 +515,17 @@ mod tests {
     fn https_upstream_defaults_to_port_443() {
         // A portless https target defaults to 443, not 80 (P1).
         let c = convert("example.com {\n    reverse_proxy https://backend.example\n}\n").unwrap();
-        assert!(c.raddyfile.contains("https://backend.example:443"));
+        assert!(c.raddexfile.contains("https://backend.example:443"));
         // A portless plain target still defaults to 80.
         let c = convert("example.com {\n    reverse_proxy http://backend.example\n}\n").unwrap();
-        assert!(c.raddyfile.contains("reverse_proxy backend.example:80"));
+        assert!(c.raddexfile.contains("reverse_proxy backend.example:80"));
     }
 
     #[test]
     fn plain_http_upstream_scheme_is_stripped() {
         let c = convert("example.com {\n    reverse_proxy http://127.0.0.1:8080\n}\n").unwrap();
-        assert!(c.raddyfile.contains("reverse_proxy 127.0.0.1:8080"));
-        assert!(!c.raddyfile.contains("http://"));
+        assert!(c.raddexfile.contains("reverse_proxy 127.0.0.1:8080"));
+        assert!(!c.raddexfile.contains("http://"));
     }
 
     #[test]

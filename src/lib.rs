@@ -11,12 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Raddy — a minimal high-performance reverse proxy gateway built on Pingora.
+//! Raddex — a minimal high-performance reverse proxy gateway built on Pingora.
 //!
 //! The crate is organized as a library (modules consumed by the integration
 //! tests) plus a thin binary entry point:
 //!
-//! * [`config`] — Raddyfile parsing (incl. `import`/snippets/`{$ENV}`), validation,
+//! * [`config`] — Raddexfile parsing (incl. `import`/snippets/`{$ENV}`), validation,
 //!   and the atomic config snapshot.
 //! * [`proxy`] — the Pingora request plane: site selection, matchers, guards,
 //!   load balancing, compression, and forwarding.
@@ -24,7 +24,7 @@
 //! * [`tls`] — certificate store, the SNI dynamic-certificate callback, and the
 //!   per-site `tls` options.
 //! * [`observ`] — Prometheus metrics.
-//! * [`migrate`] — Caddyfile/nginx.conf → Raddyfile converter (ARCHITECTURE §7).
+//! * [`migrate`] — Caddyfile/nginx.conf → Raddexfile converter (ARCHITECTURE §7).
 
 pub mod config;
 pub mod layer4;

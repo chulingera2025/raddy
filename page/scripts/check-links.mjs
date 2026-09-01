@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Deterministic internal-link checker for the Raddy Starlight docs site.
+ * Deterministic internal-link checker for the Raddex Starlight docs site.
  *
  * Scans every page under `src/content/docs/` and verifies that each internal
  * (site-relative) link resolves to an existing content page. External links,
@@ -9,7 +9,7 @@
  * The custom 404 fallback page (`src/pages/404.astro`) is checked separately:
  * it is served at whatever URL the visitor landed on, so every internal link in
  * it MUST be an absolute site-root path carrying the `base` prefix
- * (`/raddy/...`) and must resolve to an existing page. Link targets are derived
+ * (`/raddex/...`) and must resolve to an existing page. Link targets are derived
  * from the file's own contents — there is no separately maintained list of
  * links to keep in sync.
  *
@@ -35,10 +35,10 @@ const CONTENT_ROOT = join(PAGE_ROOT, 'src', 'content', 'docs');
 // Custom 404 fallback page (see `disable404Route` in astro.config.mjs).
 const CUSTOM_404 = join(PAGE_ROOT, 'src', 'pages', '404.astro');
 // Site `base` from astro.config.mjs; a fully qualified internal link may carry
-// it as a prefix (`/raddy/quickstart/`), which is stripped before resolution.
-const SITE_BASE = '/raddy/';
-// Matches the `base` as a path segment (`/raddy` followed by `/` or end), so
-// stripping it turns `/raddy/quickstart/` into `/quickstart/` (and `/raddy/`
+// it as a prefix (`/raddex/quickstart/`), which is stripped before resolution.
+const SITE_BASE = '/raddex/';
+// Matches the `base` as a path segment (`/raddex` followed by `/` or end), so
+// stripping it turns `/raddex/quickstart/` into `/quickstart/` (and `/raddex/`
 // into `/`). Keep `SITE_BASE` in sync with astro.config.mjs.
 const BASE_PREFIX_RE = new RegExp(`^${SITE_BASE.replace(/\/$/, '')}(?=/|$)`);
 
@@ -145,7 +145,7 @@ function scanLinks({ file, base, lookup, requireBase = false }) {
 		const { line, column } = positionOf(text, match.index);
 		// Links on the 404 page must carry the `base` prefix; otherwise they
 		// resolve against the missing URL the page is served at and break (e.g.
-		// `../` on `/raddy/missing` jumps to the domain root, not `/raddy/`).
+		// `../` on `/raddex/missing` jumps to the domain root, not `/raddex/`).
 		if (requireBase && !url.startsWith(SITE_BASE)) {
 			findings.push({ file, line, column, url, target: '(relative link in 404 page)' });
 			return;

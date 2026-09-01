@@ -3,7 +3,7 @@
 The filename is retained as a compatibility path for existing links. This file
 replaces the historical implementation plan with the current runtime contract
 for TCP and UDP listeners. The user-facing syntax is documented in the
-[Layer 4 guide](https://chulingera2025.github.io/raddy/guides/layer4/); this
+[Layer 4 guide](https://chulingera2025.github.io/raddex/guides/layer4/); this
 document records the invariants that should remain true when the subsystem
 changes.
 
@@ -12,7 +12,7 @@ changes.
 ```text
 HTTP sites     -> Pingora HTTP proxy
 TCP listeners  -> Pingora ServerApp over raw streams
-UDP listeners  -> Tokio UdpSocket and Raddy flow table
+UDP listeners  -> Tokio UdpSocket and Raddex flow table
 ```
 
 TCP and UDP are separate configuration types and separate listener identities.
@@ -70,7 +70,7 @@ rather than silently dropping active flows.
 
 HTTP and Layer 4 records are distinct. TCP and UDP access records include a
 listener identity and normalized outcome; Prometheus metrics use the
-`raddy_l4_tcp_*` and `raddy_l4_udp_*` families. The flow table must remain
+`raddex_l4_tcp_*` and `raddex_l4_udp_*` families. The flow table must remain
 bounded even when an upstream is unavailable or DNS resolution is slow.
 
 ## Explicit non-goals
@@ -80,5 +80,5 @@ bounded even when an upstream is unavailable or DNS resolution is slow.
 - Cluster-wide rate limiting or shared flow state.
 - A claim that UDP passthrough provides QUIC connection migration.
 
-Future changes should preserve these boundaries or update the Raddyfile
+Future changes should preserve these boundaries or update the Raddexfile
 specification, capability matrix, and integration tests in the same change.

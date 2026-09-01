@@ -51,8 +51,8 @@ api.example.com {
 ## 运行
 
 ```bash
-raddy check -c Raddyfile
-raddy run -c Raddyfile
+raddex check -c Raddexfile
+raddex run -c Raddexfile
 ```
 
 ## 你能得到什么
@@ -60,7 +60,7 @@ raddy run -c Raddyfile
 - **分发** —— 连续请求交替落在 `10.0.0.1:8000` 与 `10.0.0.2:8000`。
 - **故障转移** —— 停掉一个后端;经过 `consecutive_failures` 次探测后它被
   摘除,流量转向健康实例。重启后经过 `consecutive_successes` 次成功自动回流。
-- **全挂** —— 若*每个*上游都不健康,raddy 返回 **`502 Bad Gateway`**,而不是
+- **全挂** —— 若*每个*上游都不健康,raddex 返回 **`502 Bad Gateway`**,而不是
   静默黑洞请求。
 - **限流** —— 超限客户端收到 `429`;健康状态与令牌桶跨 SIGHUP 重载存活。
 
@@ -78,7 +78,7 @@ chat.example.com {
 }
 ```
 
-上游应答 `101 Switching Protocols` 后,raddy 便隧道该连接;后端本身必须能说
+上游应答 `101 Switching Protocols` 后,raddex 便隧道该连接;后端本身必须能说
 升级后的协议。`encode` 绝不作用于升级响应。协议升级见[指令参考](../../config/directives/#websocket-and-protocol-upgrades)。
 
 **不同路径** —— 与 `handle` 组合,可在同一主机上为 API 限流、负载均衡,同时

@@ -36,8 +36,8 @@ example.com {
 ## 运行
 
 ```bash
-raddy check -c Raddyfile
-raddy run -c Raddyfile
+raddex check -c Raddexfile
+raddex run -c Raddexfile
 ```
 
 ## 你能得到什么

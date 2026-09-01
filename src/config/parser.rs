@@ -11,11 +11,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Raddyfile parser (minimal M2 subset), strictly per `RADDYFILE_SPEC`.
+//! Raddexfile parser (minimal M2 subset), strictly per `RADDEXFILE_SPEC`.
 //!
 //! Line-oriented grammar: one directive per line; a directive that opens a
 //! block ends its line with `{`, and the block closes with `}` on its own
-//! line. Unsupported syntax must be documented in `RADDYFILE_SPEC.md` before
+//! line. Unsupported syntax must be documented in `RADDEXFILE_SPEC.md` before
 //! being implemented here (CONTRIBUTING red line).
 
 use crate::config::ast::*;
@@ -36,14 +36,14 @@ const MAX_IMPORT_DEPTH: usize = 32;
 /// config with ~100k nested braces cannot exhaust the stack (SECURITY.md).
 const MAX_BLOCK_DEPTH: usize = 100;
 
-/// Parse a Raddyfile into its source AST.
+/// Parse a Raddexfile into its source AST.
 ///
 /// The input is preprocessed before the grammar parse (spec §5.12): `{$ENV}`
 /// placeholders are expanded from the environment (at the token level, so a
 /// value cannot change the configuration structure), `(name)` snippet
 /// definitions are captured, and `import` statements are spliced in
 /// (recursively).
-pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
+pub fn parse(file: &str, input: &str) -> Result<Raddexfile, ConfigError> {
     let tokens = lex(input).map_err(|message| ConfigError::Parse {
         file: file.to_string(),
         line: 1,
@@ -74,7 +74,7 @@ pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
         stmt_pos: (1, 1),
         depth: 0,
     }
-    .parse_raddyfile()
+    .parse_raddexfile()
 }
 
 /// Expand `{$ENV}` placeholders at the token level (spec §5.12): every
@@ -534,7 +534,7 @@ impl<'a> Parser<'a> {
         Ok((words, block_open))
     }
 
-    fn parse_raddyfile(&mut self) -> Result<Raddyfile, ConfigError> {
+    fn parse_raddexfile(&mut self) -> Result<Raddexfile, ConfigError> {
         let mut global = GlobalConfig::default();
 
         // Skip leading newlines (comment-only lines lex to newlines) before
@@ -618,7 +618,7 @@ impl<'a> Parser<'a> {
                 _ => sites.extend(self.parse_site(&words, block_open)?),
             }
         }
-        Ok(Raddyfile {
+        Ok(Raddexfile {
             global,
             sites,
             layer4,
@@ -2433,12 +2433,12 @@ mod tests {
         // The spec §5.12 example: `reverse_proxy https://{$BACKEND_HOST}:8443`
         // must expand to a single upstream target, not a three-argument parse
         // error (P1).
-        std::env::set_var("RADDY_TEST_EMBEDDED_UPSTREAM", "127.0.0.1");
+        std::env::set_var("RADDEX_TEST_EMBEDDED_UPSTREAM", "127.0.0.1");
         let parsed = parse(
             "test",
-            ":8080 {\n    reverse_proxy https://{$RADDY_TEST_EMBEDDED_UPSTREAM}:8443\n}\n",
+            ":8080 {\n    reverse_proxy https://{$RADDEX_TEST_EMBEDDED_UPSTREAM}:8443\n}\n",
         );
-        std::env::remove_var("RADDY_TEST_EMBEDDED_UPSTREAM");
+        std::env::remove_var("RADDEX_TEST_EMBEDDED_UPSTREAM");
         let rf = parsed.unwrap();
         match &rf.sites[0].directives[0] {
             Directive::ReverseProxy { to, .. } => {
@@ -2455,14 +2455,14 @@ mod tests {
     fn adjacent_env_placeholders_merge_into_one_word() {
         // Two adjacent `{$A}{$B}` placeholders (plus a trailing fragment) are
         // one logical argument; each placeholder expands.
-        std::env::set_var("RADDY_TEST_A", "a");
-        std::env::set_var("RADDY_TEST_B", "b");
+        std::env::set_var("RADDEX_TEST_A", "a");
+        std::env::set_var("RADDEX_TEST_B", "b");
         let parsed = parse(
             "test",
-            ":8080 {\n    redir https://{$RADDY_TEST_A}{$RADDY_TEST_B}.example.com\n}\n",
+            ":8080 {\n    redir https://{$RADDEX_TEST_A}{$RADDEX_TEST_B}.example.com\n}\n",
         );
-        std::env::remove_var("RADDY_TEST_A");
-        std::env::remove_var("RADDY_TEST_B");
+        std::env::remove_var("RADDEX_TEST_A");
+        std::env::remove_var("RADDEX_TEST_B");
         let rf = parsed.unwrap();
         match &rf.sites[0].directives[0] {
             Directive::Redir { to, code } => {
@@ -3134,7 +3134,7 @@ mod tests {
         }
     }
 
-    /// A charset mixing Raddyfile tokens, whitespace, braces, comments, and
+    /// A charset mixing Raddexfile tokens, whitespace, braces, comments, and
     /// multi-byte UTF-8 (non-ASCII hosts/values must not panic the lexer).
     const FUZZ_CHARS: &[char] = &[
         'a', 'b', 'z', '0', '9', ':', '/', '.', '{', '}', '#', '\n', ' ', '\t', '@', '-', '_', '*',
@@ -3351,7 +3351,7 @@ mod tests {
     fn snippet_import_is_spliced() {
         // A `(name)` definition is captured and `import name` splices it
         // (spec §5.12), including inside a site block.
-        let input = "(base) {\n    header_up X-Raddy yes\n}\n:8080 {\n    import base\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let input = "(base) {\n    header_up X-Raddex yes\n}\n:8080 {\n    import base\n    reverse_proxy 127.0.0.1:9000\n}\n";
         let rf = parse("test", input).unwrap();
         assert_eq!(rf.sites.len(), 1);
         let directives = &rf.sites[0].directives;
@@ -3363,7 +3363,7 @@ mod tests {
     #[test]
     fn file_import_is_spliced() {
         let dir = std::env::temp_dir();
-        let imported = dir.join(format!("raddy_import_{}.Raddyfile", std::process::id()));
+        let imported = dir.join(format!("raddex_import_{}.Raddexfile", std::process::id()));
         std::fs::write(&imported, "reverse_proxy 127.0.0.1:9000\n").unwrap();
         let input = format!(":8080 {{\n    import {}\n}}\n", imported.display());
         let rf = parse("test", &input).unwrap();
@@ -3379,7 +3379,7 @@ mod tests {
     fn missing_import_file_is_an_error() {
         let err = parse(
             "test",
-            ":8080 {\n    import /nonexistent/raddy_import_file\n}\n",
+            ":8080 {\n    import /nonexistent/raddex_import_file\n}\n",
         )
         .unwrap_err();
         assert!(err.to_string().contains("failed to read imported file"));
@@ -3387,7 +3387,7 @@ mod tests {
 
     #[test]
     fn parses_global_access_log_directive() {
-        let input = "{\n    access_log /tmp/raddy.log format=common\n}\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let input = "{\n    access_log /tmp/raddex.log format=common\n}\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n";
         let rf = parse("test", input).unwrap();
         assert!(matches!(
             rf.global.access_log,
@@ -3445,8 +3445,8 @@ mod tests {
     #[test]
     fn import_cycle_is_detected_via_canonical_path() {
         let dir = std::env::temp_dir();
-        let a = dir.join(format!("raddy_cycle_a_{}.Raddyfile", std::process::id()));
-        let b = dir.join(format!("raddy_cycle_b_{}.Raddyfile", std::process::id()));
+        let a = dir.join(format!("raddex_cycle_a_{}.Raddexfile", std::process::id()));
+        let b = dir.join(format!("raddex_cycle_b_{}.Raddexfile", std::process::id()));
         let a_name = a.file_name().unwrap().to_str().unwrap().to_string();
         let b_name = b.file_name().unwrap().to_str().unwrap().to_string();
         // Textually different `./` prefixes still canonicalize to the same file,

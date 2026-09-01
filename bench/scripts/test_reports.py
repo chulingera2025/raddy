@@ -72,7 +72,7 @@ class CollectionTests(unittest.TestCase):
         for target, qps, p99, cpu, memory in (
             ("nginx", 1000, 2, 1, 100),
             ("caddy", 900, 3, 2, 120),
-            ("raddy", 1100, 1.5, 0.8, 90),
+            ("raddex", 1100, 1.5, 0.8, 90),
         ):
             for repetition in (1, 2, 3):
                 records.append(

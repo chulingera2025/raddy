@@ -13,8 +13,8 @@ assignees: chulingera2025
 
 ## Proposed behavior
 
-<!-- For a new Raddyfile directive: the proposed syntax and semantics.
-     NOTE the spec-first red line: `docs/RADDYFILE_SPEC.md` is the source of
+<!-- For a new Raddexfile directive: the proposed syntax and semantics.
+     NOTE the spec-first red line: `docs/RADDEXFILE_SPEC.md` is the source of
      truth and MUST be updated (and reviewed) before the syntax is implemented.
      Link the spec section this would extend (e.g. §4 trusted_proxies, §8 Todo). -->
 
@@ -39,4 +39,4 @@ assignees: chulingera2025
 
 ## Related
 
-<!-- Link the ROADMAP milestone and/or RADDYFILE_SPEC section. -->
+<!-- Link the ROADMAP milestone and/or RADDEXFILE_SPEC section. -->

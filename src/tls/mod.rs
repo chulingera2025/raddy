@@ -93,7 +93,7 @@ impl CertStore {
     /// Hostnames whose certificate expires on or before `before` — candidates
     /// for renewal. Only ACME-managed certificates are candidates: an
     /// operator-supplied (`tls internal` / static) certificate is the
-    /// operator's to rotate, never re-issued by raddy. Unknown expiry
+    /// operator's to rotate, never re-issued by raddex. Unknown expiry
     /// (unparsable `notAfter`) is treated as never due rather than hammering
     /// ACME on every scan.
     pub fn hosts_due_renewal(&self, before: SystemTime) -> Vec<String> {

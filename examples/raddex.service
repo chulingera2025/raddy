@@ -1,29 +1,29 @@
-# Raddy systemd unit example.
+# Raddex systemd unit example.
 #
 # Install:
-#   sudo install -Dm644 examples/raddy.service /etc/systemd/system/raddy.service
+#   sudo install -Dm644 examples/raddex.service /etc/systemd/system/raddex.service
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now raddy
+#   sudo systemctl enable --now raddex
 #
 # Automatic HTTPS binds :80 and :443 (the implicit HTTP-01 listener and the TLS
 # listener), so the service runs as root (or grant CAP_NET_BIND_SERVICE).
-# The ACME cert-dir and the config are expected under /etc/raddy; adjust paths
-# to taste. A SIGHUP reloads the config (raddy hot reload); the config file
+# The ACME cert-dir and the config are expected under /etc/raddex; adjust paths
+# to taste. A SIGHUP reloads the config (raddex hot reload); the config file
 # lives outside the hardened read-only paths, so edit it directly.
 
 [Unit]
-Description=Raddy reverse proxy gateway
-Documentation=https://github.com/chulingera2025/raddy
+Description=Raddex reverse proxy gateway
+Documentation=https://github.com/chulingera2025/raddex
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/raddy run \
-    -c /etc/raddy/Raddyfile \
-    --cert-dir /var/lib/raddy/certs \
-    --pidfile /run/raddy.pid \
-    --upgrade-sock /run/raddy_upgrade.sock
+ExecStart=/usr/local/bin/raddex run \
+    -c /etc/raddex/Raddexfile \
+    --cert-dir /var/lib/raddex/certs \
+    --pidfile /run/raddex.pid \
+    --upgrade-sock /run/raddex_upgrade.sock
 # SIGHUP = hot reload (the routing snapshot is swapped atomically).
 ExecReload=/bin/kill -HUP $MAINPID
 # SIGTERM = graceful shutdown (drains in-flight requests, pingora default).
@@ -31,9 +31,9 @@ KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=3
 
-# Zero-downtime binary upgrade (optional): run `raddy upgrade` with the *new*
+# Zero-downtime binary upgrade (optional): run `raddex upgrade` with the *new*
 # binary and the same flags, then:
-#   sudo systemctl start raddy   # the replacement takes over the listeners
+#   sudo systemctl start raddex   # the replacement takes over the listeners
 # The old process exits after handing off; `systemctl` sees it as a normal
 # restart. Requires the ExecStart flags above to match exactly.
 

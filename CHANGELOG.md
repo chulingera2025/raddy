@@ -1,13 +1,37 @@
 # Changelog
 
-All notable changes to Raddy are documented here, newest first. Releases are
+All notable changes to Raddex are documented here, newest first. Releases are
 tagged `v*`; this file follows [Keep a Changelog](https://keepachangelog.com/)'s
 shape (Added / Changed / Fixed), though the project keeps the "Unreleased"
 section short.
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Changed
+
+- **Renamed the project from `raddy` to `raddex`.** The crate `raddy` on
+  crates.io is an unrelated automatic-differentiation library, so the old name
+  could never be published or installed with `cargo install`. `raddex` is
+  unclaimed on both crates.io and GitHub. This renames the binary, the crate,
+  the config file, the metric prefix, the environment variables, and the
+  default paths:
+
+  | Before | After |
+  | --- | --- |
+  | `raddy` binary and crate | `raddex` |
+  | `Raddyfile` | `Raddexfile` |
+  | `raddy_*` Prometheus metrics | `raddex_*` |
+  | `RADDY_*` environment variables | `RADDEX_*` |
+  | `raddy_certs/` default cert dir | `raddex_certs/` |
+  | `/tmp/raddy_upgrade.sock` | `/tmp/raddex_upgrade.sock` |
+  | `/etc/raddy/`, `raddy.service` | `/etc/raddex/`, `raddex.service` |
+  | `docs/RADDYFILE_SPEC.md` | `docs/RADDEXFILE_SPEC.md` |
+
+  A config named `Raddyfile` is still loaded when no `Raddexfile` sits beside
+  it, with a deprecation warning. **This fallback is removed in `v0.4.0`** —
+  rename the file. Nothing else falls back: Prometheus dashboards scraping
+  `raddy_*` and units referencing `/etc/raddy/` must be updated at upgrade
+  time. Existing GitHub URLs keep working through GitHub's rename redirect.
 
 ## [v0.3.5] — 2026-08-26
 
@@ -53,7 +77,7 @@ No unreleased changes yet.
   `lb_policy` (round-robin/random/source-IP hash), `connect_timeout` /
   `idle_timeout` (a true inactivity timeout reset by traffic in either
   direction), `max_connections` admission, and active TCP-connect `health_check`
-  probes. IPv6 addresses supported. Prometheus metrics (`raddy_l4_tcp_*`) and
+  probes. IPv6 addresses supported. Prometheus metrics (`raddex_l4_tcp_*`) and
   typed JSON access records per closed connection. A SIGHUP reload applies the
   new upstream set/policy/limits to new connections (existing ones keep their
   upstream); a reload that changes the listener *topology* is rejected.
@@ -66,11 +90,11 @@ No unreleased changes yet.
   per-client flows (connected upstream sockets demultiplex responses),
   source-IP-hash stickiness, bounded flow tables (capacity + idle eviction),
   oversized-datagram accounting, configurable socket buffers, and typed flow
-  records (`raddy_l4_udp_*`). UDP and TCP may share a port. Zero-downtime
+  records (`raddex_l4_udp_*`). UDP and TCP may share a port. Zero-downtime
   upgrades do not transfer UDP flows (documented restart path).
 - **Layer-4 DNS refresh** (L4 plan): hostname upstreams are re-resolved
   periodically; the resolved set is swapped for new connections only, and a
-  transient refresh failure keeps last-known-good (`raddy_l4_tcp_dns_refresh_failures_total`).
+  transient refresh failure keeps last-known-good (`raddex_l4_tcp_dns_refresh_failures_total`).
 - **Implicit HTTP-01 listener on :80.** A config with named sites but no site on
   port 80 now binds a plain-HTTP `:80` listener that serves only the ACME
   challenge, so automatic HTTPS actually completes without an explicit `:80`
@@ -80,7 +104,7 @@ No unreleased changes yet.
   uncompressed — the codec framing made them larger than the payload.
 - **Hidden files are never served by `file_server`.** Any path segment starting
   with `.` (`.env`, `.git/`, `.htaccess`) is rejected with 404.
-- CHANGELOG.md, plus a `raddy.service` systemd unit example.
+- CHANGELOG.md, plus a `raddex.service` systemd unit example.
 
 ### Changed
 
@@ -112,7 +136,7 @@ No unreleased changes yet.
   (A4).
 - **Malformed Host ports are a 400.** `Host: example.com:notaport` no longer
   silently strips the port and matches the named site (RFC 9112 §3.2).
-- **HTTP/2 requests are routed correctly.** raddy advertises `h2` but site
+- **HTTP/2 requests are routed correctly.** raddex advertises `h2` but site
   selection read only the `Host` header, which HTTP/2 clients do not send (the
   authority travels in the `:authority` pseudo-header) — so every HTTP/2 request
   fell through to a 400. The handler now falls back to the URI authority.
@@ -156,21 +180,21 @@ No unreleased changes yet.
 
 - `rate_limit remote_ip` single-node token-bucket limiting with `trusted_proxies`
   (the real-client-IP trust model).
-- `raddy import caddyfile|nginx` migration tool.
+- `raddex import caddyfile|nginx` migration tool.
 - Community workflows (issue/PR templates, CODEOWNERS).
 
 ## [v0.1.0] — 2026-08-05
 
 ### Added
 
-- Initial release: Raddyfile DSL, `reverse_proxy`, `file_server`, `encode`,
+- Initial release: Raddexfile DSL, `reverse_proxy`, `file_server`, `encode`,
   `redir`, SIGHUP hot reload, ACME automatic HTTPS (HTTP-01, verified against
   Pebble), structured access log, Prometheus metrics, release installer.
 
-[Unreleased]: https://github.com/chulingera2025/raddy/compare/v0.3.5...HEAD
-[v0.3.5]: https://github.com/chulingera2025/raddy/compare/v0.3.0...v0.3.5
-[v0.3.0]: https://github.com/chulingera2025/raddy/compare/v0.2.10...v0.3.0
-[v0.2.10]: https://github.com/chulingera2025/raddy/compare/v0.2.1...v0.2.10
-[v0.2.1]: https://github.com/chulingera2025/raddy/compare/v0.1.2...v0.2.1
-[v0.1.2]: https://github.com/chulingera2025/raddy/compare/v0.1.0...v0.1.2
-[v0.1.0]: https://github.com/chulingera2025/raddy/releases/tag/v0.1.0
+[Unreleased]: https://github.com/chulingera2025/raddex/compare/v0.3.5...HEAD
+[v0.3.5]: https://github.com/chulingera2025/raddex/compare/v0.3.0...v0.3.5
+[v0.3.0]: https://github.com/chulingera2025/raddex/compare/v0.2.10...v0.3.0
+[v0.2.10]: https://github.com/chulingera2025/raddex/compare/v0.2.1...v0.2.10
+[v0.2.1]: https://github.com/chulingera2025/raddex/compare/v0.1.2...v0.2.1
+[v0.1.2]: https://github.com/chulingera2025/raddex/compare/v0.1.0...v0.1.2
+[v0.1.0]: https://github.com/chulingera2025/raddex/releases/tag/v0.1.0

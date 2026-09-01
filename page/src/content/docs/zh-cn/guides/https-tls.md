@@ -3,7 +3,7 @@ title: HTTPS 与 TLS
 description: 自动 HTTPS、tls 指令、上游 TLS、双向 TLS 与 HTTP/2。
 ---
 
-本指南涵盖 raddy 中所有与 TLS 相关的内容:基于 ACME 的自动 HTTPS、按站点
+本指南涵盖 raddex 中所有与 TLS 相关的内容:基于 ACME 的自动 HTTPS、按站点
 掌控的 `tls` 指令(自签或静态证书、协议版本、密码套件、双向 TLS)、到上游
 后端的 TLS,以及下游 HTTP/2。
 
@@ -17,7 +17,7 @@ example.com {
 }
 ```
 
-raddy 向 ACME 目录注册,证明域名控制权——默认在其纯 HTTP 监听器上用
+raddex 向 ACME 目录注册,证明域名控制权——默认在其纯 HTTP 监听器上用
 **HTTP-01**,当 80 端口不可达时经 [`dns_challenge`](../../config/directives/#dns_challenge)
 用 **DNS-01**,或者设置 `tls_alpn_challenge` 使用 TLS-ALPN-01——并在到期前
 30 天内自动续期。在[全局块](../../config/sites/#the-global-block)
@@ -111,8 +111,8 @@ api.example.com {
     reverse_proxy {
         to https://10.0.0.1:8443 https://10.0.0.2:8443
         tls_servername api.internal
-        tls_ca /etc/raddy/root-ca.pem
-        tls_cert /etc/raddy/client.pem /etc/raddy/client.key
+        tls_ca /etc/raddex/root-ca.pem
+        tls_cert /etc/raddex/client.pem /etc/raddex/client.key
     }
 }
 ```

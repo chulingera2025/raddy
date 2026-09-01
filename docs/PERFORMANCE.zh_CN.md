@@ -1,6 +1,6 @@
 # 性能对比
 
-正式的 Nginx / Caddy / Raddy 公平对比测试位于 [`bench/`](../bench/)。它
+正式的 Nginx / Caddy / Raddex 公平对比测试位于 [`bench/`](../bench/)。它
 使用同一个 origin、同一组场景和同样的 Docker 资源限制，每次只启动一个
 代理，并在每个场景内以 Nginx 作为基线。
 
@@ -13,7 +13,7 @@
 ```
 
 宿主机只需要 Docker Engine 和 Docker Compose v2。oha、origin、Matplotlib
-以及 Raddy 构建都在固定版本的容器中完成。详细拓扑、场景和资源控制见
+以及 Raddex 构建都在固定版本的容器中完成。详细拓扑、场景和资源控制见
 [`bench/README.md`](../bench/README.md)。
 
 ## 如何读取结果

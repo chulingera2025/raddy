@@ -1,7 +1,7 @@
-# Raddy proxy comparison benchmark
+# Raddex proxy comparison benchmark
 
 This directory contains an independent Docker benchmark for Nginx, Caddy, and
-Raddy. It measures only capabilities shared by the three HTTP proxies and
+Raddex. It measures only capabilities shared by the three HTTP proxies and
 normalizes every chart against Nginx.
 
 ## Requirements
@@ -39,12 +39,12 @@ The resource limit can be changed for a controlled local experiment:
 BENCH_CPUS=4 BENCH_MEMORY_LIMIT=2g ./bench/scripts/run.sh quick
 ```
 
-Each run starts the origin once and starts Nginx, Caddy, and Raddy one at a
+Each run starts the origin once and starts Nginx, Caddy, and Raddex one at a
 time. This prevents the targets from competing with one another. Every target
 uses the same response body, paths, TLS certificate, Docker resource limits,
 load-generator image, warm-up, duration, and repetition count.
-The benchmark defaults Raddy to two Pingora workers to match the Nginx
-configuration; override this explicitly with `RADDY_THREADS=1` or another
+The benchmark defaults Raddex to two Pingora workers to match the Nginx
+configuration; override this explicitly with `RADDEX_THREADS=1` or another
 positive value when investigating worker scaling.
 
 ## Scenarios
@@ -95,7 +95,7 @@ Throughput is normalized as `target / nginx`; latency, CPU per request, and
 memory use the same ratio but are interpreted as lower-is-better. Error rate is
 shown as an absolute percentage. No combined score is produced.
 
-The raw manifest records the Raddy commit, tool versions, scenario profile, and
+The raw manifest records the Raddex commit, tool versions, scenario profile, and
 configuration hashes. It does not attempt to make absolute results from
 different machines directly comparable.
 

@@ -1,9 +1,9 @@
 ---
 title: Capability matrix
-description: Understand which Raddy features are supported, Linux-only, passthrough-only, or outside the Pingora process.
+description: Understand which Raddex features are supported, Linux-only, passthrough-only, or outside the Pingora process.
 ---
 
-This page is the deployment-oriented summary of Raddy's protocol boundaries.
+This page is the deployment-oriented summary of Raddex's protocol boundaries.
 The configuration reference describes syntax; this page describes what the
 runtime actually terminates, forwards, or leaves to another service.
 
@@ -12,13 +12,13 @@ runtime actually terminates, forwards, or leaves to another service.
 - **Supported** — implemented and covered by the v0.3.5 verification suite.
 - **Linux-only** — supported, but requires Linux kernel behavior, privileges,
   or file-descriptor handoff.
-- **Passthrough** — Raddy forwards bytes or datagrams without terminating the
+- **Passthrough** — Raddex forwards bytes or datagrams without terminating the
   higher-level protocol.
 - **Sidecar required** — the feature needs a protocol stack that is not part of
-  Pingora 0.8.1 or Raddy's current runtime.
+  Pingora 0.8.1 or Raddex's current runtime.
 
-Raddy is pre-1.0. Supported behavior is the release contract for the current
-version, while the [Raddyfile specification](../../config/directives/) remains
+Raddex is pre-1.0. Supported behavior is the release contract for the current
+version, while the [Raddexfile specification](../../config/directives/) remains
 the source of truth for configuration compatibility.
 
 ## HTTP and TLS
@@ -57,13 +57,13 @@ the source of truth for configuration compatibility.
 | Transparent TCP | Linux-only | Requires TPROXY rules, policy routing, and `CAP_NET_ADMIN`-equivalent permission |
 | UDP lossless upgrade | Linux-only | Listener, connected flow sockets, and bounded metadata are handed off |
 | QUIC datagram passthrough | Passthrough | QUIC packets are treated as ordinary UDP datagrams |
-| QUIC / HTTP/3 termination | Sidecar required | Raddy does not implement QUIC handshakes, HTTP/3 routing, or migration |
+| QUIC / HTTP/3 termination | Sidecar required | Raddex does not implement QUIC handshakes, HTTP/3 routing, or migration |
 
 ## Operational boundaries
 
 | Behavior | What to expect |
 | --- | --- |
-| `raddy check` | Validates the same configuration rules used by reload |
+| `raddex check` | Validates the same configuration rules used by reload |
 | SIGHUP reload | Replaces routing and runtime policy for new work; existing connections remain on their selected upstream |
 | Listener topology change | Rejected by reload and by upgrade preflight; use a normal restart where required |
 | Transparent TCP upgrade | Not supported by the standard handoff path; use a normal restart |
@@ -72,8 +72,8 @@ the source of truth for configuration compatibility.
 
 ## Choosing the right boundary
 
-Use Raddy directly when it needs to terminate HTTP, TLS, TCP, or UDP. Put a
-dedicated QUIC/HTTP/3 service in front of or beside Raddy when the deployment
+Use Raddex directly when it needs to terminate HTTP, TLS, TCP, or UDP. Put a
+dedicated QUIC/HTTP/3 service in front of or beside Raddex when the deployment
 needs HTTP/3 termination, HTTP/3 routing, connection migration, or QUIC-aware
 load balancing. Do not infer those capabilities from successful UDP
 passthrough.

@@ -1,5 +1,5 @@
 ---
-title: Raddy
+title: Raddex
 description: 基于 Cloudflare Pingora 构建的极简高性能反向代理网关。
 template: splash
 hero:
@@ -8,31 +8,31 @@ hero:
     - text: 快速开始
       link: quickstart/
       variant: primary
-    - text: 安装 raddy
+    - text: 安装 raddex
       link: install/
 ---
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-Raddy 是基于 [Cloudflare Pingora](https://github.com/cloudflare/pingora) 构建的
+Raddex 是基于 [Cloudflare Pingora](https://github.com/cloudflare/pingora) 构建的
 反向代理网关(Rust)——Pingora 正是为 Cloudflare 边缘网络提供动力的代理框架。
-你只需写一份 **Raddyfile**(Caddyfile 风格的配置),raddy 便负责路由、自动
+你只需写一份 **Raddexfile**(Caddyfile 风格的配置),raddex 便负责路由、自动
 HTTPS、静态文件、压缩、限流与访问日志,并享有 Pingora 的性能与内存安全。
 
 结果是一个单一的小型二进制,做反向代理该做的事——配置可读、行为可预测。
 
-## 为什么选 Raddy
+## 为什么选 Raddex
 
-- **天生高速。** raddy 构建于 Pingora:多线程事件循环、共享连接池、无垃圾
+- **天生高速。** raddex 构建于 Pingora:多线程事件循环、共享连接池、无垃圾
   回收。相对裸 Pingora,代理热路径只增加极小开销。
 - **配置可以推理。** 指令**严格按书写顺序**执行。所见即所执行——没有隐藏的
   指令排序表。每条指令要么是终端("谁服务这个请求"),要么是修饰符
   ("如何服务"),要么是守卫("谁可以被服务")。
 - **开箱即用的生产级 TLS。** 基于 ACME 的自动 HTTPS(HTTP-01 或 DNS-01)、
   SNI 证书选择、按站点的 TLS 选项、双向 TLS,以及下游 HTTP/2。
-- **零停机运维。** SIGHUP 重载原子替换路由快照;`raddy upgrade` 将监听套接字
+- **零停机运维。** SIGHUP 重载原子替换路由快照;`raddex upgrade` 将监听套接字
   移交给新二进制,连接零中断。
-- **默认安全。** 未经声明不信任任何东西:raddy 在配置 `trusted_proxies` 之前
+- **默认安全。** 未经声明不信任任何东西:raddex 在配置 `trusted_proxies` 之前
   忽略 `X-Forwarded-For`;无法读取的凭据会失败关闭(fail closed)。
 
 ## 功能亮点
@@ -58,15 +58,15 @@ HTTPS、静态文件、压缩、限流与访问日志,并享有 Pingora 的性�
 - **可观测性** —— Prometheus 指标、JSON 或 Common Log Format 访问日志,可按
   站点配置。
 
-## 何时使用 raddy
+## 何时使用 raddex
 
-当你想用一个又小又快的、可预测的反向代理时,raddy 很合适:
+当你想用一个又小又快的、可预测的反向代理时,raddex 很合适:
 
 - 把一个或多个 HTTP/HTTPS 服务放到公网并自动启用 TLS。
 - 在单个进程中同时托管静态内容与代理 API。
-- 用 `raddy check` 校验、用 SIGHUP 重载的配置文件,精确掌控路由、限流与认证。
+- 用 `raddex check` 校验、用 SIGHUP 重载的配置文件,精确掌控路由、限流与认证。
 
-raddy 是**单实例**的:限流按进程计数,不跨集群共享。如果你需要跨集群协调、
+raddex 是**单实例**的:限流按进程计数,不跨集群共享。如果你需要跨集群协调、
 外部共享服务或插件系统,更大的代理更合适。
 
 <CardGrid>
@@ -88,18 +88,18 @@ raddy 是**单实例**的:限流按进程计数,不跨集群共享。如果你�
 		Prometheus 指标与结构化 JSON 或 Common Log Format 访问日志。
 	</Card>
 	<Card title="零停机升级" icon="rocket">
-		`raddy upgrade` 将监听套接字移交给新二进制,连接零中断。
+		`raddex upgrade` 将监听套接字移交给新二进制,连接零中断。
 	</Card>
 </CardGrid>
 
 ## 下一步
 
 <CardGrid>
-	<LinkCard title="快速上手" href="quickstart/" description="五分钟内写出第一个 Raddyfile 并跑通流量。" />
-	<LinkCard title="配置指南" href="config/" description="Raddyfile 背后的心智模型:请求如何流经你的配置。" />
+	<LinkCard title="快速上手" href="quickstart/" description="五分钟内写出第一个 Raddexfile 并跑通流量。" />
+	<LinkCard title="配置指南" href="config/" description="Raddexfile 背后的心智模型:请求如何流经你的配置。" />
 	<LinkCard title="HTTPS 与 TLS" href="guides/https-tls/" description="自动 HTTPS、tls 指令、上游 TLS、mTLS 与 HTTP/2。" />
 	<LinkCard title="路由与匹配器" href="guides/routing/" description="按路径、主机、方法、请求头、查询参数、客户端 IP 或协议路由。" />
 	<LinkCard title="指令参考" href="config/directives/" description="每条指令的语法与示例。" />
-	<LinkCard title="CLI 参考" href="cli/" description="所有 `raddy` 子命令与选项。" />
+	<LinkCard title="CLI 参考" href="cli/" description="所有 `raddex` 子命令与选项。" />
 	<LinkCard title="运维" href="operations/metrics/" description="指标、访问日志与性能基线。" />
 </CardGrid>

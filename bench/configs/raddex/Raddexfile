@@ -7,7 +7,7 @@
 }
 
 bench.local:8443 {
-    tls /etc/raddy/tls/bench.crt /etc/raddy/tls/bench.key
+    tls /etc/raddex/tls/bench.crt /etc/raddex/tls/bench.key
 
     handle path /route/multi/* {
         reverse_proxy origin:18080

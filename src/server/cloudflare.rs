@@ -13,7 +13,7 @@
 
 //! Cloudflare DNS-01 challenge provider (spec §5.3).
 //!
-//! When the Raddyfile sets `dns_challenge cloudflare <token>`, certificate
+//! When the Raddexfile sets `dns_challenge cloudflare <token>`, certificate
 //! issuance proves domain control by publishing `_acme-challenge.<host>` TXT
 //! records through the Cloudflare API v4 instead of answering HTTP-01. This
 //! module implements the three API calls involved: finding the zone that owns a
@@ -86,10 +86,10 @@ impl RecordHandle {
 impl Cloudflare {
     /// Create a client bound to the Cloudflare production API.
     ///
-    /// The API base URL can be overridden with the `RADDY_CLOUDFLARE_API_BASE`
+    /// The API base URL can be overridden with the `RADDEX_CLOUDFLARE_API_BASE`
     /// environment variable (used by the test suite to point at a mock).
     pub fn new(api_token: &str) -> Self {
-        let base_url = std::env::var("RADDY_CLOUDFLARE_API_BASE")
+        let base_url = std::env::var("RADDEX_CLOUDFLARE_API_BASE")
             .unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
         Self::with_agent(
             api_token,

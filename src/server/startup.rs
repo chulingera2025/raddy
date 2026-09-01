@@ -13,7 +13,7 @@
 
 //! Startup sequence: parse → validate → snapshot → derive listeners → serve.
 //!
-//! The Raddyfile is fully parsed and validated before any listener is bound
+//! The Raddexfile is fully parsed and validated before any listener is bound
 //! (Q6): an invalid config returns an error and the process exits non-zero
 //! without serving. The listener set is derived from the snapshot and fixed for
 //! the process lifetime (ADR-010). Port 443 is served over TLS with SNI
@@ -71,10 +71,10 @@ pub struct RunOptions {
     /// instance's listening fds over the upgrade socket (ADR-008).
     pub upgrade: bool,
     /// Validate the config and construction, then exit 0/1 without binding any
-    /// listener (used as the `raddy upgrade` pre-flight).
+    /// listener (used as the `raddex upgrade` pre-flight).
     pub test: bool,
-    /// Write this process's PID here so `raddy upgrade` can find it (none =
-    /// don't write; `raddy upgrade` then requires an explicit `--pidfile`).
+    /// Write this process's PID here so `raddex upgrade` can find it (none =
+    /// don't write; `raddex upgrade` then requires an explicit `--pidfile`).
     pub pidfile: Option<PathBuf>,
     /// Unix socket both sides use to hand over listening fds (must match).
     pub upgrade_sock: String,
@@ -101,7 +101,7 @@ impl Default for RunOptions {
 
 /// Boot the proxy server and run until a shutdown signal.
 ///
-/// Returns an error if the Raddyfile is invalid or the server cannot be
+/// Returns an error if the Raddexfile is invalid or the server cannot be
 /// constructed; the caller reports it and exits non-zero.
 pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> {
     // The ACME/DNS-01 HTTP clients use rustls, which 0.23 refuses to
@@ -173,7 +173,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         .count();
     let issuance_queue = acme.spawn_issuance_worker(configured_hosts + ISSUANCE_QUEUE_CAPACITY + 1);
     // Renewal: periodically re-issue certificates inside the renewal window.
-    // The interval is overridable via RADDY_RENEW_INTERVAL_SECS (a test hook so
+    // The interval is overridable via RADDEX_RENEW_INTERVAL_SECS (a test hook so
     // Pebble's short-lived certificates can be renewed quickly).
     acme.spawn_renewal_scheduler(issuance_queue.clone(), renew_interval());
 
@@ -273,7 +273,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     );
     server.bootstrap();
 
-    // Record our PID for `raddy upgrade` once the server is actually going to
+    // Record our PID for `raddex upgrade` once the server is actually going to
     // serve (bootstrap exits the process in test mode, so a throwaway check
     // never clobbers the running instance's pidfile).
     if !opts.test {
@@ -432,7 +432,7 @@ fn ipv6_dual_stack_options() -> TcpSocketOptions {
 /// The listeners to serve: the configured sites' ports, plus an implicit
 /// plain-HTTP :80 listener when automatic HTTPS needs HTTP-01.
 ///
-/// raddy proves domain control with HTTP-01 on a plain-HTTP listener, so a
+/// raddex proves domain control with HTTP-01 on a plain-HTTP listener, so a
 /// config with named sites but no explicit :80 listener would otherwise be
 /// unreachable by the ACME server and issuance would hang forever (P0). DNS-01
 /// deployments (`dns_challenge`) skip the implicit listener — they chose DNS
@@ -627,7 +627,7 @@ fn global_access_log_format(global: &Option<AccessLogDirective>) -> AccessLogFor
 /// Install the rustls `CryptoProvider` that the ACME/DNS-01 HTTP clients need.
 ///
 /// rustls 0.23 panics on first TLS use when it cannot pick a single backend
-/// from the crate features. Feature unification across raddy's dependencies
+/// from the crate features. Feature unification across raddex's dependencies
 /// enables both `aws-lc-rs` (instant-acme's hyper-rustls) and `ring`
 /// (rustls-platform-verifier), so the provider is chosen and installed
 /// explicitly here — the aws-lc-rs backend, matching instant-acme. Idempotent;
@@ -642,9 +642,9 @@ fn install_rustls_crypto_provider() {
 }
 
 /// The renewal scan interval: hourly by default, overridable via
-/// `RADDY_RENEW_INTERVAL_SECS` (a test hook for Pebble's short-lived certs).
+/// `RADDEX_RENEW_INTERVAL_SECS` (a test hook for Pebble's short-lived certs).
 fn renew_interval() -> std::time::Duration {
-    std::env::var("RADDY_RENEW_INTERVAL_SECS")
+    std::env::var("RADDEX_RENEW_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(std::time::Duration::from_secs)
@@ -652,7 +652,7 @@ fn renew_interval() -> std::time::Duration {
 }
 
 /// The tracing filter level to use when `RUST_LOG` is unset: the configured
-/// global `log_level`, or `info` (the default) when the Raddyfile does not set
+/// global `log_level`, or `info` (the default) when the Raddexfile does not set
 /// one.
 fn default_log_filter(log_level: Option<LogLevel>) -> &'static str {
     match log_level {
@@ -691,11 +691,11 @@ mod tests {
         assert_eq!(default_log_filter(None), "info");
     }
 
-    /// Build a snapshot from an in-memory Raddyfile (temp file). `tag`
+    /// Build a snapshot from an in-memory Raddexfile (temp file). `tag`
     /// distinguishes parallel tests so they never share a temp filename.
     fn build_snapshot(tag: &str, config: &str) -> crate::config::ast::CompiledConfig {
         let path = std::env::temp_dir().join(format!(
-            "raddy_startup_{tag}_{}.Raddyfile",
+            "raddex_startup_{tag}_{}.Raddexfile",
             std::process::id()
         ));
         std::fs::write(&path, config).unwrap();

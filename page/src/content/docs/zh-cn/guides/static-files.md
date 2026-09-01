@@ -1,6 +1,6 @@
 ---
 title: 静态托管
-description: 用 raddy 从磁盘托管一个静态站点,并启用压缩。
+description: 用 raddex 从磁盘托管一个静态站点,并启用压缩。
 ---
 
 ## 目标
@@ -19,7 +19,7 @@ static.example.com {
 }
 ```
 
-`root` 设置目录;`file_server` 提供它。像 `./public` 这样的相对路径从 raddy
+`root` 设置目录;`file_server` 提供它。像 `./public` 这样的相对路径从 raddex
 的工作目录解析。
 
 要发送压缩响应,加 `encode` —— 客户端也支持的第一个算法胜出。可使用
@@ -38,8 +38,8 @@ static.example.com {
 ## 运行
 
 ```bash
-raddy check -c Raddyfile
-raddy run -c Raddyfile
+raddex check -c Raddexfile
+raddex run -c Raddexfile
 ```
 
 ## 你能得到什么

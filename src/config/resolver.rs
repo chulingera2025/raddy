@@ -16,7 +16,7 @@
 //! The config plane resolves each configured upstream to concrete addresses at
 //! build time (ADR-011). The standard library's `ToSocketAddrs` has no timeout
 //! and cannot be cancelled, so it is moved onto a small fixed pool of resolver
-//! threads and awaited with an explicit [`RESOLVE_TIMEOUT`]: `raddy check` and
+//! threads and awaited with an explicit [`RESOLVE_TIMEOUT`]: `raddex check` and
 //! SIGHUP reload report a diagnosable timeout error instead of blocking the
 //! config plane forever.
 //!
@@ -38,7 +38,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 /// Per-lookup timeout: a hostname that does not resolve within this is an error
-/// (returned to `raddy check`/reload), never a hang.
+/// (returned to `raddex check`/reload), never a hang.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Number of resolver worker threads. Bounded so a hung `getaddrinfo` can
 /// strand at most this many threads for the process lifetime.

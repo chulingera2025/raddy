@@ -1,10 +1,10 @@
 ---
 title: Performance comparison
-description: Compare Nginx, Caddy, and Raddy with a reproducible Docker benchmark and Nginx-relative charts.
+description: Compare Nginx, Caddy, and Raddex with a reproducible Docker benchmark and Nginx-relative charts.
 ---
 
 The repository includes an independent Docker benchmark under
-[`bench/`](https://github.com/chulingera2025/raddy/tree/main/bench). It starts
+[`bench/`](https://github.com/chulingera2025/raddex/tree/main/bench). It starts
 one proxy at a time against the same origin, uses the same scenario and
 resource limits, and generates raw data plus Markdown, HTML, SVG, and PNG
 reports.
@@ -26,7 +26,7 @@ Run the report-script unit tests with:
 
 The host only needs Docker Engine and Docker Compose v2. The load generator and
 Matplotlib run inside the pinned benchmark containers. See the
-[benchmark README](https://github.com/chulingera2025/raddy/tree/main/bench)
+[benchmark README](https://github.com/chulingera2025/raddex/tree/main/bench)
 for the scenario matrix and tuning controls.
 
 ## Relative charts

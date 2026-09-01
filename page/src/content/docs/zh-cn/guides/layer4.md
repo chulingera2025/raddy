@@ -3,7 +3,7 @@ title: 四层代理（TCP 与 UDP）
 description: 用 tcp 与 udp 监听器做裸 TCP 与 UDP 代理——负载均衡、超时、健康检查、通配符 SNI、TLS 终止、透明路由与 UDP 交接。
 ---
 
-除 HTTP 之外，raddy 可用 `tcp` 与 `udp` **顶级监听器**代理裸 TCP 连接与 UDP
+除 HTTP 之外，raddex 可用 `tcp` 与 `udp` **顶级监听器**代理裸 TCP 连接与 UDP
 数据报——它们是 HTTP 站点块的平级，而非其内部指令。它们只拥有传输概念：
 上游选择、超时、连接/流上限与中继。普通 TCP 不终止 TLS；可选的 `tls` 配置
 会在同一中继前先终止 TLS。
@@ -34,8 +34,8 @@ tcp :3306 {
 - **`health_check { ... }`** —— 主动 TCP 连接探活；不健康上游被跳过，全部
   不健康时拒绝新连接。
 - **重载** —— SIGHUP 重载把新的上游集合/策略/限制应用到*新*连接；已有连接
-  保持其上游。修改绑定地址属于拓扑变更，会被拒绝（请重启或 `raddy upgrade`）。
-- 每条关闭的连接写一条类型化 JSON 访问日志与 `raddy_l4_tcp_*` 指标。
+  保持其上游。修改绑定地址属于拓扑变更，会被拒绝（请重启或 `raddex upgrade`）。
+- 每条关闭的连接写一条类型化 JSON 访问日志与 `raddex_l4_tcp_*` 指标。
 
 ### SNI 路由
 
@@ -88,8 +88,8 @@ udp :53 {
   空闲 flow、`max_datagram_size` 丢弃并计数超大报文、`recv_buffer`/`send_buffer`
   设置 socket 缓冲（0 = 系统默认）。IPv4 与 IPv6 上游均支持。
 - UDP 与 TCP 可共享同一地址端口。
-- 指标：`raddy_l4_udp_*`。
-- **Linux UDP 支持零停机升级**：raddy 在替代进程开始接收前交接监听 fd、已连接
+- 指标：`raddex_l4_udp_*`。
+- **Linux UDP 支持零停机升级**：raddex 在替代进程开始接收前交接监听 fd、已连接
   上游 flow fd 和有界 flow 元数据。
 - **QUIC 透传**通过 UDP 可用，因为 QUIC 承载于数据报。Pingora 0.8.1 不提供
   QUIC/HTTP/3 终止、HTTP/3 路由或连接迁移；这些需要独立的 QUIC/HTTP/3 sidecar。

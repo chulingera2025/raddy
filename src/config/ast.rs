@@ -13,7 +13,7 @@
 
 //! Pure-data AST and compiled types for the config plane.
 //!
-//! A [`Raddyfile`] is parsed from source into the AST below, then validated,
+//! A [`Raddexfile`] is parsed from source into the AST below, then validated,
 //! resolved, and compiled into [`CompiledConfig`] — the pure data that becomes
 //! the runtime [`crate::config::snapshot::ConfigSnapshot`]. Per ADR-012 the
 //! compiled form separates *terminal* directives (which directive serves a
@@ -237,9 +237,9 @@ impl ValueTemplate {
 // Source AST
 // ---------------------------------------------------------------------------
 
-/// The parsed Raddyfile: a global block plus site blocks.
+/// The parsed Raddexfile: a global block plus site blocks.
 #[derive(Debug, Clone)]
-pub struct Raddyfile {
+pub struct Raddexfile {
     pub global: GlobalConfig,
     pub sites: Vec<Site>,
     /// Top-level layer-4 listener blocks (`tcp`/`udp`), peers of HTTP sites.

@@ -3,13 +3,13 @@ title: Compression
 description: Compress responses with gzip, zstd, and Brotli.
 ---
 
-The `encode` directive compresses responses before they leave raddy. It supports
+The `encode` directive compresses responses before they leave raddex. It supports
 three algorithms — **gzip**, **zstd**, and **Brotli** (`br`) — and applies to
 both proxied responses and static files.
 
 ## How it works
 
-`encode` takes algorithms **in priority order**. raddy negotiates against the
+`encode` takes algorithms **in priority order**. raddex negotiates against the
 client's `Accept-Encoding` header and uses the first algorithm the client also
 supports:
 

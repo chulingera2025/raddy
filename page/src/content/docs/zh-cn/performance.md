@@ -1,9 +1,9 @@
 ---
 title: 性能对比
-description: 使用可复现的 Docker 测试套件比较 Nginx、Caddy 与 Raddy,图表以 Nginx 为基准。
+description: 使用可复现的 Docker 测试套件比较 Nginx、Caddy 与 Raddex,图表以 Nginx 为基准。
 ---
 
-仓库在 [`bench/`](https://github.com/chulingera2025/raddy/tree/main/bench) 中提供
+仓库在 [`bench/`](https://github.com/chulingera2025/raddex/tree/main/bench) 中提供
 独立的 Docker 性能对比套件。它使用同一个 origin、同一组场景和相同的资源
 限制，每次只启动一个代理，并在每个场景内以 Nginx 作为基线。
 
@@ -24,7 +24,7 @@ description: 使用可复现的 Docker 测试套件比较 Nginx、Caddy 与 Radd
 
 宿主机只需要 Docker Engine 和 Docker Compose v2。负载生成器与 Matplotlib
 均在固定版本的测试容器中运行。完整场景矩阵和调节项见
-[测试套件说明](https://github.com/chulingera2025/raddy/tree/main/bench)。
+[测试套件说明](https://github.com/chulingera2025/raddex/tree/main/bench)。
 
 ## 相对图表
 

@@ -17,7 +17,7 @@
 //! reads. [`ConfigStore`] holds it behind an `arc-swap` pointer so a reload
 //! swaps the whole snapshot atomically (ADR-011). [`build`] is the single
 //! read → parse → validate → compile pipeline shared by startup, SIGHUP
-//! reload, and `raddy check` (Q7).
+//! reload, and `raddex check` (Q7).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -61,7 +61,7 @@ impl ConfigStore {
     }
 }
 
-/// Build a config snapshot from a Raddyfile: read, parse, validate, compile —
+/// Build a config snapshot from a Raddexfile: read, parse, validate, compile —
 /// one atomic step (Q6). On any error nothing is produced and nothing changes.
 pub fn build(path: &Path) -> Result<ConfigSnapshot, ConfigError> {
     let file = path.display().to_string();
@@ -69,8 +69,8 @@ pub fn build(path: &Path) -> Result<ConfigSnapshot, ConfigError> {
         file: file.clone(),
         source,
     })?;
-    let raddyfile = parser::parse(&file, &input)?;
-    validate::validate_and_compile(&file, &raddyfile)
+    let raddexfile = parser::parse(&file, &input)?;
+    validate::validate_and_compile(&file, &raddexfile)
 }
 
 #[cfg(test)]
@@ -79,12 +79,12 @@ mod tests {
 
     #[test]
     fn store_swap_is_visible() {
-        let snapshot = build(Path::new("examples/Raddyfile")).unwrap();
+        let snapshot = build(Path::new("examples/Raddexfile")).unwrap();
         let store = ConfigStore::new(snapshot);
         let a = store.load();
         assert_eq!(a.sites.len(), 2);
 
-        let b = build(Path::new("examples/Raddyfile")).unwrap();
+        let b = build(Path::new("examples/Raddexfile")).unwrap();
         store.store(b);
         assert_eq!(store.load().sites.len(), 2);
     }

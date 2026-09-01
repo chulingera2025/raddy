@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-TARGETS = ("nginx", "caddy", "raddy")
+TARGETS = ("nginx", "caddy", "raddex")
 NUMERIC_METRICS = (
     "qps",
     "success_rate",
@@ -605,8 +605,8 @@ def build_manifest(
     bench_root: Path,
     run_id: str,
     profile_name: str,
-    raddy_commit: str,
-    raddy_threads: int,
+    raddex_commit: str,
+    raddex_threads: int,
 ) -> dict[str, Any]:
     """Build a reproducibility manifest without host-identifying fields.
 
@@ -614,8 +614,8 @@ def build_manifest(
         bench_root: Mounted benchmark directory.
         run_id: Unique run identifier.
         profile_name: Selected benchmark profile.
-        raddy_commit: Raddy commit used by the image build.
-        raddy_threads: Pingora worker threads used by the Raddy target.
+        raddex_commit: Raddex commit used by the image build.
+        raddex_threads: Pingora worker threads used by the Raddex target.
 
     Returns:
         Manifest containing tool versions and configuration hashes.
@@ -634,8 +634,8 @@ def build_manifest(
         "schema_version": 1,
         "run_id": run_id,
         "profile": profile_name,
-        "raddy_commit": raddy_commit,
-        "raddy_threads": raddy_threads,
+        "raddex_commit": raddex_commit,
+        "raddex_threads": raddex_threads,
         "tools": parse_versions(bench_root / "versions.env"),
         "config_sha256": config_hashes,
     }
@@ -711,8 +711,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bench-root", type=Path, default=Path("/bench"))
     parser.add_argument("--raw-dir", type=Path)
     parser.add_argument("--run-id")
-    parser.add_argument("--raddy-commit", default="unknown")
-    parser.add_argument("--raddy-threads", type=int, default=1)
+    parser.add_argument("--raddex-commit", default="unknown")
+    parser.add_argument("--raddex-threads", type=int, default=1)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--summary-out", type=Path)
     return parser.parse_args()
@@ -730,14 +730,14 @@ def main() -> int:
         if args.write_manifest:
             if not args.run_id:
                 raise ValueError("--run-id is required with --write-manifest")
-            if args.raddy_threads < 1:
-                raise ValueError("--raddy-threads must be at least 1")
+            if args.raddex_threads < 1:
+                raise ValueError("--raddex-threads must be at least 1")
             manifest = build_manifest(
                 args.bench_root,
                 args.run_id,
                 args.profile,
-                args.raddy_commit,
-                args.raddy_threads,
+                args.raddex_commit,
+                args.raddex_threads,
             )
             output = args.bench_root / "results" / args.run_id / "run.json"
             output.parent.mkdir(parents=True, exist_ok=True)

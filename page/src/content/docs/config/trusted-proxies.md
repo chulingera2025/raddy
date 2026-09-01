@@ -1,21 +1,21 @@
 ---
 title: Trusted proxies
-description: Tell raddy which networks are trusted so it can derive the real client IP from X-Forwarded-For.
+description: Tell raddex which networks are trusted so it can derive the real client IP from X-Forwarded-For.
 ---
 
 Features that key on the client — [rate limiting](../directives/#rate_limit),
 `ip_hash` load balancing, access logs — need the *real* client IP, not the
-address of an intermediate proxy. This page explains how raddy decides that.
+address of an intermediate proxy. This page explains how raddex decides that.
 
 ## The default
 
-By default raddy **trusts nothing**: it uses the TCP peer address directly and
+By default raddex **trusts nothing**: it uses the TCP peer address directly and
 ignores any `X-Forwarded-For` header. This is safe by default — an attacker
 cannot forge a client IP unless you explicitly trust the proxy they came through.
 
 ## When you sit behind a proxy
 
-If raddy is behind a CDN or a load balancer that sets `X-Forwarded-For`, declare
+If raddex is behind a CDN or a load balancer that sets `X-Forwarded-For`, declare
 that proxy's network as trusted:
 
 ```caddyfile
@@ -24,11 +24,11 @@ that proxy's network as trusted:
 }
 ```
 
-Once a network is trusted, raddy derives the real client IP as follows:
+Once a network is trusted, raddex derives the real client IP as follows:
 
 1. If the TCP peer is **not** in the trusted list, the peer address *is* the
    client (no `X-Forwarded-For` parsing).
-2. If the peer **is** trusted, raddy walks the `X-Forwarded-For` chain from the
+2. If the peer **is** trusted, raddex walks the `X-Forwarded-For` chain from the
    right and takes the rightmost entry that is **not** a trusted proxy (malformed
    entries are skipped).
 3. If the whole chain is trusted — or the header is absent — the trusted peer

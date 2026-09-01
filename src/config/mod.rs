@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The config plane: Raddyfile parsing, validation, and the atomic config snapshot.
+//! The config plane: Raddexfile parsing, validation, and the atomic config snapshot.
 //!
 //! The pipeline is `parse → validate → compile → snapshot` (one atomic step, see
 //! [`snapshot`]). The snapshot holds pure data only; the upstream `Connector` and

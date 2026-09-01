@@ -6,7 +6,7 @@ description: Proxy raw TCP and UDP with explicit routing, limits, timeouts, TLS 
 Layer 4 listeners are top-level `tcp` and `udp` blocks. They are peers of HTTP
 site blocks and do not enter the HTTP routing pipeline.
 
-| Mode | Raddy does | Raddy does not do |
+| Mode | Raddex does | Raddex does not do |
 | --- | --- | --- |
 | Raw TCP | Connects and relays bytes | Parse HTTP or terminate TLS by default |
 | SNI passthrough | Inspects a bounded ClientHello prefix and routes it | Decrypt or modify the TLS stream |
@@ -71,7 +71,7 @@ tcp :8443 {
 }
 ```
 
-Use `tls internal` or `tls <cert-file> <key-file>`. Raddy completes the TLS
+Use `tls internal` or `tls <cert-file> <key-file>`. Raddex completes the TLS
 handshake and passes the decrypted byte stream to the raw relay. This mode uses
 the ordinary `to` upstream set and cannot be combined with SNI passthrough or
 transparent mode.
@@ -94,7 +94,7 @@ client address on the outbound connection. Deployment also needs:
 - policy routing for marked packets;
 - a route to the selected upstream.
 
-Because this mode owns a custom listener, `raddy upgrade` is not available for
+Because this mode owns a custom listener, `raddex upgrade` is not available for
 transparent TCP. Use a normal restart after validating the new configuration.
 
 ## UDP flows
@@ -130,6 +130,6 @@ the upgrade fails closed rather than claiming a lossless transition.
 ## QUIC boundary
 
 UDP forwarding can carry QUIC datagrams, but it is only passthrough. Pingora
-0.8.1 and Raddy do not terminate QUIC, route HTTP/3 requests, or manage QUIC
+0.8.1 and Raddex do not terminate QUIC, route HTTP/3 requests, or manage QUIC
 connection migration. Use a dedicated QUIC/HTTP/3 service when those functions
 are required.

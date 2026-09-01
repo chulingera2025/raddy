@@ -1,4 +1,4 @@
-# Raddy v0.3.5 Release Checklist
+# Raddex v0.3.5 Release Checklist
 
 ## Scope
 
@@ -14,7 +14,7 @@
 ## Configuration and compatibility
 
 - [x] `Cargo.toml`, `Cargo.lock`, CLI metadata, and badges report `0.3.5`.
-- [x] Raddyfile specification and Chinese specification describe only tested
+- [x] Raddexfile specification and Chinese specification describe only tested
   syntax and behavior.
 - [x] Existing HTTP/1.1, TLS, mTLS, raw TCP, SNI passthrough, UDP, reload, and
   TCP upgrade behavior remains covered by regression tests.
@@ -44,5 +44,5 @@
 Release evidence:
 
 - Merge commit: `ee27445a50a14b64d5cb78d342c3fceee373cd6a`.
-- Pull request: [#24](https://github.com/chulingera2025/raddy/pull/24).
-- Release: [v0.3.5](https://github.com/chulingera2025/raddy/releases/tag/v0.3.5).
+- Pull request: [#24](https://github.com/chulingera2025/raddex/pull/24).
+- Release: [v0.3.5](https://github.com/chulingera2025/raddex/releases/tag/v0.3.5).

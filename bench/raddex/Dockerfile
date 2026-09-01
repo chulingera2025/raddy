@@ -16,5 +16,5 @@ FROM ${RUNTIME_IMAGE}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/raddy /usr/local/bin/raddy
-ENTRYPOINT ["/usr/local/bin/raddy"]
+COPY --from=builder /src/target/release/raddex /usr/local/bin/raddex
+ENTRYPOINT ["/usr/local/bin/raddex"]
