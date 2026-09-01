@@ -31,7 +31,8 @@ use crate::config::ast::{
     TlsSource,
 };
 use crate::config::snapshot::{self, ConfigStore};
-use crate::layer4::tcp::{TcpAccessRecord, TcpProxyApp, TransparentTcpProxy};
+use crate::layer4::tcp::{TcpAccessRecord, TcpListenerService, TransparentTcpProxy};
+use crate::layer4::tls_accept::TlsAcceptor;
 use crate::layer4::udp::{UdpFlowRecord, UdpProxy};
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
@@ -40,8 +41,7 @@ use crate::server::issuance_queue::{EnqueueOutcome, RequestKind};
 use crate::server::reload;
 use crate::server::upgrade;
 use crate::tls::{
-    cert_store_key, configure_http_alpn, CertStore, SniCallback, StaticCertCallback,
-    TlsAlpnChallengeStore,
+    cert_store_key, configure_http_alpn, CertStore, SniCallback, TlsAlpnChallengeStore,
 };
 use pingora::listeners::{tls::TlsSettings, TcpSocketOptions, TlsAcceptCallbacks};
 use pingora::prelude::*;
@@ -342,40 +342,51 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                     tracing::info!("listening (transparent TCP) on {}", tcp.listen.display());
                     continue;
                 }
-                let app = TcpProxyApp::new(tcp, config_store.clone(), sink)?;
-                let mut service = Service::new(format!("tcp/{}", tcp.listen.display()), app);
-                if let Some(tls) = &tcp.tls {
-                    let cert = match &tls.source {
-                        TlsSource::Internal => generate_internal_cert("localhost")?,
-                        TlsSource::Static {
-                            cert_file,
-                            key_file,
-                        } => {
-                            let cert_pem = std::fs::read_to_string(cert_file).map_err(|e| {
-                                format!("failed to read certificate {cert_file}: {e}")
-                            })?;
-                            let key_pem = std::fs::read_to_string(key_file)
-                                .map_err(|e| format!("failed to read key {key_file}: {e}"))?;
-                            crate::tls::cert_key_from_pem(&cert_pem, &key_pem)?
-                        }
-                        TlsSource::Acme => {
-                            return Err(
-                                "TCP TLS termination cannot use ACME without a site identity"
-                                    .into(),
-                            )
-                        }
-                    };
-                    let callbacks =
-                        Box::new(StaticCertCallback::with_options(cert, Some(tls.clone())))
-                            as TlsAcceptCallbacks;
-                    let settings = TlsSettings::with_callbacks(callbacks)?;
-                    service.add_tls_with_settings(&tcp.listen.display(), None, settings);
+                let tls_acceptor = match &tcp.tls {
+                    None => None,
+                    Some(tls) => {
+                        let cert = match &tls.source {
+                            TlsSource::Internal => generate_internal_cert("localhost")?,
+                            TlsSource::Static {
+                                cert_file,
+                                key_file,
+                            } => {
+                                let cert_pem = std::fs::read_to_string(cert_file).map_err(|e| {
+                                    format!("failed to read certificate {cert_file}: {e}")
+                                })?;
+                                let key_pem = std::fs::read_to_string(key_file)
+                                    .map_err(|e| format!("failed to read key {key_file}: {e}"))?;
+                                crate::tls::cert_key_from_pem(&cert_pem, &key_pem)?
+                            }
+                            TlsSource::Acme => {
+                                return Err(
+                                    "TCP TLS termination cannot use ACME without a site identity"
+                                        .into(),
+                                )
+                            }
+                        };
+                        Some(Arc::new(TlsAcceptor::new(&cert, Some(tls))?))
+                    }
+                };
+                let terminates_tls = tls_acceptor.is_some();
+                let service = TcpListenerService::new(
+                    tcp,
+                    config_store.clone(),
+                    sink,
+                    tls_acceptor,
+                    opts.upgrade,
+                    opts.upgrade_sock.clone(),
+                    Some(server.watch_execution_phase()),
+                )?;
+                server.add_service(background_service(
+                    &format!("tcp/{}", tcp.listen.display()),
+                    service,
+                ));
+                if terminates_tls {
                     tracing::info!("listening (TLS-terminated TCP) on {}", tcp.listen.display());
                 } else {
-                    service.add_tcp(&tcp.listen.display());
                     tracing::info!("listening (raw TCP) on {}", tcp.listen.display());
                 }
-                server.add_service(service);
             }
             Layer4Listener::Udp(udp) => {
                 let sink = l4_access_log.as_ref().map(|log| {
@@ -592,7 +603,7 @@ fn load_site_certificates(
 }
 
 /// Generate a self-signed certificate for `host` (the `tls internal` source).
-fn generate_internal_cert(host: &str) -> Result<pingora::utils::tls::CertKey, String> {
+pub(crate) fn generate_internal_cert(host: &str) -> Result<pingora::utils::tls::CertKey, String> {
     let cert = rcgen::generate_simple_self_signed(vec![host.to_string()])
         .map_err(|e| format!("failed to generate internal certificate for {host}: {e}"))?;
     crate::tls::cert_key_from_pem(&cert.cert.pem(), &cert.signing_key.serialize_pem())

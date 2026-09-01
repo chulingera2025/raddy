@@ -13,14 +13,21 @@
 
 //! Raw TCP proxy runtime (L4_PROXY_PLAN, P0).
 //!
-//! One [`TcpProxyApp`] is bound to one `tcp <address> { ... }` listener and
-//! registered as a Pingora `Service<ServerApp>`. `process_new` performs
-//! admission (per-listener semaphore) and upstream selection, then spawns a
-//! relay task that owns the connection — so the worker is free to accept the
-//! next connection. The relay connects under a hard wall-clock bound, then
-//! copies bytes bidirectionally with a *true* inactivity timeout (reset by
-//! traffic in either direction) and half-close propagation, and records typed
-//! metrics and an access record on close.
+//! The L4 data path is native Tokio: [`TcpListenerService`] owns the accept
+//! loop and hands each accepted [`tokio::net::TcpStream`] straight to
+//! [`TcpProxyApp::handle_connection`], which performs admission (per-listener
+//! semaphore) and upstream selection, then spawns a relay task that owns the
+//! connection — so the acceptor is free to accept the next one. The relay
+//! connects under a hard wall-clock bound, then copies bytes bidirectionally
+//! with a *true* inactivity timeout (reset by traffic in either direction) and
+//! half-close propagation, and records typed metrics and an access record on
+//! close.
+//!
+//! Nothing here wraps the socket in a buffered transport: `write_all` reaches
+//! the kernel directly, which is where the measured advantage over the previous
+//! Pingora-`Stream` data path comes from. Pingora remains the *process* host —
+//! the listener runs as a `BackgroundService` and observes `ShutdownWatch` —
+//! but no byte of relayed traffic passes through it.
 
 use crate::config::ast::{
     wildcard_match_specificity, L4Upstream, Layer4Listener, ListenAddress, TcpHealthCheckSpec,
@@ -29,12 +36,9 @@ use crate::config::ast::{
 use crate::config::snapshot::ConfigStore;
 use crate::layer4::tls;
 use async_trait::async_trait;
-use pingora::apps::ServerApp;
 use pingora::lb::health_check;
 use pingora::lb::selection::{Consistent, Random, RoundRobin};
 use pingora::lb::LoadBalancer;
-use pingora::protocols::l4::stream::Stream as L4Stream;
-use pingora::protocols::{SocketDigest, Stream};
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -42,6 +46,8 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -52,6 +58,11 @@ use tokio::sync::Semaphore;
 /// Read chunk used by the relay pump. Bounded, so per-connection memory is two
 /// buffers plus codec state, independent of transfer size.
 const RELAY_CHUNK: usize = 16 * 1024;
+
+/// Pending-connection backlog for an L4 listener. Sized for connection-rate
+/// bursts: the accept loop hands each connection straight to a spawned relay,
+/// so the queue only has to absorb scheduling jitter, not slow work.
+const LISTEN_BACKLOG: i32 = 1024;
 
 /// How often hostname upstreams are re-resolved (L4 plan: refresh, keep
 /// last-known-good on a transient failure). Overridable via
@@ -578,16 +589,362 @@ impl TcpProxyApp {
     }
 }
 
-/// A Linux transparent-proxy acceptor. Pingora's ServerApp and relay logic are
-/// reused after this small listener shim attaches the socket digest that carries
-/// the original destination.
+/// The native accept loop for one non-transparent `tcp` listener.
+///
+/// Owns the bound socket and hands every accepted connection to the shared
+/// [`TcpProxyApp`]. Registered as a Pingora `BackgroundService` purely for
+/// process lifecycle — no relayed byte passes through Pingora.
+pub struct TcpListenerService {
+    /// Bound at construction — which happens on the startup thread, before the
+    /// Pingora server builds its runtime — and converted to a Tokio listener
+    /// inside [`BackgroundService::start`], which does run on the runtime.
+    /// `tokio::net::TcpListener::from_std` panics without a reactor, so the
+    /// socket cannot be registered any earlier. `None` until received when this
+    /// process is an upgrade replacement.
+    listener: Mutex<Option<std::net::TcpListener>>,
+    app: Arc<TcpProxyApp>,
+    /// Set when the listener terminates TLS before relaying (spec §5.7).
+    tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
+    /// The `tcp/<address>` label, for logs and handoff artifacts.
+    label: String,
+    /// True when this process must receive the listening socket from the
+    /// outgoing process instead of binding it.
+    upgrade: bool,
+    #[cfg(unix)]
+    upgrade_sock: String,
+    #[cfg(unix)]
+    handoff_id: String,
+    #[cfg(unix)]
+    phase_watch: Mutex<Option<tokio::sync::broadcast::Receiver<pingora::server::ExecutionPhase>>>,
+}
+
+impl TcpListenerService {
+    /// Bind `tcp.listen` (or prepare to inherit it) and build the proxy app.
+    ///
+    /// `tls` terminates TLS on this listener when set. `upgrade` marks this
+    /// process as the replacement side of a zero-downtime upgrade, in which
+    /// case no socket is bound here — the listening descriptor arrives from the
+    /// outgoing process in [`BackgroundService::start`]. Returns an error when
+    /// the socket cannot be bound or the proxy app cannot be built; both are
+    /// startup failures, reported before any listener serves traffic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tcp: &TcpProxyConfig,
+        config_store: Arc<ConfigStore>,
+        access_log: Option<Arc<AccessLogSink>>,
+        tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
+        upgrade: bool,
+        #[cfg(unix)] upgrade_sock: String,
+        #[cfg(unix)] phase_watch: Option<
+            tokio::sync::broadcast::Receiver<pingora::server::ExecutionPhase>,
+        >,
+    ) -> Result<Self, String> {
+        let ListenAddress::Socket(address) = &tcp.listen;
+        let label = format!("tcp/{}", tcp.listen.display());
+        let listener = if upgrade {
+            None
+        } else {
+            Some(bind_listener(*address)?)
+        };
+        Ok(Self {
+            listener: Mutex::new(listener),
+            app: Arc::new(TcpProxyApp::new(tcp, config_store, access_log)?),
+            tls,
+            #[cfg(unix)]
+            handoff_id: crate::layer4::handoff_key(&tcp.listen.display()),
+            label,
+            upgrade,
+            #[cfg(unix)]
+            upgrade_sock,
+            #[cfg(unix)]
+            phase_watch: Mutex::new(phase_watch),
+        })
+    }
+
+    /// The status path one TCP listener publishes its handoff outcome to, so
+    /// the upgrade driver can refuse to continue after a failed transfer.
+    #[cfg(unix)]
+    pub(crate) fn status_path_for(upgrade_sock: &str, listener: &str) -> String {
+        format!(
+            "{upgrade_sock}.tcp.{}.status",
+            crate::layer4::handoff_key(listener)
+        )
+    }
+
+    /// This listener's handoff status path.
+    #[cfg(unix)]
+    fn handoff_status_path(&self) -> String {
+        format!("{}.tcp.{}.status", self.upgrade_sock, self.handoff_id)
+    }
+
+    /// The socket path the listening descriptor is passed over.
+    #[cfg(unix)]
+    fn handoff_socket_path(&self) -> String {
+        format!("{}.tcp.{}.fd", self.upgrade_sock, self.handoff_id)
+    }
+
+    /// Send the listening descriptor to the replacement process, then publish
+    /// the outcome so the upgrade driver can verify it.
+    ///
+    /// Unlike the UDP handoff there is no per-connection state to carry: an
+    /// established TCP relay is owned by its own task in the outgoing process
+    /// and drains there, so only the *listening* socket moves.
+    #[cfg(unix)]
+    async fn send_handoff(&self) {
+        let result = self.send_handoff_inner().await;
+        if let Err(error) = &result {
+            tracing::error!("{}: upgrade handoff failed: {error}", self.label);
+        }
+        let status = match &result {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!("error: {error}"),
+        };
+        if let Err(error) = crate::layer4::write_handoff_file(
+            &self.handoff_status_path(),
+            status.as_bytes(),
+            "TCP handoff status",
+        ) {
+            tracing::error!("{}: failed to publish handoff status: {error}", self.label);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn send_handoff_inner(&self) -> Result<(), String> {
+        let fd = {
+            let guard = self.listener.lock().expect("L4 TCP listener lock poisoned");
+            guard
+                .as_ref()
+                .ok_or("TCP listening socket is unavailable")?
+                .as_raw_fd()
+        };
+        let path = self.handoff_socket_path();
+        // `Fds::send_to_sock` blocks on the unix socket, so it runs off the
+        // reactor thread.
+        tokio::task::spawn_blocking(move || {
+            let mut fds = pingora::server::Fds::new();
+            fds.add("listener".to_string(), fd);
+            fds.send_to_sock(path.as_str())
+                .map_err(|e| format!("send TCP listener descriptor: {e}"))?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("TCP handoff worker failed: {e}"))?
+    }
+
+    /// Receive the inherited listening descriptor from the outgoing process.
+    #[cfg(unix)]
+    async fn receive_handoff(&self) -> Result<std::net::TcpListener, String> {
+        let path = self.handoff_socket_path();
+        tokio::task::spawn_blocking(move || {
+            let mut fds = pingora::server::Fds::new();
+            fds.get_from_sock(path.as_str())
+                .map_err(|e| format!("receive TCP listener descriptor: {e}"))?;
+            let fd = *fds
+                .get("listener")
+                .ok_or("TCP handoff is missing the listener descriptor")?;
+            // SAFETY: the descriptor was transferred through SCM_RIGHTS and is
+            // now owned by this process.
+            let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("set inherited TCP listener nonblocking: {e}"))?;
+            Ok(listener)
+        })
+        .await
+        .map_err(|e| format!("TCP handoff receiver failed: {e}"))?
+    }
+}
+
+#[async_trait]
+impl BackgroundService for TcpListenerService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        // An upgrade replacement inherits the listening socket instead of
+        // binding it, so the port is never released and no connection is
+        // refused during the swap.
+        #[cfg(unix)]
+        if self.upgrade {
+            match self.receive_handoff().await {
+                Ok(listener) => {
+                    *self.listener.lock().expect("L4 TCP listener lock poisoned") = Some(listener);
+                }
+                Err(error) => {
+                    tracing::error!("{}: failed to inherit listener: {error}", self.label);
+                    let status = format!("error: {error}");
+                    let _ = crate::layer4::write_handoff_file(
+                        &self.handoff_status_path(),
+                        status.as_bytes(),
+                        "TCP handoff status",
+                    );
+                    // Fail the whole replacement: continuing would leave this
+                    // listener silently unserved while the old process exits.
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // Register the pre-bound socket with the reactor now that a runtime
+        // exists. The `std` listener is retained (cloned, not consumed) because
+        // its descriptor is what a later upgrade hands to the replacement.
+        let std_listener = self
+            .listener
+            .lock()
+            .expect("L4 TCP listener lock poisoned")
+            .as_ref()
+            .and_then(|listener| listener.try_clone().ok());
+        let Some(std_listener) = std_listener else {
+            tracing::error!("{}: listening socket is unavailable", self.label);
+            if self.upgrade {
+                std::process::exit(1);
+            }
+            return;
+        };
+        let listener = match TcpListener::from_std(std_listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::error!("{}: listener registration failed: {error}", self.label);
+                if self.upgrade {
+                    std::process::exit(1);
+                }
+                return;
+            }
+        };
+
+        // Pingora signals the fd-transfer phase of a graceful upgrade on this
+        // broadcast channel; that is when the descriptor must be sent.
+        let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        #[cfg(unix)]
+        if let Some(mut phase) = self
+            .phase_watch
+            .lock()
+            .expect("L4 TCP phase watch lock poisoned")
+            .take()
+        {
+            tokio::spawn(async move {
+                while let Ok(value) = phase.recv().await {
+                    if matches!(
+                        value,
+                        pingora::server::ExecutionPhase::GracefulUpgradeTransferringFds
+                    ) {
+                        let _ = handoff_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        drop(handoff_tx);
+
+        loop {
+            let accepted = tokio::select! {
+                result = listener.accept() => result,
+                signal = handoff_rx.recv() => {
+                    if signal.is_some() {
+                        #[cfg(unix)]
+                        self.send_handoff().await;
+                        // Stop accepting: the replacement owns the socket now.
+                        // In-flight relays keep running until they drain or the
+                        // shutdown watch cancels them.
+                        break;
+                    }
+                    continue;
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let (stream, peer) = match accepted {
+                Ok(pair) => pair,
+                Err(error) => {
+                    // A per-connection accept error (EMFILE, a client that went
+                    // away between the SYN and accept) must not kill the
+                    // listener; log and take the next one.
+                    tracing::warn!("tcp accept failed: {error}");
+                    continue;
+                }
+            };
+            // Relayed traffic is latency-sensitive and already chunked by the
+            // pump, so Nagle only adds delay.
+            let _ = stream.set_nodelay(true);
+            let peer = Some(normalize_socket_addr(peer));
+            let app = self.app.clone();
+            let child_shutdown = shutdown.clone();
+            match &self.tls {
+                None => {
+                    app.handle_connection(stream, peer, None, &child_shutdown)
+                        .await;
+                }
+                Some(acceptor) => {
+                    // The handshake is remote-driven, so it runs inside the
+                    // spawned task under its own timeout: a stalled client must
+                    // never block the accept loop.
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                app.handle_connection(tls_stream, peer, None, &child_shutdown)
+                                    .await;
+                            }
+                            Err(error) => {
+                                tracing::debug!("tcp TLS handshake failed: {error}");
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Bind a plain TCP listener for an L4 listener address.
+///
+/// An unspecified IPv6 address is left dual-stack (`IPV6_V6ONLY` off) so one
+/// listener serves both families, matching the HTTP listeners. Returns a
+/// blocking `std` listener: binding happens on the startup thread, before a
+/// Tokio runtime exists, so reactor registration is deferred to `start`.
+fn bind_listener(address: SocketAddr) -> Result<std::net::TcpListener, String> {
+    let domain = if address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|e| format!("create TCP socket: {e}"))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| format!("set TCP reuseaddr: {e}"))?;
+    if let SocketAddr::V6(v6) = address {
+        if v6.ip().is_unspecified() {
+            socket
+                .set_only_v6(false)
+                .map_err(|e| format!("set TCP dual-stack: {e}"))?;
+        }
+    }
+    socket
+        .bind(&SockAddr::from(address))
+        .map_err(|e| format!("bind TCP listener {address}: {e}"))?;
+    socket
+        .listen(LISTEN_BACKLOG)
+        .map_err(|e| format!("listen on TCP {address}: {e}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("set TCP nonblocking: {e}"))?;
+    Ok(socket.into())
+}
+
+/// A Linux transparent-proxy acceptor: same relay path, but the socket carries
+/// `IP_TRANSPARENT` and the upstream is the original destination.
 pub struct TransparentTcpProxy {
-    listener: Arc<TcpListener>,
+    /// Bound at construction, registered with the reactor in `start` — see
+    /// [`TcpListenerService::listener`] for why.
+    listener: Mutex<Option<std::net::TcpListener>>,
     app: Arc<TcpProxyApp>,
 }
 
 impl TransparentTcpProxy {
-    /// Bind a transparent TCP listener and build its Pingora-backed proxy app.
+    /// Bind a transparent TCP listener and build its proxy app.
     ///
     /// The tcp parameter supplies the listener and routing configuration;
     /// config_store supplies reloadable upstream state; access_log is the
@@ -601,7 +958,7 @@ impl TransparentTcpProxy {
         let ListenAddress::Socket(address) = &tcp.listen;
         let listener = bind_transparent_listener(*address)?;
         Ok(Self {
-            listener: Arc::new(listener),
+            listener: Mutex::new(Some(listener)),
             app: Arc::new(TcpProxyApp::new(tcp, config_store, access_log)?),
         })
     }
@@ -610,9 +967,25 @@ impl TransparentTcpProxy {
 #[async_trait]
 impl BackgroundService for TransparentTcpProxy {
     async fn start(&self, mut shutdown: ShutdownWatch) {
+        let Some(std_listener) = self
+            .listener
+            .lock()
+            .expect("transparent TCP listener lock poisoned")
+            .take()
+        else {
+            tracing::error!("transparent tcp listener started twice");
+            return;
+        };
+        let listener = match TcpListener::from_std(std_listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::error!("transparent tcp listener registration failed: {error}");
+                return;
+            }
+        };
         loop {
             let accepted = tokio::select! {
-                result = self.listener.accept() => result,
+                result = listener.accept() => result,
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         break;
@@ -627,21 +1000,27 @@ impl BackgroundService for TransparentTcpProxy {
                     continue;
                 }
             };
-            let raw_fd = stream.as_raw_fd();
-            let mut session: Stream = Box::new(L4Stream::from(stream));
-            session.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
+            let _ = stream.set_nodelay(true);
+            let original = original_dst(&stream);
             tracing::debug!("transparent TCP connection from {peer}");
             let app = self.app.clone();
             let child_shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                let _ = app.process_new(session, &child_shutdown).await;
-            });
+            app.handle_connection(
+                stream,
+                Some(normalize_socket_addr(peer)),
+                original,
+                &child_shutdown,
+            )
+            .await;
         }
     }
 }
 
 /// Bind a TCP socket with the Linux transparent-proxy option before bind.
-fn bind_transparent_listener(address: SocketAddr) -> Result<TcpListener, String> {
+///
+/// Returns a blocking `std` listener for the same reason as [`bind_listener`]:
+/// the bind happens before a Tokio runtime exists.
+fn bind_transparent_listener(address: SocketAddr) -> Result<std::net::TcpListener, String> {
     let domain = if address.is_ipv4() {
         Domain::IPV4
     } else {
@@ -662,9 +1041,7 @@ fn bind_transparent_listener(address: SocketAddr) -> Result<TcpListener, String>
     socket
         .set_nonblocking(true)
         .map_err(|e| format!("set transparent TCP nonblocking: {e}"))?;
-    let listener: std::net::TcpListener = socket.into();
-    TcpListener::from_std(listener)
-        .map_err(|e| format!("adopt transparent TCP listener {address}: {e}"))
+    Ok(socket.into())
 }
 
 /// Set IP_TRANSPARENT/IPV6_TRANSPARENT on a socket.
@@ -705,28 +1082,114 @@ fn set_transparent_fd(fd: std::os::fd::RawFd, ipv4: bool) -> Result<(), String> 
 }
 
 /// Read the destination selected by a Linux REDIRECT/TPROXY rule.
-fn original_dst(stream: &Stream) -> Option<SocketAddr> {
-    stream
-        .get_socket_digest()?
-        .original_dst()?
-        .as_inet()
-        .copied()
+///
+/// With TPROXY the socket is bound to the original destination already, so
+/// `local_addr` is the answer. With REDIRECT the kernel rewrote the destination
+/// and keeps the pre-NAT address in the conntrack entry, reachable only through
+/// `SO_ORIGINAL_DST`. Try the socket option first and fall back to `local_addr`.
+#[cfg(target_os = "linux")]
+fn original_dst(stream: &TcpStream) -> Option<SocketAddr> {
+    let fd = stream.as_raw_fd();
+    let ipv4 = matches!(stream.local_addr().ok()?, SocketAddr::V4(_));
+    // SAFETY: `storage` is sized for either address family and `len` is
+    // initialized to its capacity, as getsockopt requires. The fd is owned by
+    // `stream`, which outlives the call.
+    let decoded = unsafe {
+        let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let (level, name) = if ipv4 {
+            (libc::SOL_IP, libc::SO_ORIGINAL_DST)
+        } else {
+            (libc::SOL_IPV6, IP6T_SO_ORIGINAL_DST)
+        };
+        if libc::getsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::addr_of_mut!(storage).cast::<libc::c_void>(),
+            &mut len,
+        ) != 0
+        {
+            None
+        } else {
+            sockaddr_storage_to_socket_addr(&storage)
+        }
+    };
+    // TPROXY binds the socket to the original destination, so `local_addr` is
+    // already correct there and is the right fallback when the REDIRECT-only
+    // socket option is unavailable.
+    decoded
+        .or_else(|| stream.local_addr().ok())
+        .map(normalize_socket_addr)
 }
 
-#[async_trait]
-impl ServerApp for TcpProxyApp {
-    async fn process_new(
+/// `IP6T_SO_ORIGINAL_DST` from `linux/netfilter_ipv6/ip6_tables.h`; `libc` does
+/// not export it.
+#[cfg(target_os = "linux")]
+const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
+
+/// Decode a kernel-filled `sockaddr_storage` into a [`SocketAddr`].
+///
+/// Returns `None` for an address family this proxy does not handle, so a
+/// surprising value falls back to the local address rather than being
+/// misinterpreted.
+#[cfg(target_os = "linux")]
+fn sockaddr_storage_to_socket_addr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match i32::from(storage.ss_family) {
+        libc::AF_INET => {
+            // SAFETY: ss_family says this storage holds a sockaddr_in, and
+            // sockaddr_storage is defined to be large enough and aligned for it.
+            let addr = unsafe { *std::ptr::from_ref(storage).cast::<libc::sockaddr_in>() };
+            Some(SocketAddr::from((
+                u32::from_be(addr.sin_addr.s_addr).to_be_bytes(),
+                u16::from_be(addr.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: as above, for a sockaddr_in6.
+            let addr = unsafe { *std::ptr::from_ref(storage).cast::<libc::sockaddr_in6>() };
+            Some(SocketAddr::from((
+                addr.sin6_addr.s6_addr,
+                u16::from_be(addr.sin6_port),
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Non-Linux builds never reach transparent mode (the config validator rejects
+/// it), so the original destination is simply the local address.
+#[cfg(not(target_os = "linux"))]
+fn original_dst(stream: &TcpStream) -> Option<SocketAddr> {
+    stream.local_addr().ok().map(normalize_socket_addr)
+}
+
+impl TcpProxyApp {
+    /// Admit, select an upstream for, and relay one accepted connection.
+    ///
+    /// `client` is the accepted transport — a plain [`TcpStream`], or a
+    /// TLS-terminated stream once the listener terminates TLS. `peer` is the
+    /// client address and `original_destination` the Linux REDIRECT/TPROXY
+    /// destination in transparent mode (`None` otherwise).
+    ///
+    /// Returns as soon as the connection has been handed to its relay task, so
+    /// the caller can accept the next connection. A connection refused by
+    /// admission or by an all-unhealthy backend set is dropped here.
+    pub async fn handle_connection<S>(
         self: &Arc<Self>,
-        mut session: Stream,
+        client: S,
+        peer: Option<SocketAddr>,
+        original_destination: Option<SocketAddr>,
         shutdown: &ShutdownWatch,
-    ) -> Option<Stream> {
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         tracing::debug!("tcp {}: new connection", self.listener);
         // Load the current runtime (rebuilt on reload when the spec changed);
         // new connections always use the latest upstream set and limits.
         let handle = self.current_handle();
-        let client_addr = peer_addr(&mut session);
+        let client_addr = peer;
         let transparent = handle.transparent;
-        let original_destination = transparent.then(|| original_dst(&session)).flatten();
         // Admission first: reject before spending a worker on connect/relay
         // when the listener is at capacity.
         let permit = match handle.admission.clone().try_acquire_owned() {
@@ -734,7 +1197,7 @@ impl ServerApp for TcpProxyApp {
             Err(_) => {
                 self.metrics.rejected.inc();
                 tracing::debug!("tcp {}: admission limit reached; rejecting", self.listener);
-                return None;
+                return;
             }
         };
         let key = match handle.policy {
@@ -753,7 +1216,7 @@ impl ServerApp for TcpProxyApp {
                     Some(addr) => Some(addr),
                     None => {
                         self.metrics.no_upstream.inc();
-                        return None;
+                        return;
                     }
                 },
                 L4Selector::Sni { .. } => None,
@@ -761,9 +1224,8 @@ impl ServerApp for TcpProxyApp {
         };
         self.metrics.accepted.inc();
 
-        // The relay owns the connection: spawn it so the worker accepts the
-        // next connection immediately. `None` tells pingora the session is not
-        // reusable (every TCP connection is terminal).
+        // The relay owns the connection: spawn it so the acceptor takes the
+        // next connection immediately.
         let metrics = self.metrics.clone();
         let connect_timeout = handle.connect_timeout;
         let idle_timeout = handle.idle_timeout;
@@ -778,7 +1240,7 @@ impl ServerApp for TcpProxyApp {
                 L4Selector::Balancer(_) => {
                     let upstream = pre_selected.expect("balancer mode pre-selects");
                     relay_tcp(
-                        session,
+                        client,
                         upstream,
                         transparent.then_some(client_addr).flatten(),
                         connect_timeout,
@@ -790,7 +1252,7 @@ impl ServerApp for TcpProxyApp {
                 }
                 L4Selector::Sni { routes, fallback } => {
                     relay_tcp_sni(
-                        session,
+                        client,
                         routes.clone(),
                         *fallback,
                         connect_timeout,
@@ -816,7 +1278,6 @@ impl ServerApp for TcpProxyApp {
                 });
             }
         });
-        None
     }
 }
 
@@ -855,15 +1316,18 @@ async fn connect_upstream(
 }
 
 /// Connect to the upstream under a hard wall-clock bound, then relay.
-async fn relay_tcp(
-    client: Stream,
+async fn relay_tcp<S>(
+    client: S,
     upstream_addr: SocketAddr,
     source_addr: Option<SocketAddr>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     shutdown: &ShutdownWatch,
     metrics: &TcpMetrics,
-) -> RelayOutcome {
+) -> RelayOutcome
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let upstream = match tokio::time::timeout(
         connect_timeout,
         connect_upstream(upstream_addr, source_addr),
@@ -929,15 +1393,18 @@ fn select_sni_route(routes: &HashMap<String, SocketAddr>, name: &str) -> Option<
 /// inspected bytes, then relay the rest. Unknown SNI / absent SNI / malformed
 /// ClientHello all use the fallback when set, otherwise the connection is
 /// closed.
-async fn relay_tcp_sni(
-    mut client: Stream,
+async fn relay_tcp_sni<S>(
+    mut client: S,
     routes: Arc<HashMap<String, SocketAddr>>,
     fallback: Option<SocketAddr>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     shutdown: &ShutdownWatch,
     metrics: &TcpMetrics,
-) -> RelayOutcome {
+) -> RelayOutcome
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // 1. Bounded inspection: read until a complete ClientHello is available.
     let inspected = tls::read_client_hello(&mut client, tls::MAX_CLIENT_HELLO_BYTES).await;
     // 2. Select the upstream: exact SNI -> its route; else the fallback; else
@@ -1067,12 +1534,15 @@ impl EndReason {
 /// connection lifetime. Half-close is propagated (EOF on one side shuts the
 /// write half of the other), so the remaining direction drains. When the
 /// server begins shutting down the relay is cancelled promptly.
-async fn bidirectional(
-    mut client: Stream,
+async fn bidirectional<S>(
+    mut client: S,
     mut upstream: TcpStream,
     idle: Duration,
     shutdown: &ShutdownWatch,
-) -> (u64, u64, EndReason) {
+) -> (u64, u64, EndReason)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let last = Arc::new(tokio::sync::Mutex::new(Instant::now()));
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -1159,9 +1629,11 @@ where
                 if dst.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
-                // Pingora's transport `Stream` wraps the socket in a buffered
-                // writer; flush so relayed bytes reach the peer promptly rather
-                // than sitting in the write buffer until it fills.
+                // A plain `TcpStream` has no user-space write buffer, so this
+                // flush is a no-op and `write_all` above already reached the
+                // kernel — that is the win over the previous buffered Pingora
+                // transport. It is kept because a TLS-terminated listener hands
+                // this pump an `SslStream`, whose write BIO *does* buffer.
                 if dst.flush().await.is_err() {
                     break;
                 }
@@ -1172,18 +1644,6 @@ where
         }
     }
     total
-}
-
-/// The peer address of a stream, if the transport can report it.
-fn peer_addr(session: &mut Stream) -> Option<SocketAddr> {
-    let digest = session.get_socket_digest()?;
-    digest
-        .peer_addr
-        .get()?
-        .as_ref()
-        .and_then(|addr| addr.as_inet())
-        .copied()
-        .map(normalize_socket_addr)
 }
 
 /// Collapse an IPv4-mapped IPv6 peer address from a dual-stack listener.

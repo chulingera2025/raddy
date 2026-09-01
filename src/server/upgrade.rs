@@ -29,6 +29,7 @@
 
 use crate::config::ast::CompiledConfig;
 use crate::config::snapshot;
+use crate::layer4::tcp::TcpListenerService;
 use crate::layer4::udp::UdpProxy;
 use crate::server::startup::RunOptions;
 use std::path::{Path, PathBuf};
@@ -112,6 +113,7 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     // only ever observes the replacement's fresh socket.
     let _ = std::fs::remove_file(&opts.upgrade_sock);
     cleanup_udp_handoff_files(&opts.upgrade_sock);
+    cleanup_l4_handoff_files(&opts.upgrade_sock, ".tcp.");
 
     eprintln!(
         "raddex: spawning replacement {} (waiting on {})",
@@ -137,6 +139,7 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
 
     wait_for_exit(old_pid, OLD_PROCESS_EXIT_TIMEOUT)?;
     verify_udp_handoffs(&snapshot, &opts.upgrade_sock)?;
+    verify_tcp_handoffs(&snapshot, &opts.upgrade_sock)?;
 
     // Confirm the replacement actually took over: the pidfile must now name a
     // different, live process. Without this check a race where the old process
@@ -188,6 +191,73 @@ pub(crate) fn write_topology_state(pidfile: &Path, config: &CompiledConfig) -> R
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("failed to protect topology state {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Remove layer-4 handoff artifacts left by a previous interrupted upgrade.
+///
+/// `infix` selects the transport (`".udp."` or `".tcp."`). A stale status file
+/// would otherwise make the next upgrade believe a handoff already succeeded.
+fn cleanup_l4_handoff_files(upgrade_sock: &str, infix: &str) {
+    let Some(parent) = Path::new(upgrade_sock).parent() else {
+        return;
+    };
+    let Some(prefix) = Path::new(upgrade_sock).file_name() else {
+        return;
+    };
+    let prefix = format!("{}{infix}", prefix.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Verify that every configured raw-TCP listener completed its handoff.
+///
+/// The L4 TCP data path binds its own socket, so — unlike the HTTP listeners —
+/// Pingora does not transfer it. A listener that never publishes `ok` means the
+/// replacement did not inherit the port, so the upgrade must not be treated as
+/// successful.
+fn verify_tcp_handoffs(config: &CompiledConfig, upgrade_sock: &str) -> Result<(), String> {
+    let listeners: Vec<String> = config
+        .layer4
+        .iter()
+        .filter_map(|listener| match listener {
+            crate::config::ast::Layer4Listener::Tcp(tcp) if !tcp.transparent => {
+                Some(tcp.listen.display())
+            }
+            _ => None,
+        })
+        .collect();
+    if listeners.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for listener in listeners {
+        let path = TcpListenerService::status_path_for(upgrade_sock, &listener);
+        let status = loop {
+            if let Ok(status) = std::fs::read_to_string(&path) {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "TCP listener {listener} did not publish an upgrade status; use a normal restart"
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        if !status.trim().eq("ok") {
+            return Err(format!(
+                "TCP listener {listener} handoff failed: {}; use a normal restart",
+                status.trim()
+            ));
+        }
     }
     Ok(())
 }
