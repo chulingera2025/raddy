@@ -34,6 +34,14 @@ so existing links do not break; the table below is the logical grouping:
 | Releases | `RELEASE_CHECKLIST_*.md` — historical release evidence |
 | `DOCUMENTATION.md` | This structure and maintenance policy |
 
+Contribution guidance lives in `CONTRIBUTING.md` at the repository root, next to
+`README.md`, `CHANGELOG.md`, and `SECURITY.md`.
+
+Benchmarks are records too, and they live with the harness that produces them:
+`bench/README.md` for the HTTP comparison and `bench/l4/README.md` for the
+layer-4 forwarding comparison. `docs/PERFORMANCE.md` carries the published
+numbers and the rules for reading them.
+
 Implementation notes may live in pull requests or release checklists, but a
 released behavior belongs in the specification, a user guide, or the
 architecture record before it is advertised as supported.

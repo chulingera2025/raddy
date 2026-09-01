@@ -195,6 +195,7 @@ If either backend uses a private CA, add `tls_ca <path>` to the
 - [Architecture and capability boundaries](docs/PINGORA_CAPABILITY_RESEARCH.md) — what is native, application-level, Linux-only, or sidecar-based.
 - [Layer 4 architecture](docs/L4_PROXY_PLAN.md) — TCP/UDP runtime model and operational invariants.
 - [Performance comparison](docs/PERFORMANCE.md) — the Docker comparison suite and normalized metrics.
+- [Contributing](CONTRIBUTING.md) — the checks every change must pass, and how to add a DNS-01 provider.
 - [Release checklist](docs/RELEASE_CHECKLIST_v0.3.5.md) — historical release evidence.
 
 ## Build from source

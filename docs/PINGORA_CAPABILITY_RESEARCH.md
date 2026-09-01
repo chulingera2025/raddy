@@ -32,10 +32,20 @@ its own TLS, selects and health-checks its own upstreams, and relays with
 background services, observe the shutdown watch, and use its descriptor-passing
 helper for the upgrade handoff — but that is lifecycle, not data.
 
-This split is a measured choice, not a preference. Pingora's transport stream
-wraps the socket in a buffered writer, which cost the L4 relay a copy and a
-flush syscall per chunk: on the same host, long-lived TCP used 129.9% of Nginx's
-CPU and 282.1% of its memory through Pingora, against 81.8% and 110.3% native.
+This split is a measured choice, and the measurement is mixed. On one host
+(`bench/l4`, Nginx stream = 100%), holding 10 000 idle connections costs 79.2%
+of Nginx's CPU and 113.1% of its memory natively, against 129.9% and 282.1%
+through Pingora; UDP forwarding improved on both axes. Those are the workloads a
+layer-4 proxy exists for.
+
+Two costs are unresolved. The native listener reaches 44.5% of Nginx's
+connection rate where the Pingora path reached 90.5%, and moves 64 KiB payloads
+at 46.1% against 81.9%. Giving each worker its own `SO_REUSEPORT` accept loop
+removed the connection-rate error rate but not the deficit, so accept
+concurrency is not the explanation. Deployments dominated by short connections
+or bulk transfer should not treat the native path as faster today. See
+[the performance record](PERFORMANCE.md).
+
 HTTP keeps using Pingora, where its proxy engine, connection pooling, and
 protocol handling are the reason to depend on it at all.
 

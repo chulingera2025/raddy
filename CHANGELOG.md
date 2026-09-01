@@ -45,31 +45,35 @@ section short.
   forward passes through Pingora, which remains the process host and the HTTP
   engine. Raddex now has two cores: L4 on Tokio, L7 on Pingora.
 
-  The reason is measurable, not architectural taste. Pingora's transport stream
-  wraps the socket in a buffered writer, costing the relay a copy and a flush
-  syscall per chunk. Measured on the same host (`bench/l4`, `quick` profile,
-  Nginx stream = 100%), against the Pingora path it replaces:
+  The reason is measurable, not architectural taste. Measured on one host
+  (`bench/l4`, `quick` profile, Nginx stream = 100%), against the Pingora path
+  it replaces:
 
   | Metric | Pingora path | Native path |
   | --- | ---: | ---: |
-  | Long-lived 10K · memory | 282.1% | **113.3%** |
-  | Long-lived 10K · CPU | 129.9% | **120.1%** |
-  | UDP flows 10K · CPU | 128.6% | **101.0%** |
-  | TCP connect rate | 90.5% | **52.4%** |
-  | TCP throughput 64 KiB | 81.9% | **48.0%** |
+  | Long-lived 10K · CPU | 129.9% | **79.2%** |
+  | Long-lived 10K · memory | 282.1% | **113.1%** |
+  | UDP flows 10K · memory | — | **56.4%** |
+  | UDP packets/s · CPU | — | **86.2%** |
+  | TCP connect rate | 90.5% | **44.5%** |
+  | TCP throughput 64 KiB | 81.9% | **46.1%** |
   | TCP p99 / 64 B | 50.0% | **250.0%** |
 
-  **The memory result is decisive and the connection-rate result is a
-  regression.** Holding 10 000 idle connections now costs 113% of Nginx's memory
-  instead of 282%, and UDP forwarding costs less CPU. But the native listener
-  accepts more slowly than the Pingora path did (52.4% of Nginx's connection
-  rate, with a 0.59% error rate that exceeds the suite's own 0.1% stability
-  threshold) and moves large payloads more slowly. A single accept loop against
-  Nginx's two workers is the leading suspect; this is being investigated and the
-  numbers here will be replaced with a repeated `full`-profile run.
+  **This is a trade, not a clean win.** Holding 10 000 idle connections now
+  costs 79.2% of Nginx's CPU and 113.1% of its memory, against 129.9% and
+  282.1% through Pingora — the workload the layer-4 proxy exists for. UDP
+  improved on both axes. But the native listener accepts more slowly than the
+  Pingora path did and moves large payloads more slowly, and neither has been
+  explained yet: adding one `SO_REUSEPORT` accept loop per worker eliminated the
+  connection-rate error rate but did not raise the rate itself, which points at
+  something other than accept concurrency.
 
-  Deployments that hold many long-lived connections benefit today. Deployments
-  dominated by short connections should wait for the accept-path fix.
+  Deployments dominated by long-lived connections or UDP benefit today.
+  Deployments dominated by short connections or bulk transfer should not upgrade
+  for performance yet. The `quick` profile runs one repetition and shows visible
+  run-to-run variance — Caddy's connection rate moved from 105.5% to 77.0%
+  between two runs of the same commit-pair — so these figures will be replaced
+  by a repeated `full`-profile run before any of them is advertised.
 
   No configuration changes. `tcp` listeners, `lb_policy`, `health_check`,
   `sni`, `tls`, `transparent`, timeouts, and limits all behave as documented.

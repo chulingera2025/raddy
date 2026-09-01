@@ -115,6 +115,7 @@ Nginx 的 361%，比 Caddy 还差。
 - [安装](docs/INSTALL.zh_CN.md) — 安装脚本、手动安装、Docker
 - [Raddexfile 规范](docs/RADDEXFILE_SPEC.zh_CN.md) — 配置语言
 - [性能对比](docs/PERFORMANCE.zh_CN.md) — 完整场景矩阵、测试环境与复现方式
+- [贡献指南](CONTRIBUTING.md) — 每个改动必须通过的检查，以及如何新增 DNS-01 服务商
 - [English](README.md)
 
 ## 开发状态
