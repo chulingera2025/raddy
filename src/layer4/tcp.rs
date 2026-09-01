@@ -14,10 +14,13 @@
 //! Raw TCP proxy runtime (L4_PROXY_PLAN, P0).
 //!
 //! The L4 data path is native Tokio: [`TcpListenerService`] owns the accept
-//! loop and hands each accepted [`tokio::net::TcpStream`] straight to
-//! [`TcpProxyApp::handle_connection`], which performs admission (per-listener
-//! semaphore) and upstream selection, then spawns a relay task that owns the
-//! connection — so the acceptor is free to accept the next one. The relay
+//! loop. Each accepted [`tokio::net::TcpStream`] is admitted against the
+//! per-listener semaphore ([`TcpProxyApp::admit`]) *before* any per-connection
+//! work — so `max_connections` bounds pending TLS handshakes as well as
+//! established relays — and then handed to
+//! [`TcpProxyApp::handle_connection`], which selects an upstream and spawns a
+//! relay task that owns the connection, leaving the acceptor free to take the
+//! next one. The relay
 //! connects under a hard wall-clock bound, then copies bytes bidirectionally
 //! with a *true* inactivity timeout (reset by traffic in either direction) and
 //! half-close propagation, and records typed metrics and an access record on
@@ -404,7 +407,7 @@ fn resolved_set(tcp: &TcpProxyConfig, listener: &ListenAddress) -> Result<Vec<So
 }
 
 /// The live pieces a new connection needs, cloned out of the runtime.
-struct RuntimeHandle {
+pub(crate) struct RuntimeHandle {
     selector: Arc<L4Selector>,
     admission: Arc<Semaphore>,
     connect_timeout: Duration,
@@ -811,23 +814,37 @@ impl BackgroundService for TcpListenerService {
             let peer = Some(normalize_socket_addr(peer));
             let app = self.app.clone();
             let child_shutdown = shutdown.clone();
+            // Admit before the handshake so `max_connections` bounds pending
+            // handshakes too, not only established relays.
+            let Some((handle, permit)) = app.admit() else {
+                continue;
+            };
             match &self.tls {
                 None => {
-                    app.handle_connection(stream, peer, None, &child_shutdown)
+                    app.handle_connection(stream, peer, None, &child_shutdown, handle, permit)
                         .await;
                 }
                 Some(acceptor) => {
                     // The handshake is remote-driven, so it runs inside the
                     // spawned task under its own timeout: a stalled client must
-                    // never block the accept loop.
+                    // never block the accept loop. The permit moves with it and
+                    // is released if the handshake fails.
                     let acceptor = acceptor.clone();
                     tokio::spawn(async move {
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
-                                app.handle_connection(tls_stream, peer, None, &child_shutdown)
-                                    .await;
+                                app.handle_connection(
+                                    tls_stream,
+                                    peer,
+                                    None,
+                                    &child_shutdown,
+                                    handle,
+                                    permit,
+                                )
+                                .await;
                             }
                             Err(error) => {
+                                drop(permit);
                                 tracing::debug!("tcp TLS handshake failed: {error}");
                             }
                         }
@@ -945,11 +962,16 @@ impl BackgroundService for TransparentTcpProxy {
             tracing::debug!("transparent TCP connection from {peer}");
             let app = self.app.clone();
             let child_shutdown = shutdown.clone();
+            let Some((handle, permit)) = app.admit() else {
+                continue;
+            };
             app.handle_connection(
                 stream,
                 Some(normalize_socket_addr(peer)),
                 original,
                 &child_shutdown,
+                handle,
+                permit,
             )
             .await;
         }
@@ -1115,31 +1137,54 @@ impl TcpProxyApp {
     /// Returns as soon as the connection has been handed to its relay task, so
     /// the caller can accept the next connection. A connection refused by
     /// admission or by an all-unhealthy backend set is dropped here.
-    pub async fn handle_connection<S>(
+    /// Reserve one admission slot, or report the listener as full.
+    ///
+    /// Taken by the acceptor *before* any per-connection work — including the
+    /// TLS handshake — so `max_connections` bounds everything the listener is
+    /// holding open, not just established relays. A client that connects and
+    /// never completes a handshake would otherwise occupy an unbounded number
+    /// of tasks and descriptors.
+    pub(crate) fn admit(
+        self: &Arc<Self>,
+    ) -> Option<(RuntimeHandle, tokio::sync::OwnedSemaphorePermit)> {
+        // Load the current runtime (rebuilt on reload when the spec changed);
+        // new connections always use the latest upstream set and limits.
+        let handle = self.current_handle();
+        match handle.admission.clone().try_acquire_owned() {
+            Ok(permit) => Some((handle, permit)),
+            Err(_) => {
+                self.metrics.rejected.inc();
+                tracing::debug!("tcp {}: admission limit reached; rejecting", self.listener);
+                None
+            }
+        }
+    }
+
+    /// Select an upstream for an admitted connection and relay it.
+    ///
+    /// `client` is the accepted transport — a plain [`TcpStream`], or a
+    /// TLS-terminated stream once the listener terminates TLS. `peer` is the
+    /// client address and `original_destination` the Linux REDIRECT/TPROXY
+    /// destination in transparent mode (`None` otherwise). `handle` and
+    /// `permit` come from [`Self::admit`].
+    ///
+    /// Returns as soon as the connection has been handed to its relay task, so
+    /// the caller can accept the next connection. A connection refused by an
+    /// all-unhealthy backend set is dropped here, releasing the permit.
+    pub(crate) async fn handle_connection<S>(
         self: &Arc<Self>,
         client: S,
         peer: Option<SocketAddr>,
         original_destination: Option<SocketAddr>,
         shutdown: &ShutdownWatch,
+        handle: RuntimeHandle,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         tracing::debug!("tcp {}: new connection", self.listener);
-        // Load the current runtime (rebuilt on reload when the spec changed);
-        // new connections always use the latest upstream set and limits.
-        let handle = self.current_handle();
         let client_addr = peer;
         let transparent = handle.transparent;
-        // Admission first: reject before spending a worker on connect/relay
-        // when the listener is at capacity.
-        let permit = match handle.admission.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                self.metrics.rejected.inc();
-                tracing::debug!("tcp {}: admission limit reached; rejecting", self.listener);
-                return;
-            }
-        };
         let key = match handle.policy {
             crate::config::ast::LbPolicy::IpHash => client_addr
                 .map(|a| a.ip().to_string().into_bytes())
