@@ -375,6 +375,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                     sink,
                     tls_acceptor,
                     opts.upgrade,
+                    opts.threads,
                     opts.upgrade_sock.clone(),
                     Some(server.watch_execution_phase()),
                 )?;

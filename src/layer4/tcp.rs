@@ -48,7 +48,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -538,18 +538,29 @@ impl TcpProxyApp {
 /// [`TcpProxyApp`]. Registered as a Pingora `BackgroundService` purely for
 /// process lifecycle — no relayed byte passes through Pingora.
 pub struct TcpListenerService {
+    /// The listening sockets, one per accept loop.
+    ///
+    /// A single accept loop is a scalability ceiling: every connection is
+    /// accepted, admitted, and dispatched by one task, so connection-rate
+    /// workloads queue behind it while Nginx spreads the same work over its
+    /// workers. `SO_REUSEPORT` gives each loop its own socket and lets the
+    /// kernel distribute incoming connections between them.
+    ///
     /// Bound at construction — which happens on the startup thread, before the
-    /// Pingora server builds its runtime — and converted to a Tokio listener
+    /// Pingora server builds its runtime — and converted to Tokio listeners
     /// inside [`BackgroundService::start`], which does run on the runtime.
     /// `tokio::net::TcpListener::from_std` panics without a reactor, so the
-    /// socket cannot be registered any earlier. `None` until received when this
+    /// sockets cannot be registered any earlier. Empty until received when this
     /// process is an upgrade replacement.
-    listener: Mutex<Option<std::net::TcpListener>>,
+    listeners: Mutex<Vec<std::net::TcpListener>>,
     app: Arc<TcpProxyApp>,
     /// Set when the listener terminates TLS before relaying (spec §5.7).
     tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
     /// The `tcp/<address>` label, for logs and handoff artifacts.
     label: String,
+    /// How many accept loops (and therefore `SO_REUSEPORT` sockets) this
+    /// listener runs. Matches the configured worker-thread count.
+    accept_loops: usize,
     /// True when this process must receive the listening socket from the
     /// outgoing process instead of binding it.
     upgrade: bool,
@@ -577,6 +588,7 @@ impl TcpListenerService {
         access_log: Option<Arc<AccessLogSink>>,
         tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
         upgrade: bool,
+        accept_loops: usize,
         #[cfg(unix)] upgrade_sock: String,
         #[cfg(unix)] phase_watch: Option<
             tokio::sync::broadcast::Receiver<pingora::server::ExecutionPhase>,
@@ -584,13 +596,17 @@ impl TcpListenerService {
     ) -> Result<Self, String> {
         let ListenAddress::Socket(address) = &tcp.listen;
         let label = format!("tcp/{}", tcp.listen.display());
-        let listener = if upgrade {
-            None
+        let accept_loops = accept_loops.max(1);
+        let listeners = if upgrade {
+            Vec::new()
         } else {
-            Some(bind_listener(*address)?)
+            (0..accept_loops)
+                .map(|_| bind_listener(*address, accept_loops > 1))
+                .collect::<Result<Vec<_>, _>>()?
         };
         Ok(Self {
-            listener: Mutex::new(listener),
+            accept_loops,
+            listeners: Mutex::new(listeners),
             app: Arc::new(TcpProxyApp::new(tcp, config_store, access_log)?),
             tls,
             #[cfg(unix)]
@@ -653,21 +669,28 @@ impl TcpListenerService {
 
     #[cfg(unix)]
     async fn send_handoff_inner(&self) -> Result<(), String> {
-        let fd = {
-            let guard = self.listener.lock().expect("L4 TCP listener lock poisoned");
-            guard
-                .as_ref()
-                .ok_or("TCP listening socket is unavailable")?
-                .as_raw_fd()
+        let fds: Vec<i32> = {
+            let guard = self
+                .listeners
+                .lock()
+                .expect("L4 TCP listener lock poisoned");
+            if guard.is_empty() {
+                return Err("TCP listening socket is unavailable".to_string());
+            }
+            guard.iter().map(|listener| listener.as_raw_fd()).collect()
         };
         let path = self.handoff_socket_path();
         // `Fds::send_to_sock` blocks on the unix socket, so it runs off the
-        // reactor thread.
+        // reactor thread. Every `SO_REUSEPORT` socket is transferred, so the
+        // replacement inherits the same accept parallelism.
         tokio::task::spawn_blocking(move || {
-            let mut fds = pingora::server::Fds::new();
-            fds.add("listener".to_string(), fd);
-            fds.send_to_sock(path.as_str())
-                .map_err(|e| format!("send TCP listener descriptor: {e}"))?;
+            let mut transfer = pingora::server::Fds::new();
+            for (index, fd) in fds.iter().enumerate() {
+                transfer.add(format!("listener-{index}"), *fd);
+            }
+            transfer
+                .send_to_sock(path.as_str())
+                .map_err(|e| format!("send TCP listener descriptors: {e}"))?;
             Ok::<(), String>(())
         })
         .await
@@ -676,22 +699,28 @@ impl TcpListenerService {
 
     /// Receive the inherited listening descriptor from the outgoing process.
     #[cfg(unix)]
-    async fn receive_handoff(&self) -> Result<std::net::TcpListener, String> {
+    async fn receive_handoff(&self) -> Result<Vec<std::net::TcpListener>, String> {
         let path = self.handoff_socket_path();
+        let expected = self.accept_loops;
         tokio::task::spawn_blocking(move || {
-            let mut fds = pingora::server::Fds::new();
-            fds.get_from_sock(path.as_str())
-                .map_err(|e| format!("receive TCP listener descriptor: {e}"))?;
-            let fd = *fds
-                .get("listener")
-                .ok_or("TCP handoff is missing the listener descriptor")?;
-            // SAFETY: the descriptor was transferred through SCM_RIGHTS and is
-            // now owned by this process.
-            let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-            listener
-                .set_nonblocking(true)
-                .map_err(|e| format!("set inherited TCP listener nonblocking: {e}"))?;
-            Ok(listener)
+            let mut transfer = pingora::server::Fds::new();
+            transfer
+                .get_from_sock(path.as_str())
+                .map_err(|e| format!("receive TCP listener descriptors: {e}"))?;
+            let mut listeners = Vec::with_capacity(expected);
+            for index in 0..expected {
+                let fd = *transfer
+                    .get(&format!("listener-{index}"))
+                    .ok_or_else(|| format!("TCP handoff is missing listener descriptor {index}"))?;
+                // SAFETY: the descriptor was transferred through SCM_RIGHTS and
+                // is now owned by this process.
+                let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|e| format!("set inherited TCP listener nonblocking: {e}"))?;
+                listeners.push(listener);
+            }
+            Ok(listeners)
         })
         .await
         .map_err(|e| format!("TCP handoff receiver failed: {e}"))?
@@ -708,7 +737,10 @@ impl BackgroundService for TcpListenerService {
         if self.upgrade {
             match self.receive_handoff().await {
                 Ok(listener) => {
-                    *self.listener.lock().expect("L4 TCP listener lock poisoned") = Some(listener);
+                    *self
+                        .listeners
+                        .lock()
+                        .expect("L4 TCP listener lock poisoned") = listener;
                 }
                 Err(error) => {
                     tracing::error!("{}: failed to inherit listener: {error}", self.label);
@@ -725,35 +757,39 @@ impl BackgroundService for TcpListenerService {
             }
         }
 
-        // Register the pre-bound socket with the reactor now that a runtime
-        // exists. The `std` listener is retained (cloned, not consumed) because
-        // its descriptor is what a later upgrade hands to the replacement.
-        let std_listener = self
-            .listener
+        // Register the pre-bound sockets with the reactor now that a runtime
+        // exists. The `std` listeners are retained (cloned, not consumed)
+        // because their descriptors are what a later upgrade hands over.
+        let std_listeners: Vec<std::net::TcpListener> = self
+            .listeners
             .lock()
             .expect("L4 TCP listener lock poisoned")
-            .as_ref()
-            .and_then(|listener| listener.try_clone().ok());
-        let Some(std_listener) = std_listener else {
+            .iter()
+            .filter_map(|listener| listener.try_clone().ok())
+            .collect();
+        if std_listeners.is_empty() {
             tracing::error!("{}: listening socket is unavailable", self.label);
             if self.upgrade {
                 std::process::exit(1);
             }
             return;
-        };
-        let listener = match TcpListener::from_std(std_listener) {
-            Ok(listener) => listener,
-            Err(error) => {
-                tracing::error!("{}: listener registration failed: {error}", self.label);
-                if self.upgrade {
-                    std::process::exit(1);
+        }
+        let mut listeners = Vec::with_capacity(std_listeners.len());
+        for std_listener in std_listeners {
+            match TcpListener::from_std(std_listener) {
+                Ok(listener) => listeners.push(Arc::new(listener)),
+                Err(error) => {
+                    tracing::error!("{}: listener registration failed: {error}", self.label);
+                    if self.upgrade {
+                        std::process::exit(1);
+                    }
+                    return;
                 }
-                return;
             }
-        };
+        }
 
         // Pingora signals the fd-transfer phase of a graceful upgrade on this
-        // broadcast channel; that is when the descriptor must be sent.
+        // broadcast channel; that is when the descriptors must be sent.
         let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         #[cfg(unix)]
         if let Some(mut phase) = self
@@ -777,79 +813,116 @@ impl BackgroundService for TcpListenerService {
         #[cfg(not(unix))]
         drop(handoff_tx);
 
-        loop {
-            let accepted = tokio::select! {
-                result = listener.accept() => result,
-                signal = handoff_rx.recv() => {
-                    if signal.is_some() {
-                        #[cfg(unix)]
-                        self.send_handoff().await;
-                        // Stop accepting: the replacement owns the socket now.
-                        // In-flight relays keep running until they drain or the
-                        // shutdown watch cancels them.
-                        break;
-                    }
-                    continue;
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break;
-                    }
-                    continue;
-                }
-            };
-            let (stream, peer) = match accepted {
-                Ok(pair) => pair,
-                Err(error) => {
-                    // A per-connection accept error (EMFILE, a client that went
-                    // away between the SYN and accept) must not kill the
-                    // listener; log and take the next one.
-                    tracing::warn!("tcp accept failed: {error}");
-                    continue;
-                }
-            };
-            // Relayed traffic is latency-sensitive and already chunked by the
-            // pump, so Nagle only adds delay.
-            let _ = stream.set_nodelay(true);
-            let peer = Some(normalize_socket_addr(peer));
+        // One accept task per `SO_REUSEPORT` socket. `stop` ends them all at
+        // once, so the handoff and the shutdown watch stay single-signal.
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let mut workers = Vec::with_capacity(listeners.len());
+        for listener in listeners {
             let app = self.app.clone();
-            let child_shutdown = shutdown.clone();
-            // Admit before the handshake so `max_connections` bounds pending
-            // handshakes too, not only established relays.
-            let Some((handle, permit)) = app.admit() else {
+            let tls = self.tls.clone();
+            let shutdown = shutdown.clone();
+            let stop = stop.clone();
+            workers.push(tokio::spawn(async move {
+                accept_loop(listener, app, tls, shutdown, stop).await;
+            }));
+        }
+
+        // Wait for whichever ends the listener: shutdown, or the upgrade
+        // handoff. The accept tasks keep running until `stop` is notified.
+        tokio::select! {
+            signal = handoff_rx.recv() => {
+                if signal.is_some() {
+                    #[cfg(unix)]
+                    self.send_handoff().await;
+                }
+            }
+            _ = async {
+                loop {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    if shutdown.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+        // Stop accepting. In-flight relays keep running until they drain or the
+        // shutdown watch cancels them.
+        stop.notify_waiters();
+        for worker in workers {
+            let _ = worker.await;
+        }
+    }
+}
+
+/// Accept connections on one socket until `stop` is notified.
+///
+/// Each `SO_REUSEPORT` socket gets one of these, so accept work scales with the
+/// configured worker count instead of funnelling through a single task.
+async fn accept_loop(
+    listener: Arc<TcpListener>,
+    app: Arc<TcpProxyApp>,
+    tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
+    shutdown: ShutdownWatch,
+    stop: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            _ = stop.notified() => break,
+        };
+        let (stream, peer) = match accepted {
+            Ok(pair) => pair,
+            Err(error) => {
+                // A per-connection accept error (EMFILE, a client that went
+                // away between the SYN and accept) must not kill the listener;
+                // log and take the next one.
+                tracing::warn!("tcp accept failed: {error}");
                 continue;
-            };
-            match &self.tls {
-                None => {
-                    app.handle_connection(stream, peer, None, &child_shutdown, handle, permit)
-                        .await;
-                }
-                Some(acceptor) => {
-                    // The handshake is remote-driven, so it runs inside the
-                    // spawned task under its own timeout: a stalled client must
-                    // never block the accept loop. The permit moves with it and
-                    // is released if the handshake fails.
-                    let acceptor = acceptor.clone();
-                    tokio::spawn(async move {
-                        match acceptor.accept(stream).await {
-                            Ok(tls_stream) => {
-                                app.handle_connection(
-                                    tls_stream,
-                                    peer,
-                                    None,
-                                    &child_shutdown,
-                                    handle,
-                                    permit,
-                                )
-                                .await;
-                            }
-                            Err(error) => {
-                                drop(permit);
-                                tracing::debug!("tcp TLS handshake failed: {error}");
-                            }
+            }
+        };
+        // Relayed traffic is latency-sensitive and already chunked by the pump,
+        // so Nagle only adds delay.
+        let _ = stream.set_nodelay(true);
+        let peer = Some(normalize_socket_addr(peer));
+        let child_shutdown = shutdown.clone();
+        // Admit before the handshake so `max_connections` bounds pending
+        // handshakes too, not only established relays.
+        let Some((handle, permit)) = app.admit() else {
+            continue;
+        };
+        match &tls {
+            None => {
+                app.handle_connection(stream, peer, None, &child_shutdown, handle, permit)
+                    .await;
+            }
+            Some(acceptor) => {
+                // The handshake is remote-driven, so it runs inside the spawned
+                // task under its own timeout: a stalled client must never block
+                // the accept loop. The permit moves with it and is released if
+                // the handshake fails.
+                let acceptor = acceptor.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            app.handle_connection(
+                                tls_stream,
+                                peer,
+                                None,
+                                &child_shutdown,
+                                handle,
+                                permit,
+                            )
+                            .await;
                         }
-                    });
-                }
+                        Err(error) => {
+                            drop(permit);
+                            tracing::debug!("tcp TLS handshake failed: {error}");
+                        }
+                    }
+                });
             }
         }
     }
@@ -861,7 +934,13 @@ impl BackgroundService for TcpListenerService {
 /// listener serves both families, matching the HTTP listeners. Returns a
 /// blocking `std` listener: binding happens on the startup thread, before a
 /// Tokio runtime exists, so reactor registration is deferred to `start`.
-fn bind_listener(address: SocketAddr) -> Result<std::net::TcpListener, String> {
+///
+/// `reuse_port` sets `SO_REUSEPORT`, which is what lets several sockets share
+/// the address so each accept loop has its own and the kernel distributes
+/// connections between them. It is only set when more than one loop is
+/// requested, so a single-loop listener keeps the stricter "one bind wins"
+/// behaviour and a genuine port conflict is still an error.
+fn bind_listener(address: SocketAddr, reuse_port: bool) -> Result<std::net::TcpListener, String> {
     let domain = if address.is_ipv4() {
         Domain::IPV4
     } else {
@@ -872,6 +951,11 @@ fn bind_listener(address: SocketAddr) -> Result<std::net::TcpListener, String> {
     socket
         .set_reuse_address(true)
         .map_err(|e| format!("set TCP reuseaddr: {e}"))?;
+    if reuse_port {
+        socket
+            .set_reuse_port(true)
+            .map_err(|e| format!("set TCP reuseport: {e}"))?;
+    }
     if let SocketAddr::V6(v6) = address {
         if v6.ip().is_unspecified() {
             socket
@@ -1528,7 +1612,12 @@ async fn bidirectional<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let last = Arc::new(tokio::sync::Mutex::new(Instant::now()));
+    // The activity clock is an atomic, not a mutex: both pumps touch it on
+    // every chunk, and an async lock there serialises the two directions
+    // against each other on the hot path. Time is stored as milliseconds since
+    // `base`, which is ample resolution for an idle timeout.
+    let base = Instant::now();
+    let last = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
     // Watchdog: once the connection has been idle for `idle`, or the server
@@ -1547,7 +1636,7 @@ where
                     stop.store(true, Ordering::Relaxed);
                     return;
                 }
-                let deadline = *last.lock().await + idle;
+                let deadline = base + Duration::from_millis(last.load(Ordering::Relaxed)) + idle;
                 let now = Instant::now();
                 if now >= deadline {
                     stop.store(true, Ordering::Relaxed);
@@ -1570,8 +1659,8 @@ where
     let (upstream_r, upstream_w) = tokio::io::split(&mut upstream);
 
     let (c2u, u2c) = tokio::join!(
-        pump(client_r, upstream_w, &last, &stop),
-        pump(upstream_r, client_w, &last, &stop),
+        pump(client_r, upstream_w, base, &last, &stop),
+        pump(upstream_r, client_w, base, &last, &stop),
     );
 
     let end = if *shutdown.borrow() {
@@ -1591,7 +1680,8 @@ where
 async fn pump<R, W>(
     mut src: R,
     mut dst: W,
-    last: &Arc<tokio::sync::Mutex<Instant>>,
+    base: Instant,
+    last: &Arc<AtomicU64>,
     stop: &Arc<AtomicBool>,
 ) -> u64
 where
@@ -1623,7 +1713,7 @@ where
                     break;
                 }
                 total += n as u64;
-                *last.lock().await = Instant::now();
+                last.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
             }
             Err(_) => break,
         }

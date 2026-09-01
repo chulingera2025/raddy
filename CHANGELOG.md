@@ -7,45 +7,6 @@ section short.
 
 ## [Unreleased]
 
-### Changed
-
-- **The layer-4 data path is now native Tokio.** Raw TCP listeners bind their
-  own socket, run their own accept loop, terminate their own TLS, select and
-  health-check their own upstreams, and relay with `tokio::io`. Nothing they
-  forward passes through Pingora, which remains the process host and the HTTP
-  engine. Raddex now has two cores: L4 on Tokio, L7 on Pingora.
-
-  The reason is measurable, not architectural taste. Pingora's transport stream
-  wraps the socket in a buffered writer, costing the relay a copy and a flush
-  syscall per chunk. On the same host (`bench/l4`, Nginx stream = 100%):
-
-  | Metric | Pingora path | Native path |
-  | --- | ---: | ---: |
-  | TCP connect rate | 90.5% | **103.1%** |
-  | Long-lived 10K · CPU | 129.9% | **81.8%** |
-  | Long-lived 10K · memory | 282.1% | **110.3%** |
-  | TCP throughput 64 KiB | **81.9%** | 77.4% |
-
-  No configuration changes. `tcp` listeners, `lb_policy`, `health_check`,
-  `sni`, `tls`, `transparent`, timeouts, and limits all behave as documented.
-
-- `ip_hash` for layer-4 listeners is now consistent hashing over a 160-vnode
-  ring, so adding or removing a backend no longer reshuffles unrelated clients.
-
-### Fixed
-
-- Layer-4 `ip_hash` distributed client IPs from one subnet very unevenly.
-  Selection hashed with FNV-1a, whose high-bit avalanche is weak for inputs
-  sharing a long prefix — which is exactly what client IPs are. Measured, 400
-  addresses in one `/24` landed in 16% of the hash space and every one of them
-  was routed to a single backend. Selection now applies an avalanche finalizer.
-  (The UDP selector was checked for the same defect and does not have it.)
-
-- `TransparentTcpProxy` panicked on startup with "there is no reactor running":
-  it registered its listener with Tokio from the startup thread, before the
-  runtime existed. Both layer-4 TCP listeners now bind a blocking socket and
-  register it once their service starts.
-
 ### Added
 
 - `dns_challenge` accepts a block form carrying any number of named
@@ -77,6 +38,44 @@ section short.
   45.8%, CPU 70.8%).
 
 ### Changed
+
+- **The layer-4 data path is now native Tokio.** Raw TCP listeners bind their
+  own socket, run their own accept loop, terminate their own TLS, select and
+  health-check their own upstreams, and relay with `tokio::io`. Nothing they
+  forward passes through Pingora, which remains the process host and the HTTP
+  engine. Raddex now has two cores: L4 on Tokio, L7 on Pingora.
+
+  The reason is measurable, not architectural taste. Pingora's transport stream
+  wraps the socket in a buffered writer, costing the relay a copy and a flush
+  syscall per chunk. Measured on the same host (`bench/l4`, `quick` profile,
+  Nginx stream = 100%), against the Pingora path it replaces:
+
+  | Metric | Pingora path | Native path |
+  | --- | ---: | ---: |
+  | Long-lived 10K · memory | 282.1% | **113.3%** |
+  | Long-lived 10K · CPU | 129.9% | **120.1%** |
+  | UDP flows 10K · CPU | 128.6% | **101.0%** |
+  | TCP connect rate | 90.5% | **52.4%** |
+  | TCP throughput 64 KiB | 81.9% | **48.0%** |
+  | TCP p99 / 64 B | 50.0% | **250.0%** |
+
+  **The memory result is decisive and the connection-rate result is a
+  regression.** Holding 10 000 idle connections now costs 113% of Nginx's memory
+  instead of 282%, and UDP forwarding costs less CPU. But the native listener
+  accepts more slowly than the Pingora path did (52.4% of Nginx's connection
+  rate, with a 0.59% error rate that exceeds the suite's own 0.1% stability
+  threshold) and moves large payloads more slowly. A single accept loop against
+  Nginx's two workers is the leading suspect; this is being investigated and the
+  numbers here will be replaced with a repeated `full`-profile run.
+
+  Deployments that hold many long-lived connections benefit today. Deployments
+  dominated by short connections should wait for the accept-path fix.
+
+  No configuration changes. `tcp` listeners, `lb_policy`, `health_check`,
+  `sni`, `tls`, `transparent`, timeouts, and limits all behave as documented.
+
+- `ip_hash` for layer-4 listeners is now consistent hashing over a 160-vnode
+  ring, so adding or removing a backend no longer reshuffles unrelated clients.
 
 - DNS-01 providers are now registry entries rather than hard-coded branches.
   Each provider declares its credential fields in `src/server/dns/mod.rs`, and
@@ -112,6 +111,20 @@ section short.
   rename the file. Nothing else falls back: Prometheus dashboards scraping
   `raddy_*` and units referencing `/etc/raddy/` must be updated at upgrade
   time. Existing GitHub URLs keep working through GitHub's rename redirect.
+
+### Fixed
+
+- Layer-4 `ip_hash` distributed client IPs from one subnet very unevenly.
+  Selection hashed with FNV-1a, whose high-bit avalanche is weak for inputs
+  sharing a long prefix — which is exactly what client IPs are. Measured, 400
+  addresses in one `/24` landed in 16% of the hash space and every one of them
+  was routed to a single backend. Selection now applies an avalanche finalizer.
+  (The UDP selector was checked for the same defect and does not have it.)
+
+- `TransparentTcpProxy` panicked on startup with "there is no reactor running":
+  it registered its listener with Tokio from the startup thread, before the
+  runtime existed. Both layer-4 TCP listeners now bind a blocking socket and
+  register it once their service starts.
 
 ## [v0.3.5] — 2026-08-26
 
