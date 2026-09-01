@@ -15,16 +15,18 @@ The origin server, oha, report generator, and proxy builds run in containers.
 
 ## Run it
 
-From the repository root:
-
-```bash
-./bench/scripts/run.sh quick
-```
-
-Use the complete matrix when a longer run is appropriate:
+From the repository root, the comparable run — this is the profile the
+published numbers come from:
 
 ```bash
 ./bench/scripts/run.sh full
+```
+
+A 3-second-per-point smoke test, for checking that the harness works. Its
+numbers are **not** comparable and must not be published:
+
+```bash
+./bench/scripts/run.sh quick
 ```
 
 Run the report-script unit tests without starting proxy containers:
@@ -36,7 +38,7 @@ Run the report-script unit tests without starting proxy containers:
 The resource limit can be changed for a controlled local experiment:
 
 ```bash
-BENCH_CPUS=4 BENCH_MEMORY_LIMIT=2g ./bench/scripts/run.sh quick
+BENCH_CPUS=4 BENCH_MEMORY_LIMIT=2g ./bench/scripts/run.sh full
 ```
 
 Each run starts the origin once and starts Nginx, Caddy, and Raddex one at a

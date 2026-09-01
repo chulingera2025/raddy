@@ -71,22 +71,82 @@ curl -H 'Host: example.local' http://127.0.0.1:8090/
 `raddex check` performs the same configuration validation used by reload. Keep
 it in deployment scripts and CI before starting or reloading the service.
 
-## Relative performance benchmark
+## Where Raddex actually lands on performance
 
-The repository includes a Docker comparison suite for Nginx, Caddy, and Raddex.
-It uses the same origin and scenario for each target and normalizes every
-scenario against Nginx (`1.00x = 100%`).
+The repository includes a Docker comparison suite that runs Nginx, Caddy, and
+Raddex one at a time against the same origin, scenario matrix, TLS certificate,
+and resource limits. Every number below comes from one `full` run and is
+normalized against Nginx in its own scenario.
 
-![Relative maximum stable throughput](page/public/benchmarks/throughput.svg)
+**Summary: Raddex sits between Caddy and Nginx.** It is substantially leaner
+than Caddy on every axis measured, and it does not match Nginx on raw
+throughput or per-request CPU. If you are replacing Nginx purely for speed,
+this data does not justify the switch; if you are choosing between Caddy-style
+configuration ergonomics and Nginx-style efficiency, that is the gap Raddex
+targets.
 
-Run it locally with:
+Medians across the nine scenarios, plus the one scenario that actually measures
+peak throughput (Nginx = 100%):
+
+| Metric | Caddy | Raddex | Better is |
+| --- | ---: | ---: | --- |
+| Max stable throughput (concurrency scan) | 39.7% | **59.6%** | higher |
+| p99 latency (median of 9 scenarios) | 154.5% | **116.6%** | lower |
+| CPU per request (median) | 274.7% | **146.5%** | lower |
+| Peak memory (median) | 306.2% | **174.0%** | lower |
+
+In absolute terms on the test machine, the concurrency scan peaked at 15 603
+QPS for Nginx, 9 297 for Raddex, and 6 201 for Caddy. No target recorded a
+non-zero error rate in any scenario.
+
+Two results worth calling out individually:
+
+- **HTTPS with HTTP/2 multiplexing.** At a 4 000 QPS target, Nginx and Raddex
+  both sustained it (4 008 QPS); Caddy reached only 1 008 QPS (25.1%) and used
+  6.5× Nginx's CPU per request.
+- **Connection churn is Raddex's weakest scenario.** p99 is 361% of Nginx
+  (5.08 ms vs 1.41 ms) and worse than Caddy's 116%. Keep-alive workloads are
+  fine; a workload that opens a fresh connection per request is not where
+  Raddex is strong today.
+
+Raddex beats Nginx in exactly one scenario — 1 MiB responses, at 45.8% of its
+p99 and 70.8% of its CPU per request.
+
+### How to read the full table
+
+Seven of the nine scenarios drive a **fixed** request rate, so every target
+reports `100.0%` throughput there — that is all three hitting the target rate,
+not a tie on capacity. Only the concurrency scan searches for maximum stable
+throughput, so it is the only throughput figure that means anything. A point
+counts as stable only at an error rate ≤ 0.1%.
+
+### What was measured, and what was not
+
+- **Test machine**: 10-core / 7 GiB Debian 12 host, Docker 29.7. Each proxy ran
+  under a 2 CPU / 1 GiB limit, with Nginx at 2 workers and Raddex at 2 Pingora
+  threads. `oha` 1.16.0 as the load generator; 10 s warm-up, 30 s measurement,
+  3 repetitions, aggregated by median.
+- **Access logging is off for all three.** This is fair — no target writes logs
+  — but it means Raddex's access-log path is not exercised here, and it is not
+  free: it serializes on one mutex and flushes per request. Enable it and
+  expect a different profile than these numbers.
+- **Not covered**: ACME, caching, TCP/UDP, QUIC/HTTP3, and anything
+  implementation-specific. Those need their own fairness definitions.
+- **Relative only.** The percentages are valid within a scenario on one machine
+  and one run. Do not compare absolute QPS across machines, and re-run the
+  suite on your own hardware before treating any of this as a capacity plan.
+
+Reproduce it — the host needs only Docker Engine and Compose v2:
 
 ```bash
-./bench/scripts/run.sh quick
+./bench/scripts/run.sh full
 ```
 
-See the [benchmark documentation](docs/PERFORMANCE.md) for the full matrix,
-relative-metric rules, and generated report locations.
+`quick` also exists, but it is a 3-second smoke test, not a comparable run. See
+the [benchmark documentation](docs/PERFORMANCE.md) for the full matrix and the
+per-scenario tables, and [`bench/`](bench/) for the scenario definitions.
+
+![Relative maximum stable throughput](page/public/benchmarks/throughput.svg)
 
 ## A production-shaped site
 

@@ -26,6 +26,14 @@ section short.
 - `CONTRIBUTING.md`, with a step-by-step walkthrough for adding a DNS-01
   provider.
 
+- Published benchmark numbers. The README and the performance documents now
+  carry the measured results of a `full` run — including where Raddex loses —
+  instead of an unlabelled chart. Headline: Raddex reaches 59.6% of Nginx's max
+  stable throughput and 146.5% of its CPU per request (medians), against
+  Caddy's 39.7% and 274.7%. Connection churn is Raddex's weakest scenario
+  (p99 361% of Nginx, worse than Caddy); 1 MiB responses are its best (p99
+  45.8%, CPU 70.8%).
+
 ### Changed
 
 - DNS-01 providers are now registry entries rather than hard-coded branches.

@@ -75,6 +75,37 @@ raddex run -c Raddexfile --acme-directory https://acme-v02.api.letsencrypt.org/d
 80 端口不可达？在全局块加 `dns_challenge cloudflare <token>`，改用 DNS-01
 证明控制权（见 [Raddexfile 规范](docs/RADDEXFILE_SPEC.zh_CN.md)）。
 
+## 性能实测
+
+`bench/` 里的 Docker 对比套件依次单独启动 Nginx、Caddy、Raddex，使用同一个源站、
+同一套场景、同样的资源限额，并在每个场景内以 Nginx 为基线归一化。
+
+**结论：Raddex 位于 Caddy 与 Nginx 之间。** 在所有被测维度上都明显比 Caddy 精简，
+但在峰值吞吐和单请求 CPU 上达不到 Nginx。如果你只为了更快而想替换 Nginx，这组
+数据不支持这个决定；如果你在「Caddy 式的配置体验」和「Nginx 式的效率」之间权衡，
+Raddex 瞄准的正是这段空隙。
+
+| 指标（Nginx = 100%） | Caddy | Raddex | 方向 |
+| --- | ---: | ---: | --- |
+| 最大稳定吞吐（并发扫描） | 39.7% | **59.6%** | 越高越好 |
+| p99 延迟（9 个场景中位数） | 154.5% | **116.6%** | 越低越好 |
+| 单请求 CPU（9 个场景中位数） | 274.7% | **146.5%** | 越低越好 |
+| 峰值内存（9 个场景中位数） | 306.2% | **174.0%** | 越低越好 |
+
+测试机绝对峰值：Nginx 15 603 QPS、Raddex 9 297、Caddy 6 201；所有场景错误率均为 0。
+两个值得单独看的点：HTTPS + HTTP/2 下 Nginx 与 Raddex 都扛住了 4 000 QPS 目标，
+Caddy 只到 1 008 QPS（25.1%）；而**连接频繁新建是 Raddex 最弱的场景**，p99 为
+Nginx 的 361%，比 Caddy 还差。
+
+注意：9 个场景中有 7 个是固定速率压测，三家在那里都报 100% 吞吐，那是「都打满了
+目标速率」而非容量打平——只有并发扫描在测最大稳定吞吐。三个目标都关闭了访问日志，
+所以 Raddex 的访问日志路径没有被测到。完整矩阵、测试环境与复现方式见
+[性能对比](docs/PERFORMANCE.zh_CN.md)。
+
+```bash
+./bench/scripts/run.sh full
+```
+
 ## 配置
 
 完整语法与语义见 [Raddexfile 规范](docs/RADDEXFILE_SPEC.zh_CN.md)：站点、`handle`、头改写、静态文件、压缩、重定向、全局块。
@@ -83,7 +114,7 @@ raddex run -c Raddexfile --acme-directory https://acme-v02.api.letsencrypt.org/d
 
 - [安装](docs/INSTALL.zh_CN.md) — 安装脚本、手动安装、Docker
 - [Raddexfile 规范](docs/RADDEXFILE_SPEC.zh_CN.md) — 配置语言
-- [性能](docs/PERFORMANCE.zh_CN.md) — 可复现的 QPS / P99 基线
+- [性能对比](docs/PERFORMANCE.zh_CN.md) — 完整场景矩阵、测试环境与复现方式
 - [English](README.md)
 
 ## 开发状态
