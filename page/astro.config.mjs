@@ -97,8 +97,9 @@ export default defineConfig({
 				},
 				{
 					label: 'Architecture',
+					translations: { 'zh-CN': '架构' },
 					items: [
-						{ label: 'Capability matrix', slug: 'architecture/capabilities' },
+						{ label: 'Capability matrix', translations: { 'zh-CN': '能力矩阵' }, slug: 'architecture/capabilities' },
 					],
 				},
 				{

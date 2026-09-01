@@ -34,8 +34,14 @@ tcp :3306 {
 - `lb_policy` supports `round_robin`, `random`, and `ip_hash`.
 - `connect_timeout` limits one upstream connection.
 - `idle_timeout` measures inactivity in either direction, not connection age.
-- `max_connections` bounds concurrent TCP connections.
-- `health_check` uses active TCP connects and skips unhealthy upstreams.
+- `max_connections` bounds concurrent TCP connections. The slot is taken when
+  the connection is accepted, so on a TLS-terminating listener it also bounds
+  connections still completing their handshake.
+- `health_check` uses active TCP connects and skips unhealthy upstreams. A
+  backend leaves the rotation only after `consecutive_failures` probes fail and
+  rejoins only after `consecutive_successes` succeed, so one blip does not flap
+  it. `ip_hash` uses consistent hashing, so adding or removing a backend does
+  not reshuffle unrelated clients.
 
 Changing upstreams, policies, limits, or timeouts applies to new connections;
 existing connections keep their selected upstream. A listener bind change is a
@@ -123,9 +129,12 @@ flow identity still includes the source port.
 - TCP and UDP may use the same address and port because they are different
   transports.
 
-On Linux, a zero-downtime upgrade transfers the UDP listener, connected
-upstream flow sockets, and bounded flow metadata. If handoff verification fails,
-the upgrade fails closed rather than claiming a lossless transition.
+On Linux, a zero-downtime upgrade transfers layer-4 listening sockets
+explicitly. Raw TCP listeners hand over their listening descriptors; UDP hands
+over the listener, its connected upstream flow sockets, and bounded flow
+metadata. `raddex upgrade` does not report success until every configured
+layer-4 listener has confirmed its transfer, so a failed handoff fails the
+upgrade rather than leaving a port silently unserved.
 
 ## QUIC boundary
 
