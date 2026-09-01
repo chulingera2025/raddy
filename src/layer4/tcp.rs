@@ -55,14 +55,33 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 
-/// Read chunk used by the relay pump. Bounded, so per-connection memory is two
-/// buffers plus codec state, independent of transfer size.
-const RELAY_CHUNK: usize = 16 * 1024;
+/// Initial relay buffer, per direction.
+///
+/// Relay buffers dominate this proxy's resident memory: two per connection,
+/// held for its whole life. A listener holding 10 000 mostly-idle connections
+/// pays for every byte of them, which is why the buffer starts small instead of
+/// being sized for peak throughput.
+const RELAY_CHUNK_MIN: usize = 8 * 1024;
 
-/// Pending-connection backlog for an L4 listener. Sized for connection-rate
-/// bursts: the accept loop hands each connection straight to a spawned relay,
-/// so the queue only has to absorb scheduling jitter, not slow work.
-const LISTEN_BACKLOG: i32 = 1024;
+/// Largest relay buffer, per direction.
+///
+/// Matches Pingora's 64 KiB read buffer, which is the size that made its
+/// throughput competitive: a bulk transfer costs one `read` syscall per buffer,
+/// so a small buffer multiplies syscalls on exactly the workload that can least
+/// afford them. Buffers grow to this only when a connection proves it is
+/// carrying enough data to fill them (see [`pump`]), so the memory is spent on
+/// active transfers rather than reserved for idle connections.
+const RELAY_CHUNK_MAX: usize = 64 * 1024;
+
+/// Pending-connection backlog for an L4 listener.
+///
+/// Matches Pingora's `LISTENER_BACKLOG`, which is what this path used before it
+/// was native. The kernel silently caps this at `net.core.somaxconn`, so the
+/// large value is a request, not an allocation. It has to be large: a burst of
+/// connections that overflows the accept queue is answered by dropping SYNs,
+/// and the client then waits out a retransmission timeout — which collapses the
+/// connection rate far more than any per-connection work in this file.
+const LISTEN_BACKLOG: i32 = 65_535;
 
 /// How often hostname upstreams are re-resolved (L4 plan: refresh, keep
 /// last-known-good on a transient failure). Overridable via
@@ -1688,7 +1707,10 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; RELAY_CHUNK];
+    // Grows on demand: see `RELAY_CHUNK_MIN` / `RELAY_CHUNK_MAX`. An idle
+    // connection keeps the small buffer forever; a bulk transfer reaches the
+    // large one within a few reads.
+    let mut buf = vec![0u8; RELAY_CHUNK_MIN];
     let mut total = 0u64;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1703,6 +1725,12 @@ where
             Ok(n) => {
                 if dst.write_all(&buf[..n]).await.is_err() {
                     break;
+                }
+                // A full buffer means the socket had at least this much queued,
+                // so the next read can likely be larger. Doubling costs one
+                // reallocation per step and stops at `RELAY_CHUNK_MAX`.
+                if n == buf.len() && buf.len() < RELAY_CHUNK_MAX {
+                    buf.resize((buf.len() * 2).min(RELAY_CHUNK_MAX), 0);
                 }
                 // A plain `TcpStream` has no user-space write buffer, so this
                 // flush is a no-op and `write_all` above already reached the
