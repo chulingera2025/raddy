@@ -664,33 +664,58 @@ port 80 is unreachable. See [Sites, ports & HTTPS](../sites/).
 **Syntax.**
 
 ```caddyfile
-dns_challenge cloudflare <api_token>
+dns_challenge <provider> <value>        # shorthand: one credential
+dns_challenge <provider> { ... }        # block: any number of credentials
 ```
 
-**Arguments.** The provider (`cloudflare` — the only one today) and the
-provider's API token, which must have **Zone: DNS: Edit** permission. Lives in
-the [global block](../sites/#the-global-block).
+**Arguments.** The provider keyword, plus its credentials. The shorthand is
+available only for a provider that needs exactly one credential; the block form
+takes one `<field> <value>` line per credential and works for every provider.
+Lives in the [global block](../sites/#the-global-block).
+
+| Provider | Credential | Required | Notes |
+|---|---|---|---|
+| `cloudflare` | `api_token` | yes | Must have **Zone: DNS: Edit** on the zone. |
 
 **Behavior.** When set, every certificate on the instance is issued via DNS-01:
 raddex publishes `_acme-challenge.<host>` TXT records while the order is being
 validated and removes them afterwards. Without `dns_challenge`, HTTP-01 is used
-as before.
+as before. `raddex check` validates the provider keyword and its credential
+fields — a missing or empty required credential, an unknown field name, and a
+duplicated field are all configuration errors.
 
-> **Security:** the API token is a secret — keep the Raddexfile out of version
-> control or protect it accordingly.
+> **Security:** every credential value is a secret. Raddex redacts them from its
+> diagnostic output, but the Raddexfile holds them in cleartext — keep it out of
+> version control, or inject the values with `{$ENV}` placeholders.
 
 **Example.**
 
 ```caddyfile
 {
     acme_email ops@example.com
-    dns_challenge cloudflare <api_token>
+    dns_challenge cloudflare {$CLOUDFLARE_API_TOKEN}
 }
 
 api.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
+
+The block form is equivalent, and is the shape a multi-credential provider
+uses:
+
+```caddyfile
+{
+    acme_email ops@example.com
+    dns_challenge cloudflare {
+        api_token {$CLOUDFLARE_API_TOKEN}
+    }
+}
+```
+
+Providers are registry entries in `src/server/dns/`; adding one does not change
+this grammar. See
+[CONTRIBUTING.md](https://github.com/chulingera2025/raddex/blob/main/CONTRIBUTING.md).
 
 ## `tls_alpn_challenge`
 

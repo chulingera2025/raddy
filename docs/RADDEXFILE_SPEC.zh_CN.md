@@ -84,7 +84,7 @@ api.example.com {
 | `acme_email` | ACME 注册邮箱（Let's Encrypt 要求） | 可用 |
 | `rate_limit` | `rate_limit <key> <rate> [burst=<n>]`（**单机**限流；见 第 5.2 节）；key 为 `remote_ip` 或 `header <name>` | 可用 |
 | `trusted_proxies` | 受信网段列表（见 第 4 节） | 可用 |
-| `dns_challenge` | `dns_challenge cloudflare <api_token>` —— 经 DNS 服务商（Cloudflare）做 DNS-01 签发（见 第 5.3 节） | 可用 |
+| `dns_challenge` | `dns_challenge <provider> <value>`，或块形式 `dns_challenge <provider> { <字段> <值>... }` —— 经 DNS 服务商（目前 Cloudflare）做 DNS-01 签发（见 第 5.3 节） | 可用 |
 | `tls_alpn_challenge` | 在 443 端口上以 TLS-ALPN-01 代替 HTTP-01 证明域名控制权（见 第 5.8 节） | 可用 |
 | `tls` | 站点级 TLS 来源与选项：`tls [<cert> <key> \| internal]`、`min_version`、`max_version`、`ciphers`、`client_auth`（见 第 5.7 节） | 可用 |
 | `rewrite` | `rewrite <to>` —— 转发前改写请求 URI；不带 matcher，始终生效（修饰指令；见 第 5.9 节） | 可用 |
@@ -147,24 +147,55 @@ api.example.com {
 
 默认情况下，raddex 在纯 HTTP 监听器上用 **HTTP-01** 证明域名控制权。当 80
 端口不可达（网络屏蔽，或纯 DNS 部署）时，改用 `dns_challenge` 通过发布 DNS
-TXT 记录证明控制权：
+TXT 记录证明控制权。
 
-- **语法**：`dns_challenge <provider> <api_token>`，位于**全局块**。
-- **服务商**：`cloudflare`（目前唯一支持）。令牌需要 **Zone: DNS: Edit**
-  权限。
+**语法**——两种写法，都位于**全局块**：
+
+```caddyfile
+dns_challenge <provider> <value>        # 简写：单个凭证
+dns_challenge <provider> { ... }        # 块形式：任意数量凭证
+```
+
+简写只对「恰好需要一个凭证」的服务商可用，填入的就是那个凭证。块形式每行一条
+`<字段> <值>`，适用于所有服务商。
+
 - **语义**：配置后，本实例上所有证书签发走 **DNS-01**——raddex 在校验订单
   期间通过服务商 API 发布 `_acme-challenge.<host>` TXT 记录，完成后移除。未
   配置 `dns_challenge` 时行为不变（HTTP-01）。
-- **安全**：API 令牌是机密——注意不要让 Raddexfile 落入版本控制。
+- **校验**：服务商关键字及其凭证字段由 `raddex check` 检查。必填凭证缺失或为
+  空、字段名未知、字段重复，都是配置错误。
+- **安全**：所有凭证值都是机密。raddex 会在诊断输出中脱敏，但 Raddexfile 本身
+  以明文保存它们——不要让它落入版本控制，或改用 `{$ENV}` 占位符注入
+  （见 第 5.12 节）。
+
+**服务商**
+
+| 服务商 | 凭证 | 必填 | 说明 |
+|---|---|---|---|
+| `cloudflare` | `api_token` | 是 | 需要该 zone 的 **Zone: DNS: Edit** 权限。 |
+
+新增服务商不会改动这套语法：服务商是 `src/server/dns/` 里的注册表条目，解析、
+校验和错误信息全部由服务商自身声明的字段推导而来。参见 `CONTRIBUTING.md`。
 
 ```caddyfile
 {
     acme_email ops@example.com
-    dns_challenge cloudflare <api_token>
+    dns_challenge cloudflare {$CLOUDFLARE_API_TOKEN}
 }
 
 api.example.com {
     reverse_proxy 127.0.0.1:8080
+}
+```
+
+块形式等价，也是多凭证服务商所用的写法：
+
+```caddyfile
+{
+    acme_email ops@example.com
+    dns_challenge cloudflare {
+        api_token {$CLOUDFLARE_API_TOKEN}
+    }
 }
 ```
 

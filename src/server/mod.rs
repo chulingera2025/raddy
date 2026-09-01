@@ -19,7 +19,6 @@
 
 pub mod acme;
 pub mod cli;
-pub mod cloudflare;
 pub mod dns;
 pub mod issuance_queue;
 pub mod reload;

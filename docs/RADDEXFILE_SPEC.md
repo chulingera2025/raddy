@@ -125,7 +125,7 @@ trusted, so the default must be pinned down:
 | `acme_email` | ACME registration email (required by Let's Encrypt) | Available |
 | `rate_limit` | `rate_limit <key> <rate> [burst=<n>]` (**single-instance** rate limit; see Section 5.2); key is `remote_ip` or `header <name>` | Available |
 | `trusted_proxies` | trusted network list (see Section 4) | Available |
-| `dns_challenge` | `dns_challenge cloudflare <api_token>` — DNS-01 issuance via a DNS provider (Cloudflare today; see Section 5.3) | Available |
+| `dns_challenge` | `dns_challenge <provider> <value>` or block form `dns_challenge <provider> { <field> <value>... }` — DNS-01 issuance via a DNS provider (Cloudflare today; see Section 5.3) | Available |
 | `tls_alpn_challenge` | prove control via TLS-ALPN-01 on port 443 instead of HTTP-01 (see Section 5.8) | Available |
 | `tls` | per-site TLS source and options: `tls [<cert> <key> \| internal]`, `min_version`, `max_version`, `ciphers`, `client_auth` (see Section 5.7) | Available |
 | `rewrite` | `rewrite <to>` — rewrite the request URI before forwarding; takes no matcher, always applied (modifier; see Section 5.9) | Available |
@@ -221,26 +221,61 @@ api.example.com {
 By default, raddex proves domain control with **HTTP-01** on its plain-HTTP
 listener. When port 80 is unreachable (a network that blocks it, or a
 DNS-only deployment), set `dns_challenge` to prove control by publishing a DNS
-TXT record instead:
+TXT record instead.
 
-- **Syntax**: `dns_challenge <provider> <api_token>`, in the **global block**.
-- **Provider**: `cloudflare` (the only provider today). The token must have
-  **Zone: DNS: Edit** permission.
+**Syntax** — two forms, both in the **global block**:
+
+```caddyfile
+dns_challenge <provider> <value>        # shorthand: one credential
+dns_challenge <provider> { ... }        # block: any number of credentials
+```
+
+The shorthand is available only for a provider that needs exactly one
+credential, and fills that credential. The block form takes one
+`<field> <value>` line per credential and works for every provider.
+
 - **Semantics**: when set, every certificate on this instance is issued via
   **DNS-01** — raddex publishes `_acme-challenge.<host>` TXT records through the
   provider's API while the order is being validated, then removes them. Without
   `dns_challenge`, behavior is unchanged (HTTP-01).
-- **Security**: the API token is a secret — keep the Raddexfile out of version
-  control or protect it accordingly.
+- **Validation**: the provider keyword and its credential fields are checked by
+  `raddex check`. A required credential that is missing or empty, an unknown
+  field name, and a duplicated field are all configuration errors.
+- **Security**: every credential value is a secret. Raddex redacts them from its
+  diagnostic output, but the Raddexfile itself holds them in cleartext — keep it
+  out of version control, or inject the values with `{$ENV}` placeholders
+  (Section 5.12).
+
+**Providers**
+
+| Provider | Credential | Required | Notes |
+|---|---|---|---|
+| `cloudflare` | `api_token` | yes | Must have **Zone: DNS: Edit** on the zone. |
+
+Adding a provider does not change this grammar: providers are registry entries
+in `src/server/dns/`, and the parser, the validator, and the error messages are
+all derived from what the provider declares. See `CONTRIBUTING.md`.
 
 ```caddyfile
 {
     acme_email ops@example.com
-    dns_challenge cloudflare <api_token>
+    dns_challenge cloudflare {$CLOUDFLARE_API_TOKEN}
 }
 
 api.example.com {
     reverse_proxy 127.0.0.1:8080
+}
+```
+
+The block form is equivalent, and is the shape a multi-credential provider
+uses:
+
+```caddyfile
+{
+    acme_email ops@example.com
+    dns_challenge cloudflare {
+        api_token {$CLOUDFLARE_API_TOKEN}
+    }
 }
 ```
 

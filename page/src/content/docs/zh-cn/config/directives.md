@@ -633,30 +633,51 @@ HTTPS](../sites/)。
 **语法。**
 
 ```caddyfile
-dns_challenge cloudflare <api_token>
+dns_challenge <provider> <value>        # 简写:单个凭证
+dns_challenge <provider> { ... }        # 块形式:任意数量凭证
 ```
 
-**参数。** 服务商(`cloudflare`——目前唯一)与服务商的 API 令牌,令牌需要
-**Zone: DNS: Edit** 权限。位于[全局块](../sites/#the-global-block)。
+**参数。** 服务商关键字及其凭证。简写只对「恰好需要一个凭证」的服务商可用;
+块形式每行一条 `<字段> <值>`,适用于所有服务商。位于[全局块](../sites/#the-global-block)。
+
+| 服务商 | 凭证 | 必填 | 说明 |
+|---|---|---|---|
+| `cloudflare` | `api_token` | 是 | 需要该 zone 的 **Zone: DNS: Edit** 权限。 |
 
 **行为。** 配置后,本实例上所有证书走 DNS-01 签发:raddex 在校验订单期间发布
 `_acme-challenge.<host>` TXT 记录,完成后移除。未配置 `dns_challenge` 时
-沿用 HTTP-01。
+沿用 HTTP-01。`raddex check` 会校验服务商关键字与凭证字段——必填凭证缺失或为
+空、字段名未知、字段重复,都是配置错误。
 
-> **安全:** API 令牌是机密——注意不要让 Raddexfile 落入版本控制。
+> **安全:** 所有凭证值都是机密。raddex 会在诊断输出中脱敏,但 Raddexfile 本身
+> 以明文保存它们——不要让它落入版本控制,或改用 `{$ENV}` 占位符注入。
 
 **示例。**
 
 ```caddyfile
 {
     acme_email ops@example.com
-    dns_challenge cloudflare <api_token>
+    dns_challenge cloudflare {$CLOUDFLARE_API_TOKEN}
 }
 
 api.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
+
+块形式等价,也是多凭证服务商所用的写法:
+
+```caddyfile
+{
+    acme_email ops@example.com
+    dns_challenge cloudflare {
+        api_token {$CLOUDFLARE_API_TOKEN}
+    }
+}
+```
+
+服务商是 `src/server/dns/` 里的注册表条目,新增服务商不会改动这套语法。参见
+[CONTRIBUTING.md](https://github.com/chulingera2025/raddex/blob/main/CONTRIBUTING.md)。
 
 ## `tls_alpn_challenge`
 

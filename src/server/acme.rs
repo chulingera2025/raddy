@@ -32,7 +32,7 @@
 //! shared resolver pool), so even synchronous cleanup terminates.
 
 use crate::config::ast::DnsChallenge;
-use crate::server::dns::{self, DnsProvider, DnsRecord};
+use crate::server::dns::{DnsProvider, DnsRecord};
 use crate::server::issuance_queue::{AcmeQueue, EnqueueOutcome, RequestKind};
 use crate::tls::{CertStore, TlsAlpnChallengeStore};
 use instant_acme::{
@@ -328,7 +328,8 @@ impl AcmeManager {
         };
         let mut dns_guard = match &self.dns_challenge {
             Some(dns) => Some(Dns01Guard::new(
-                dns::build(dns.provider, &dns.api_token)
+                dns.provider
+                    .client(&dns.credentials)
                     .map_err(|e| format!("dns-01 provider init: {e}"))?,
             )),
             None => None,

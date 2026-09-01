@@ -20,6 +20,7 @@
 
 use crate::config::ast::*;
 use crate::config::lexer::{lex, Token, TokenKind};
+use crate::server::dns::{self, DnsCredentials};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -576,10 +577,7 @@ impl<'a> Parser<'a> {
                 if words.is_empty() {
                     continue;
                 }
-                if block_open {
-                    return Err(self.err("unexpected '{' in global block"));
-                }
-                self.apply_global(&mut global, &words)?;
+                self.apply_global(&mut global, &words, block_open)?;
             }
         }
 
@@ -2001,8 +1999,131 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn apply_global(&self, global: &mut GlobalConfig, words: &[String]) -> Result<(), ConfigError> {
+    /// Parse `dns_challenge` in either accepted form (spec §5.3):
+    ///
+    /// ```text
+    /// dns_challenge cloudflare <api_token>     # shorthand, single-credential
+    /// dns_challenge <provider> {               # block, any provider
+    ///     <field> <value>
+    /// }
+    /// ```
+    ///
+    /// The provider keyword is resolved against the DNS-01 registry and the
+    /// credentials are checked against the fields that provider declares, so a
+    /// newly registered provider parses and validates without changing this
+    /// function.
+    fn parse_dns_challenge(
+        &mut self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<DnsChallenge, ConfigError> {
+        let Some(keyword) = words.get(1) else {
+            return Err(self.err(format!(
+                "dns_challenge requires a provider (expected {})",
+                dns::keywords()
+            )));
+        };
+        let Some(spec) = dns::lookup(keyword) else {
+            return Err(self.err(format!(
+                "invalid dns_challenge provider '{keyword}' (expected {})",
+                dns::keywords()
+            )));
+        };
+        let entries = if block_open {
+            if words.len() != 2 {
+                return Err(self.err(format!(
+                    "dns_challenge {keyword} takes no arguments before '{{'"
+                )));
+            }
+            self.parse_dns_credentials(keyword)?
+        } else {
+            // The shorthand fills exactly one declared field; a provider that
+            // needs several credentials declares no shorthand and must use the
+            // block form.
+            let Some(field) = spec.shorthand_field else {
+                return Err(self.err(format!(
+                    "dns_challenge {keyword} needs several credentials: use the block form \
+                     'dns_challenge {keyword} {{ ... }}'"
+                )));
+            };
+            if words.len() != 3 {
+                return Err(self.err(format!(
+                    "dns_challenge {keyword} takes one argument ({field}), or a block"
+                )));
+            }
+            vec![(field.to_string(), words[2].clone())]
+        };
+        let credentials = DnsCredentials::from_pairs(entries);
+        spec.validate(&credentials).map_err(|m| self.err(m))?;
+        Ok(DnsChallenge {
+            provider: spec,
+            credentials,
+        })
+    }
+
+    /// Read the `<field> <value>` lines of a `dns_challenge` block. Field names
+    /// are not checked here; the provider's spec validates them so the error
+    /// text can list what that provider actually accepts.
+    fn parse_dns_credentials(
+        &mut self,
+        keyword: &str,
+    ) -> Result<Vec<(String, String)>, ConfigError> {
+        let mut entries: Vec<(String, String)> = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Token {
+                    kind: TokenKind::RBrace,
+                    ..
+                }) => {
+                    self.pos += 1;
+                    break;
+                }
+                None => {
+                    return Err(self.err(format!(
+                        "unexpected end of file in dns_challenge {keyword} block"
+                    )));
+                }
+                _ => {}
+            }
+            let (line, nested) = self.parse_statement()?;
+            if line.is_empty() {
+                continue;
+            }
+            if nested {
+                return Err(self.err(format!("unexpected '{{' in dns_challenge {keyword} block")));
+            }
+            if line.len() != 2 {
+                return Err(self.err(format!(
+                    "dns_challenge {keyword} credential '{}' takes exactly one value",
+                    line[0]
+                )));
+            }
+            if entries.iter().any(|(name, _)| name == &line[0]) {
+                return Err(self.err(format!(
+                    "duplicate dns_challenge {keyword} credential '{}'",
+                    line[0]
+                )));
+            }
+            entries.push((line[0].clone(), line[1].clone()));
+        }
+        Ok(entries)
+    }
+
+    /// Apply one global-block directive.
+    ///
+    /// `block_open` reports that the statement was followed by `{`. Only
+    /// `dns_challenge` accepts a block; every other global directive rejects one
+    /// so a stray brace stays an error rather than being silently swallowed.
+    fn apply_global(
+        &mut self,
+        global: &mut GlobalConfig,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<(), ConfigError> {
         let name = words.first().expect("non-empty");
+        if block_open && name != "dns_challenge" {
+            return Err(self.err(format!("unexpected '{{' after {name} in global block")));
+        }
         match name.as_str() {
             "acme_email" => {
                 if words.len() != 2 {
@@ -2039,27 +2160,7 @@ impl<'a> Parser<'a> {
                 global.trusted_proxies = networks;
             }
             "dns_challenge" => {
-                if words.len() != 3 {
-                    return Err(self.err(
-                        "dns_challenge requires a provider and an API token: dns_challenge cloudflare <api_token>",
-                    ));
-                }
-                let provider = match words[1].as_str() {
-                    "cloudflare" => DnsProviderKind::Cloudflare,
-                    other => {
-                        return Err(self.err(format!(
-                            "invalid dns_challenge provider '{other}' (expected {})",
-                            DnsProviderKind::ALL.join(", ")
-                        )));
-                    }
-                };
-                if words[2].is_empty() {
-                    return Err(self.err("dns_challenge requires a non-empty API token"));
-                }
-                global.dns_challenge = Some(DnsChallenge {
-                    provider,
-                    api_token: words[2].clone(),
-                });
+                global.dns_challenge = Some(self.parse_dns_challenge(words, block_open)?);
             }
             "tls_alpn_challenge" => {
                 if words.len() != 1 {
@@ -2351,8 +2452,69 @@ mod tests {
         let input = "{ dns_challenge cloudflare abc123 }\napi.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
         let rf = parse("test", input).unwrap();
         let challenge = rf.global.dns_challenge.expect("dns_challenge parsed");
-        assert_eq!(challenge.provider, DnsProviderKind::Cloudflare);
-        assert_eq!(challenge.api_token, "abc123");
+        assert_eq!(challenge.provider.keyword, "cloudflare");
+        assert_eq!(challenge.credentials.get("api_token"), Some("abc123"));
+    }
+
+    #[test]
+    fn parses_dns_challenge_block_form() {
+        // The block form is the general shape every provider accepts; the
+        // shorthand is sugar for a provider with exactly one credential.
+        let input = "{\n    dns_challenge cloudflare {\n        api_token abc123\n    }\n}\n\
+                     api.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
+        let rf = parse("test", input).unwrap();
+        let challenge = rf.global.dns_challenge.expect("dns_challenge parsed");
+        assert_eq!(challenge.provider.keyword, "cloudflare");
+        assert_eq!(challenge.credentials.get("api_token"), Some("abc123"));
+    }
+
+    #[test]
+    fn dns_challenge_block_rejects_unknown_and_duplicate_credentials() {
+        // Both errors come from the provider's declared field list, so a new
+        // provider gets them without touching the parser.
+        let err = parse(
+            "test",
+            "{\n    dns_challenge cloudflare {\n        api_token t\n        region us-east-1\n    }\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown cloudflare credential 'region'"),
+            "got: {err}"
+        );
+
+        let err = parse(
+            "test",
+            "{\n    dns_challenge cloudflare {\n        api_token a\n        api_token b\n    }\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
+
+        let err = parse("test", "{\n    dns_challenge cloudflare {\n    }\n}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires 'api_token'"), "got: {err}");
+    }
+
+    #[test]
+    fn dns_challenge_credentials_are_redacted_in_debug() {
+        // GlobalConfig is `Debug`; a token must not reach a log or panic message.
+        let rf = parse("test", "{ dns_challenge cloudflare super-secret }\n").unwrap();
+        let rendered = format!("{:?}", rf.global.dns_challenge);
+        assert!(!rendered.contains("super-secret"), "got: {rendered}");
+        assert!(rendered.contains("api_token"), "got: {rendered}");
+    }
+
+    #[test]
+    fn global_block_still_rejects_a_brace_after_other_directives() {
+        let err = parse("test", "{\n    acme_email a@b.c {\n    }\n}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unexpected '{' after acme_email"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2369,14 +2531,22 @@ mod tests {
 
     #[test]
     fn rejects_invalid_dns_challenge() {
-        // Unknown provider.
-        let err = parse("test", "{ dns_challenge route53 tok }\n").unwrap_err();
-        assert!(err.to_string().contains("invalid dns_challenge provider"));
-        // Missing token.
-        let err = parse("test", "{ dns_challenge cloudflare }\n").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("requires a provider and an API token"));
+        // Unknown provider: the error lists the registered keywords.
+        let err = parse("test", "{ dns_challenge route53 tok }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid dns_challenge provider"), "got: {err}");
+        assert!(err.contains("cloudflare"), "got: {err}");
+        // Provider given, credential missing.
+        let err = parse("test", "{ dns_challenge cloudflare }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("takes one argument (api_token)"), "got: {err}");
+        // No provider at all.
+        let err = parse("test", "{ dns_challenge }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a provider"), "got: {err}");
     }
 
     #[test]

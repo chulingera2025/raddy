@@ -7,7 +7,37 @@ section short.
 
 ## [Unreleased]
 
+### Added
+
+- `dns_challenge` accepts a block form carrying any number of named
+  credentials, alongside the existing one-line shorthand:
+
+  ```caddyfile
+  dns_challenge cloudflare {
+      api_token {$CLOUDFLARE_API_TOKEN}
+  }
+  ```
+
+  The single-credential shorthand (`dns_challenge cloudflare <api_token>`) is
+  unchanged, so existing configurations keep working. The block form is what
+  lets a provider requiring several credentials — an access key plus a secret
+  plus a region — be configured at all.
+
+- `CONTRIBUTING.md`, with a step-by-step walkthrough for adding a DNS-01
+  provider.
+
 ### Changed
+
+- DNS-01 providers are now registry entries rather than hard-coded branches.
+  Each provider declares its credential fields in `src/server/dns/mod.rs`, and
+  the `dns_challenge` grammar, the "unknown provider" error, the
+  required/unknown/duplicate-credential checks, and `raddex check` are all
+  derived from that declaration. Adding a provider touches one new file plus
+  one registry entry — the parser and the validator do not change.
+
+- DNS-01 credential values are redacted from diagnostic output. They previously
+  sat in a `Debug`-derived config struct, so a token could reach a log line or
+  a panic message.
 
 - **Renamed the project from `raddy` to `raddex`.** The crate `raddy` on
   crates.io is an unrelated automatic-differentiation library, so the old name
