@@ -47,6 +47,13 @@ the source of truth for configuration compatibility.
 
 ## Layer 4
 
+Layer 4 runs on a **native Tokio** data path: Raddex binds the socket, accepts,
+terminates TLS, selects and health-checks upstreams, and relays with
+`tokio::io`. Nothing it forwards passes through Pingora, which hosts the process
+and runs the HTTP core. See the
+[architecture record](https://github.com/chulingera2025/raddex/blob/main/docs/PINGORA_CAPABILITY_RESEARCH.md)
+for why the two cores are split.
+
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Raw TCP proxying | Supported | No HTTP parsing; bounded connections and timeouts |
@@ -55,6 +62,9 @@ the source of truth for configuration compatibility.
 | UDP datagram proxying | Supported | Per-client flow state and bounded resource usage |
 | UDP IPv6 upstreams | Supported | Address family is preserved for flow sockets |
 | Transparent TCP | Linux-only | Requires TPROXY rules, policy routing, and `CAP_NET_ADMIN`-equivalent permission |
+| L4 load balancing | Supported | Round-robin, random, and consistent-hash `ip_hash` over healthy upstreams |
+| L4 active health checks | Supported | TCP-connect probes with consecutive-failure and consecutive-success damping |
+| TCP listener upgrade handoff | Linux-only | The listening descriptor is handed off explicitly; a failed transfer fails the upgrade |
 | UDP lossless upgrade | Linux-only | Listener, connected flow sockets, and bounded metadata are handed off |
 | QUIC datagram passthrough | Passthrough | QUIC packets are treated as ordinary UDP datagrams |
 | QUIC / HTTP/3 termination | Sidecar required | Raddex does not implement QUIC handshakes, HTTP/3 routing, or migration |

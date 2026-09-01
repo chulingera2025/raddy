@@ -11,9 +11,14 @@ changes.
 
 ```text
 HTTP sites     -> Pingora HTTP proxy
-TCP listeners  -> Pingora ServerApp over raw streams
+TCP listeners  -> Tokio TcpListener and Raddex relay
 UDP listeners  -> Tokio UdpSocket and Raddex flow table
 ```
+
+Both layer-4 transports are native Tokio end to end: Raddex binds the socket,
+accepts, terminates TLS, selects and health-checks upstreams, and relays. No
+forwarded byte passes through Pingora, which hosts the process (background
+services, shutdown watch, descriptor passing) and runs the HTTP core.
 
 TCP and UDP are separate configuration types and separate listener identities.
 They may share an address and port because they use different transports. Two
@@ -30,7 +35,8 @@ and dual-stack conflicts.
   in either direction.
 - `sni` mode reads a bounded ClientHello prefix, selects an exact or one-label
   wildcard route, and forwards the original bytes unchanged.
-- TLS termination uses Pingora's TLS listener and then reuses the raw relay.
+- TLS termination uses a Raddex-owned OpenSSL acceptor, built once per listener
+  and bounded by a handshake timeout, and then reuses the raw relay.
 - Transparent mode is a Linux socket/TPROXY integration and is not part of the
   standard listener handoff path.
 

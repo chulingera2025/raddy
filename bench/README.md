@@ -113,3 +113,25 @@ different machines directly comparable.
 The benchmark does not measure ACME, caching, TCP/UDP, QUIC/HTTP3, or
 implementation-specific features that would make a common comparison
 misleading.
+
+## Contribute a run
+
+Every published number comes from one host, and seven of the nine scenarios
+drive a **fixed** request rate — so they measure cost at that rate, not capacity.
+Both limits shrink as more people run the suite on hardware that is not this one.
+
+If you run it, a result is worth contributing. Open an issue titled
+`benchmark: <cpu> / <distro>` and attach:
+
+- `bench/results/<run-id>/summary.json` — the aggregated data, which carries the
+  normalized values, the profile, and the Raddex commit;
+- the host: CPU model and core count, total RAM, kernel version, Docker version,
+  and whether it is bare metal, a VM, or a container host;
+- any non-default `BENCH_CPUS` / `BENCH_MEMORY_LIMIT` / `RADDEX_THREADS`.
+
+A submission is comparable when it used `run.sh full` on an otherwise idle host,
+with the pinned images from `bench/versions.env` unchanged. `quick` runs and
+runs on a busy machine are still interesting for spotting a large discrepancy,
+but say so — they are not directly comparable with the numbers above.
+
+Results that contradict these are the most useful ones to receive.

@@ -63,6 +63,27 @@ description: 用可复现的 Docker 基准测试，说明 Raddex 相对 Nginx �
 
 ![相对峰值内存](/benchmarks/memory.svg)
 
+## 贡献你的测试结果
+
+上面所有数字都来自同一台主机，而 9 个场景里有 7 个是**固定速率**压测——它们测的
+是「在该速率下的开销」，不是容量上限。这两个局限，只有更多人在不同硬件上跑过之后
+才会收敛。
+
+如果你跑了这套测试，结果很有价值。欢迎开一个标题为
+`benchmark: <CPU> / <发行版>` 的 issue，并附上：
+
+- `bench/results/<run-id>/summary.json`——聚合数据，内含归一化结果、档位和
+  Raddex commit；
+- 主机信息：CPU 型号与核数、内存总量、内核版本、Docker 版本，以及它是物理机、
+  虚拟机还是容器宿主；
+- 任何非默认的 `BENCH_CPUS` / `BENCH_MEMORY_LIMIT` / `RADDEX_THREADS`。
+
+具备可比性的前提是：在空闲主机上执行 `run.sh full`，且未改动
+`bench/versions.env` 里固定版本的镜像。`quick` 档或繁忙机器上的结果仍有助于发现
+大的偏差，但请注明——它们不能与上面的数字直接对比。
+
+**与上述结论相矛盾的结果，是最有价值的。**
+
 ## 运行方式
 
 ```bash

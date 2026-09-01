@@ -131,6 +131,28 @@ Do not compare absolute QPS from two different machines.
 | Simple route / small response | Caddy | 1000 | 3999.78 | 1.250 ms | 0.000% | 0.624 | 22.98 MiB |
 | Simple route / small response | Raddex | 1000 | 3999.74 | 0.943 ms | 0.000% | 0.329 | 15.47 MiB |
 
+## Contribute a run
+
+Every published number comes from one host, and seven of the nine scenarios
+drive a **fixed** request rate — so they measure cost at that rate, not capacity.
+Both limits shrink as more people run the suite on hardware that is not this one.
+
+If you run it, a result is worth contributing. Open an issue titled
+`benchmark: <cpu> / <distro>` and attach:
+
+- `bench/results/<run-id>/summary.json` — the aggregated data, which carries the
+  normalized values, the profile, and the Raddex commit;
+- the host: CPU model and core count, total RAM, kernel version, Docker version,
+  and whether it is bare metal, a VM, or a container host;
+- any non-default `BENCH_CPUS` / `BENCH_MEMORY_LIMIT` / `RADDEX_THREADS`.
+
+A submission is comparable when it used `run.sh full` on an otherwise idle host,
+with the pinned images from `bench/versions.env` unchanged. `quick` runs and
+runs on a busy machine are still interesting for spotting a large discrepancy,
+but say so — they are not directly comparable with the numbers above.
+
+Results that contradict these are the most useful ones to receive.
+
 ## Scope and limits
 
 The suite covers HTTP/1.1, HTTPS/HTTP/1.1, HTTPS/HTTP/2, response sizes,

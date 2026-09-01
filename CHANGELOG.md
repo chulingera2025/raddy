@@ -7,6 +7,45 @@ section short.
 
 ## [Unreleased]
 
+### Changed
+
+- **The layer-4 data path is now native Tokio.** Raw TCP listeners bind their
+  own socket, run their own accept loop, terminate their own TLS, select and
+  health-check their own upstreams, and relay with `tokio::io`. Nothing they
+  forward passes through Pingora, which remains the process host and the HTTP
+  engine. Raddex now has two cores: L4 on Tokio, L7 on Pingora.
+
+  The reason is measurable, not architectural taste. Pingora's transport stream
+  wraps the socket in a buffered writer, costing the relay a copy and a flush
+  syscall per chunk. On the same host (`bench/l4`, Nginx stream = 100%):
+
+  | Metric | Pingora path | Native path |
+  | --- | ---: | ---: |
+  | TCP connect rate | 90.5% | **103.1%** |
+  | Long-lived 10K · CPU | 129.9% | **81.8%** |
+  | Long-lived 10K · memory | 282.1% | **110.3%** |
+  | TCP throughput 64 KiB | **81.9%** | 77.4% |
+
+  No configuration changes. `tcp` listeners, `lb_policy`, `health_check`,
+  `sni`, `tls`, `transparent`, timeouts, and limits all behave as documented.
+
+- `ip_hash` for layer-4 listeners is now consistent hashing over a 160-vnode
+  ring, so adding or removing a backend no longer reshuffles unrelated clients.
+
+### Fixed
+
+- Layer-4 `ip_hash` distributed client IPs from one subnet very unevenly.
+  Selection hashed with FNV-1a, whose high-bit avalanche is weak for inputs
+  sharing a long prefix — which is exactly what client IPs are. Measured, 400
+  addresses in one `/24` landed in 16% of the hash space and every one of them
+  was routed to a single backend. Selection now applies an avalanche finalizer.
+  (The UDP selector was checked for the same defect and does not have it.)
+
+- `TransparentTcpProxy` panicked on startup with "there is no reactor running":
+  it registered its listener with Tokio from the startup thread, before the
+  runtime existed. Both layer-4 TCP listeners now bind a blocking socket and
+  register it once their service starts.
+
 ### Added
 
 - `dns_challenge` accepts a block form carrying any number of named
@@ -25,6 +64,9 @@ section short.
 
 - `CONTRIBUTING.md`, with a step-by-step walkthrough for adding a DNS-01
   provider.
+
+- `bench/l4/`, a Linux-only forwarding benchmark comparing Nginx stream, Caddy
+  layer4, Raddex, and Linux NAT / nftables as a kernel reference.
 
 - Published benchmark numbers. The README and the performance documents now
   carry the measured results of a `full` run — including where Raddex loses —
