@@ -1675,7 +1675,7 @@ where
     // extends it; only a genuinely idle connection trips the `now >= deadline`
     // check. `shutdown.changed()` (re-armed every iteration) plus the
     // borrow-check at the top make shutdown prompt.
-    {
+    let watchdog = {
         let last = last.clone();
         let stop = stop.clone();
         let mut shutdown = shutdown.clone();
@@ -1699,8 +1699,8 @@ where
                     _ = shutdown.changed() => {}
                 }
             }
-        });
-    }
+        })
+    };
 
     // Split each side into read/write halves so both directions run
     // concurrently on owned halves (`Stream` is `Unpin`).
@@ -1711,6 +1711,11 @@ where
         pump(client_r, upstream_w, base, &last, &stop),
         pump(upstream_r, client_w, base, &last, &stop),
     );
+    // Both directions are done, so the watchdog has nothing left to guard.
+    // Without this it would sleep out the remaining idle timeout — an hour, on
+    // a long-`idle_timeout` listener — holding a task and a timer per closed
+    // connection.
+    watchdog.abort();
 
     let end = if *shutdown.borrow() {
         EndReason::Shutdown
