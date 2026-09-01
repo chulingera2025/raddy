@@ -247,6 +247,9 @@ pub struct TcpProxyApp {
     /// The current runtime (balancer + admission + timeouts), rebuilt on reload
     /// when the spec changes. Shared with the health-check thread.
     runtime: Arc<Mutex<AppRuntime>>,
+    /// Last `ConfigStore` generation reconciled into `runtime`, so an unchanged
+    /// config costs one atomic load per connection instead of a spec rebuild.
+    applied_generation: AtomicU64,
     metrics: Arc<TcpMetrics>,
     /// Optional sink for typed access records.
     access_log: Option<Arc<AccessLogSink>>,
@@ -501,6 +504,7 @@ impl TcpProxyApp {
         Ok(Self {
             listener,
             listen,
+            applied_generation: AtomicU64::new(config_store.generation()),
             config_store,
             runtime,
             metrics,
@@ -513,6 +517,16 @@ impl TcpProxyApp {
     /// from the snapshot (a reload that should have been rejected), the
     /// last-known runtime keeps serving.
     fn current_handle(&self) -> RuntimeHandle {
+        // Fast path: nothing has been reloaded since the last check, so the
+        // runtime is already current. This matters because it runs on the
+        // accept path for every connection, and the slow path below clones and
+        // compares the listener's whole spec — including its upstream and SNI
+        // vectors, each holding owned strings. Doing that per connection is
+        // pure allocation churn when reloads are rare, which they are.
+        let generation = self.config_store.generation();
+        if self.applied_generation.load(Ordering::Acquire) == generation {
+            return self.handle_from_runtime();
+        }
         let config = self.config_store.load();
         let new_spec = config.layer4.iter().find_map(|listener| match listener {
             Layer4Listener::Tcp(tcp) if tcp.listen == self.listen => {
@@ -540,6 +554,22 @@ impl TcpProxyApp {
                 }
             }
         }
+        // Record the generation only after reconciling it, so a reload racing
+        // with this check is picked up by the next connection rather than lost.
+        self.applied_generation.store(generation, Ordering::Release);
+        RuntimeHandle {
+            selector: guard.selector.clone(),
+            admission: guard.admission.clone(),
+            connect_timeout: guard.connect_timeout,
+            idle_timeout: guard.idle_timeout,
+            policy: guard.spec.lb_policy,
+            transparent: guard.spec.transparent,
+        }
+    }
+
+    /// Snapshot the current runtime without consulting the config store.
+    fn handle_from_runtime(&self) -> RuntimeHandle {
+        let guard = self.runtime.lock().expect("L4 runtime lock poisoned");
         RuntimeHandle {
             selector: guard.selector.clone(),
             admission: guard.admission.clone(),
