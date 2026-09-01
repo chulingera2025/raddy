@@ -36,9 +36,6 @@ use crate::config::ast::{
 use crate::config::snapshot::ConfigStore;
 use crate::layer4::tls;
 use async_trait::async_trait;
-use pingora::lb::health_check;
-use pingora::lb::selection::{Consistent, Random, RoundRobin};
-use pingora::lb::LoadBalancer;
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -306,7 +303,7 @@ impl AppRuntime {
             )
         } else {
             let resolved = resolve_upstreams(tcp, listener)?;
-            let balancer = Arc::new(L4Balancer::build(tcp, &resolved)?);
+            let balancer = Arc::new(L4Balancer::new(&resolved, tcp.lb_policy, tcp.health_check));
             (L4Selector::Balancer(balancer), resolved)
         };
         Ok(Self {
@@ -418,66 +415,9 @@ struct RuntimeHandle {
     transparent: bool,
 }
 
-/// A type-erased, health-checked backend selector for one L4 listener.
-enum L4Balancer {
-    RoundRobin(LoadBalancer<RoundRobin>),
-    Random(LoadBalancer<Random>),
-    Consistent(LoadBalancer<Consistent>),
-}
-
-impl L4Balancer {
-    /// Build the selector for the resolved `upstreams`, attaching the active
-    /// TCP-connect health check when configured.
-    fn build(tcp: &TcpProxyConfig, upstreams: &[SocketAddr]) -> Result<Self, String> {
-        let addrs: Vec<String> = upstreams.iter().map(|a| a.to_string()).collect();
-        let mut lb = match tcp.lb_policy {
-            crate::config::ast::LbPolicy::RoundRobin => L4Balancer::RoundRobin(
-                LoadBalancer::<RoundRobin>::try_from_iter(addrs)
-                    .map_err(|_| "failed to build round-robin balancer".to_string())?,
-            ),
-            crate::config::ast::LbPolicy::Random => L4Balancer::Random(
-                LoadBalancer::<Random>::try_from_iter(addrs)
-                    .map_err(|_| "failed to build random balancer".to_string())?,
-            ),
-            crate::config::ast::LbPolicy::IpHash => L4Balancer::Consistent(
-                LoadBalancer::<Consistent>::try_from_iter(addrs)
-                    .map_err(|_| "failed to build ip_hash balancer".to_string())?,
-            ),
-        };
-        if let Some(hc) = &tcp.health_check {
-            let mut check = health_check::TcpHealthCheck::new();
-            check.consecutive_failure = hc.consecutive_failures;
-            check.consecutive_success = hc.consecutive_successes;
-            check.peer_template.options.connection_timeout = Some(hc.timeout);
-            match &mut lb {
-                L4Balancer::RoundRobin(lb) => lb.set_health_check(check),
-                L4Balancer::Random(lb) => lb.set_health_check(check),
-                L4Balancer::Consistent(lb) => lb.set_health_check(check),
-            }
-        }
-        Ok(lb)
-    }
-
-    /// Select a healthy upstream for `key` (the client IP bytes for `ip_hash`;
-    /// ignored by the other policies). `None` when every upstream is unhealthy.
-    fn select(&self, key: &[u8]) -> Option<SocketAddr> {
-        let backend = match self {
-            L4Balancer::RoundRobin(lb) => lb.select(key, 256),
-            L4Balancer::Random(lb) => lb.select(key, 256),
-            L4Balancer::Consistent(lb) => lb.select(key, 256),
-        };
-        backend?.addr.as_inet().cloned()
-    }
-
-    /// Run one round of active health checks.
-    async fn probe(&self) {
-        match self {
-            L4Balancer::RoundRobin(lb) => lb.backends().run_health_check(true).await,
-            L4Balancer::Random(lb) => lb.backends().run_health_check(true).await,
-            L4Balancer::Consistent(lb) => lb.backends().run_health_check(true).await,
-        }
-    }
-}
+/// The health-checked backend selector for one L4 listener, provided by the
+/// native [`crate::layer4::balance`] module.
+type L4Balancer = crate::layer4::balance::Balancer;
 
 impl TcpProxyApp {
     /// Create an app for one compiled `tcp` listener against the live config

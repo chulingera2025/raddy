@@ -26,6 +26,7 @@
 //! handoff — but that is lifecycle, not data. HTTP keeps using the Pingora
 //! proxy engine (`crate::proxy`).
 
+pub mod balance;
 pub mod tcp;
 pub mod tls;
 pub mod tls_accept;
