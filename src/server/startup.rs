@@ -78,7 +78,8 @@ pub struct RunOptions {
     pub pidfile: Option<PathBuf>,
     /// Unix socket both sides use to hand over listening fds (must match).
     pub upgrade_sock: String,
-    /// Number of Pingora worker threads allocated to the HTTP service.
+    /// Worker threads per listener runtime: the HTTP service and each
+    /// layer-4 TCP/UDP listener get this many.
     pub threads: usize,
 }
 
@@ -335,10 +336,12 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                 });
                 if tcp.transparent {
                     let transparent = TransparentTcpProxy::new(tcp, config_store.clone(), sink)?;
-                    server.add_service(background_service(
+                    add_layer4_service(
+                        &mut server,
                         &format!("transparent-tcp/{}", tcp.listen.display()),
                         transparent,
-                    ));
+                        opts.threads,
+                    );
                     tracing::info!("listening (transparent TCP) on {}", tcp.listen.display());
                     continue;
                 }
@@ -379,10 +382,12 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                     opts.upgrade_sock.clone(),
                     Some(server.watch_execution_phase()),
                 )?;
-                server.add_service(background_service(
+                add_layer4_service(
+                    &mut server,
                     &format!("tcp/{}", tcp.listen.display()),
                     service,
-                ));
+                    opts.threads,
+                );
                 if terminates_tls {
                     tracing::info!("listening (TLS-terminated TCP) on {}", tcp.listen.display());
                 } else {
@@ -408,10 +413,12 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                     udp.listen.display(),
                     Some(server.watch_execution_phase()),
                 )?;
-                server.add_service(background_service(
+                add_layer4_service(
+                    &mut server,
                     &format!("udp/{}", udp.listen.display()),
                     proxy,
-                ));
+                    opts.threads,
+                );
                 tracing::info!("listening (UDP) on {}", udp.listen.display());
             }
         }
@@ -439,6 +446,24 @@ fn ipv6_dual_stack_options() -> TcpSocketOptions {
     let mut options = TcpSocketOptions::default();
     options.ipv6_only = Some(false);
     options
+}
+
+/// Register a layer-4 listener as a Pingora background service with `threads`
+/// runtime workers.
+///
+/// `background_service()` pins every background service to a single worker
+/// thread and never consults `ServerConf::threads`, so without this the L4
+/// listeners run every accept loop and relay on one core no matter what
+/// `--threads` says. Measured on the L4 benchmark: the TCP connection-rate
+/// scenario ran at half of Nginx's rate with the whole listener on one thread,
+/// while the other worker threads sat idle.
+fn add_layer4_service<S>(server: &mut Server, name: &str, service: S, threads: usize)
+where
+    S: pingora::services::background::BackgroundService + Send + Sync + 'static,
+{
+    let mut service = background_service(name, service);
+    service.threads = Some(threads.max(1));
+    server.add_service(service);
 }
 
 /// The listeners to serve: the configured sites' ports, plus an implicit

@@ -59,7 +59,8 @@ struct ServerArgs {
     /// Unix socket both the old and new process use to hand over listening fds.
     #[arg(long, default_value = "/tmp/raddex_upgrade.sock")]
     upgrade_sock: String,
-    /// Number of Pingora worker threads allocated to the HTTP service.
+    /// Worker threads per listener runtime: the HTTP service and each
+    /// layer-4 TCP/UDP listener get this many.
     #[arg(long, default_value_t = 1, value_parser = positive_threads)]
     threads: usize,
 }
