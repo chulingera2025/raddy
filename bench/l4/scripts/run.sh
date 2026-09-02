@@ -378,6 +378,18 @@ run_scenario_target() {
                 local warmup_perf="$point_dir/rep-${repetition}.warmup.perf.csv"
                 run_loadgen "$target" "$mode" "$port" "$warmup" "$connections" "$payload_bytes" "$window" "$connect_rate" "$packets_per_second" \
                     "$connect_timeout" "$warmup_result" "$warmup_error" "$warmup_perf" || die "warmup failed for $scenario_id / $target"
+                # The warmup leaves the target's netns with every warmup
+                # connection in TIME-WAIT toward the origin plus whatever the
+                # loadgen's exit orphaned. A 10K-connection warmup fills one
+                # parity of the ephemeral port range, and from then on each
+                # connect() in the measured pass scans the occupied ports
+                # first: measured at 1-5 ms per connect against 0.1 ms clean,
+                # scaling with how many threads the target connects from. The
+                # measured pass therefore starts from a fresh container so it
+                # measures the proxy, not the kernel's port scan.
+                stop_target "$target"
+                start_target "$target" "$transport" "$port" "$connect_timeout"
+                container_id="$("${COMPOSE[@]}" ps -q "$(target_service "$target")")"
             fi
 
             host_snapshot >"$host_path"

@@ -101,6 +101,25 @@ separates downstream accept success from successful upstream establishment.
 UDP flow scenarios send and receive one probe per source socket, so the flow is
 known to be active before the hold interval begins.
 
+Every repetition runs its warmup pass, then **restarts the target** before the
+measured pass. The warmup leaves the target's network namespace with one
+`TIME-WAIT` socket toward the origin per warmup connection, plus the sockets
+the load generator's exit orphaned. A 10K-connection warmup fills one parity
+of the ephemeral port range, after which every `connect()` in a measured pass
+on the same namespace first scans the occupied ports: 1–5 ms per connect
+against 0.1 ms on a clean namespace, in proportion to how few threads the
+target connects from. Measured before the restart was added, that scan alone
+moved the 10K connection-rate result from 89% to 49% of Nginx for a target
+connecting from one thread. The restart makes the connection-rate and
+long-lived scenarios measure the proxy on identical kernel state rather than
+the kernel's port scan.
+
+The same port range also caps what one proxy address can hold open toward one
+origin address: with the default `ip_local_port_range` (32768–60999) that is
+28 232 concurrent proxied connections, before any `TIME-WAIT` residue. The 50K
+and 100K connection scenarios ask for more than that from every target, so
+their results describe where this topology saturates, not a ranking.
+
 UDP throughput is paced instead of flooding the socket indefinitely. The
 report records both offered PPS and received PPS plus packet loss. A result
 with high packet loss is a stress point, not evidence of higher useful
