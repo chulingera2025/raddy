@@ -246,7 +246,16 @@ pub struct TcpProxyApp {
     config_store: Arc<ConfigStore>,
     /// The current runtime (balancer + admission + timeouts), rebuilt on reload
     /// when the spec changes. Shared with the health-check thread.
-    runtime: Arc<Mutex<AppRuntime>>,
+    /// The current runtime, read once per accepted connection.
+    ///
+    /// `ArcSwap`, not `Mutex`: this is on the accept path, and a mutex here is
+    /// taken per connection and contended between every accept loop plus the
+    /// health-check and DNS-refresh threads. Reads are lock-free; the rare
+    /// rebuild serialises on `rebuild_lock`.
+    runtime: Arc<arc_swap::ArcSwap<AppRuntime>>,
+    /// Serialises runtime rebuilds (reload and DNS refresh) without putting a
+    /// lock on the read path.
+    rebuild_lock: Arc<Mutex<()>>,
     /// Last `ConfigStore` generation reconciled into `runtime`, so an unchanged
     /// config costs one atomic load per connection instead of a spec rebuild.
     applied_generation: AtomicU64,
@@ -457,7 +466,10 @@ impl TcpProxyApp {
     ) -> Result<Self, String> {
         let listen = tcp.listen.clone();
         let listener = format!("tcp/{}", tcp.listen.display());
-        let runtime = Arc::new(Mutex::new(AppRuntime::build(tcp, &listen)?));
+        let runtime = Arc::new(arc_swap::ArcSwap::from_pointee(AppRuntime::build(
+            tcp, &listen,
+        )?));
+        let rebuild_lock = Arc::new(Mutex::new(()));
         let metrics = TcpMetrics::register(&listener);
         // Active health checks only apply to `to` mode; SNI routes are exact
         // single-upstream mappings (per-route health is a P1 follow-up).
@@ -474,11 +486,7 @@ impl TcpProxyApp {
                         loop {
                             tokio::time::sleep(interval).await;
                             // Probe the current balancer: a reload replaces it.
-                            let selector = runtime
-                                .lock()
-                                .expect("L4 runtime lock poisoned")
-                                .selector
-                                .clone();
+                            let selector = runtime.load().selector.clone();
                             if let L4Selector::Balancer(balancer) = &*selector {
                                 balancer.probe().await;
                             }
@@ -493,12 +501,20 @@ impl TcpProxyApp {
             let config_store = config_store.clone();
             let listen = listen.clone();
             let runtime = runtime.clone();
+            let rebuild = rebuild_lock.clone();
             let metrics = metrics.clone();
             let listener_c = listener.clone();
             let interval = dns_refresh_interval();
             std::thread::spawn(move || loop {
                 std::thread::sleep(interval);
-                refresh_dns(&config_store, &listen, &runtime, &metrics, &listener_c);
+                refresh_dns(
+                    &config_store,
+                    &listen,
+                    &runtime,
+                    &rebuild,
+                    &metrics,
+                    &listener_c,
+                );
             });
         }
         Ok(Self {
@@ -507,6 +523,7 @@ impl TcpProxyApp {
             applied_generation: AtomicU64::new(config_store.generation()),
             config_store,
             runtime,
+            rebuild_lock,
             metrics,
             access_log,
         })
@@ -534,9 +551,9 @@ impl TcpProxyApp {
             }
             _ => None,
         });
-        let mut guard = self.runtime.lock().expect("L4 runtime lock poisoned");
+        let _rebuild = self.rebuild_lock.lock().expect("L4 rebuild lock poisoned");
         if let Some(new_spec) = new_spec {
-            if guard.spec != new_spec {
+            if self.runtime.load().spec != new_spec {
                 if let Some(tcp) = config.layer4.iter().find_map(|listener| match listener {
                     Layer4Listener::Tcp(tcp) if tcp.listen == self.listen => Some(tcp),
                     _ => None,
@@ -544,7 +561,7 @@ impl TcpProxyApp {
                     match AppRuntime::build(tcp, &self.listen) {
                         Ok(runtime) => {
                             tracing::info!("tcp {}: upstream set changed on reload", self.listener);
-                            *guard = runtime;
+                            self.runtime.store(Arc::new(runtime));
                         }
                         Err(e) => tracing::error!(
                             "tcp {}: reload upstream rebuild failed, keeping previous: {e}",
@@ -557,19 +574,12 @@ impl TcpProxyApp {
         // Record the generation only after reconciling it, so a reload racing
         // with this check is picked up by the next connection rather than lost.
         self.applied_generation.store(generation, Ordering::Release);
-        RuntimeHandle {
-            selector: guard.selector.clone(),
-            admission: guard.admission.clone(),
-            connect_timeout: guard.connect_timeout,
-            idle_timeout: guard.idle_timeout,
-            policy: guard.spec.lb_policy,
-            transparent: guard.spec.transparent,
-        }
+        self.handle_from_runtime()
     }
 
     /// Snapshot the current runtime without consulting the config store.
     fn handle_from_runtime(&self) -> RuntimeHandle {
-        let guard = self.runtime.lock().expect("L4 runtime lock poisoned");
+        let guard = self.runtime.load();
         RuntimeHandle {
             selector: guard.selector.clone(),
             admission: guard.admission.clone(),
@@ -916,10 +926,17 @@ async fn accept_loop(
     shutdown: ShutdownWatch,
     stop: Arc<tokio::sync::Notify>,
 ) {
+    // Register the stop notification once. Building a `Notified` inside the
+    // select would take the notify list's lock on *every* accepted connection,
+    // and both accept loops share this `Notify` — per-connection contention on
+    // the hottest path in the listener.
+    let stopped = stop.notified();
+    tokio::pin!(stopped);
     loop {
         let accepted = tokio::select! {
+            biased;
+            _ = &mut stopped => break,
             result = listener.accept() => result,
-            _ = stop.notified() => break,
         };
         let (stream, peer) = match accepted {
             Ok(pair) => pair,
@@ -1838,7 +1855,8 @@ fn dns_refresh_interval() -> Duration {
 fn refresh_dns(
     config_store: &ConfigStore,
     listen: &ListenAddress,
-    runtime: &Mutex<AppRuntime>,
+    runtime: &arc_swap::ArcSwap<AppRuntime>,
+    rebuild_lock: &Mutex<()>,
     metrics: &TcpMetrics,
     listener: &str,
 ) {
@@ -1853,11 +1871,11 @@ fn refresh_dns(
     };
     match resolved_set(tcp, listen) {
         Ok(new_resolved) => {
-            let mut guard = runtime.lock().expect("L4 runtime lock poisoned");
+            let _rebuild = rebuild_lock.lock().expect("L4 rebuild lock poisoned");
             // Compare the *sets* of addresses (order can rotate between
             // resolutions without meaning the backend changed) so a benign
             // reorder does not rebuild the balancer and reset health state.
-            let mut current: Vec<SocketAddr> = guard.resolved.clone();
+            let mut current: Vec<SocketAddr> = runtime.load().resolved.clone();
             current.sort_unstable();
             let mut next: Vec<SocketAddr> = new_resolved.clone();
             next.sort_unstable();
@@ -1867,7 +1885,7 @@ fn refresh_dns(
                         tracing::info!(
                             "tcp {listener}: upstream addresses changed via DNS refresh"
                         );
-                        *guard = new_runtime;
+                        runtime.store(Arc::new(new_runtime));
                     }
                     Err(e) => {
                         metrics.dns_refresh_failures.inc();
@@ -2053,7 +2071,9 @@ mod tests {
         // A transient DNS refresh failure must keep the working backend set and
         // count the failure (L4 plan), never discard it.
         let good = tcp_config(&["127.0.0.1:1"]);
-        let runtime = Arc::new(Mutex::new(AppRuntime::build(&good, &good.listen).unwrap()));
+        let runtime =
+            arc_swap::ArcSwap::from_pointee(AppRuntime::build(&good, &good.listen).unwrap());
+        let rebuild_lock = Mutex::new(());
         let metrics = TcpMetrics::register("tcp/127.0.0.1:3306");
 
         // The live snapshot's upstream now fails to resolve.
@@ -2065,16 +2085,17 @@ mod tests {
         };
         let store = ConfigStore::new(compiled);
 
-        let before = runtime.lock().unwrap().resolved.clone();
+        let before = runtime.load().resolved.clone();
         refresh_dns(
             &store,
             &good.listen,
             &runtime,
+            &rebuild_lock,
             &metrics,
             "tcp/127.0.0.1:3306",
         );
         assert_eq!(
-            runtime.lock().unwrap().resolved,
+            runtime.load().resolved,
             before,
             "last-known-good addresses must be kept on a refresh failure"
         );
