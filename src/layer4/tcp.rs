@@ -1685,75 +1685,79 @@ where
     let base = Instant::now();
     let last = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    // Byte counters live outside the pumps so the shutdown path can report what
+    // was transferred without waiting for them to finish.
+    let c2u = Arc::new(AtomicU64::new(0));
+    let u2c = Arc::new(AtomicU64::new(0));
 
-    // Watchdog: once the connection has been idle for `idle`, or the server
-    // begins shutting down, set `stop`. The loop recomputes the deadline from
-    // the shared activity clock each iteration, so traffic in either direction
-    // extends it; only a genuinely idle connection trips the `now >= deadline`
-    // check. `shutdown.changed()` (re-armed every iteration) plus the
-    // borrow-check at the top make shutdown prompt.
-    let watchdog = {
-        let last = last.clone();
-        let stop = stop.clone();
-        let mut shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            loop {
-                if *shutdown.borrow() {
-                    stop.store(true, Ordering::Relaxed);
-                    return;
-                }
-                let deadline = base + Duration::from_millis(last.load(Ordering::Relaxed)) + idle;
-                let now = Instant::now();
-                if now >= deadline {
-                    stop.store(true, Ordering::Relaxed);
-                    return;
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(deadline - now) => {
-                        // Loop to recompute the deadline: activity during the
-                        // sleep extended `last`, so the connection is not idle.
-                    }
-                    _ = shutdown.changed() => {}
-                }
-            }
-        })
-    };
-
-    // Split each side into read/write halves so both directions run
-    // concurrently on owned halves (`Stream` is `Unpin`).
     let (client_r, client_w) = tokio::io::split(&mut client);
     let (upstream_r, upstream_w) = tokio::io::split(&mut upstream);
 
-    let (c2u, u2c) = tokio::join!(
-        pump(client_r, upstream_w, base, &last, &stop),
-        pump(upstream_r, client_w, base, &last, &stop),
-    );
-    // Both directions are done, so the watchdog has nothing left to guard.
-    // Without this it would sleep out the remaining idle timeout — an hour, on
-    // a long-`idle_timeout` listener — holding a task and a timer per closed
-    // connection.
-    watchdog.abort();
-
-    let end = if *shutdown.borrow() {
-        EndReason::Shutdown
-    } else if stop.load(Ordering::Relaxed) {
-        // `stop` was set by the idle watchdog (shutdown already handled above).
-        EndReason::Idle
-    } else {
-        EndReason::Closed
+    let pumps = async {
+        tokio::join!(
+            pump(client_r, upstream_w, base, idle, &last, &stop, &c2u),
+            pump(upstream_r, client_w, base, idle, &last, &stop, &u2c),
+        )
     };
-    (c2u, u2c, end)
+    tokio::pin!(pumps);
+    let mut shutdown_watch = shutdown.clone();
+    // Sync this receiver's seen-version before selecting on it. A cloned
+    // `watch::Receiver` inherits the seen state of the receiver it came from, so
+    // if that one never observed the current value, `changed()` would resolve
+    // immediately and kill the connection before it relayed anything.
+    if *shutdown_watch.borrow_and_update() {
+        return (0, 0, EndReason::Shutdown);
+    }
+
+    // One shutdown future per connection, not one per read and not a spawned
+    // watchdog task: at ten thousand concurrent connections the spawn itself is
+    // the cost, and it lands entirely inside the connection-establishment burst.
+    let end = tokio::select! {
+        (a, b) = &mut pumps => {
+            let idle_stop = stop.load(Ordering::Relaxed);
+            return (
+                a,
+                b,
+                if *shutdown_watch.borrow() {
+                    EndReason::Shutdown
+                } else if idle_stop {
+                    EndReason::Idle
+                } else {
+                    EndReason::Closed
+                },
+            );
+        }
+        _ = shutdown_watch.changed() => EndReason::Shutdown,
+    };
+    // Shutting down: tell the pumps to stop and report what they moved. They
+    // observe `stop` on their next read boundary and drop their halves.
+    stop.store(true, Ordering::Relaxed);
+    (
+        c2u.load(Ordering::Relaxed),
+        u2c.load(Ordering::Relaxed),
+        end,
+    )
 }
 
 /// Copy bytes from `src` to `dst`, resetting the shared activity clock on each
 /// read and stopping when `stop` is set. On `src` EOF, half-closes `dst`'s
 /// write side so the far end sees EOF while the other direction keeps flowing.
+///
+/// The inactivity timeout is enforced here rather than by a watchdog task. A
+/// read that does not complete within `idle` is not itself proof the connection
+/// is idle — the *other* direction may be busy — so the shared clock is
+/// consulted before giving up. This keeps the documented "reset by traffic in
+/// either direction" semantics while costing no task and no extra timer per
+/// connection.
+#[allow(clippy::too_many_arguments)]
 async fn pump<R, W>(
     mut src: R,
     mut dst: W,
     base: Instant,
+    idle: Duration,
     last: &Arc<AtomicU64>,
     stop: &Arc<AtomicBool>,
+    total_out: &Arc<AtomicU64>,
 ) -> u64
 where
     R: AsyncRead + Unpin,
@@ -1768,7 +1772,24 @@ where
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match src.read(&mut buf).await {
+        let read = match tokio::time::timeout(idle, src.read(&mut buf)).await {
+            Err(_) => {
+                // This direction was quiet for the whole window. Only close if
+                // the connection as a whole was idle; otherwise the other
+                // direction is carrying traffic and this one keeps waiting.
+                let idle_ms = base
+                    .elapsed()
+                    .as_millis()
+                    .saturating_sub(u128::from(last.load(Ordering::Relaxed)));
+                if idle_ms >= idle.as_millis() {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                continue;
+            }
+            Ok(result) => result,
+        };
+        match read {
             Ok(0) => {
                 // EOF: propagate half-close, then let the other direction end.
                 let _ = dst.shutdown().await;
@@ -1786,13 +1807,13 @@ where
                 }
                 // A plain `TcpStream` has no user-space write buffer, so this
                 // flush is a no-op and `write_all` above already reached the
-                // kernel — that is the win over the previous buffered Pingora
-                // transport. It is kept because a TLS-terminated listener hands
+                // kernel. It is kept because a TLS-terminated listener hands
                 // this pump an `SslStream`, whose write BIO *does* buffer.
                 if dst.flush().await.is_err() {
                     break;
                 }
                 total += n as u64;
+                total_out.store(total, Ordering::Relaxed);
                 last.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
             }
             Err(_) => break,
