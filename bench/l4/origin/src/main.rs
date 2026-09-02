@@ -3,11 +3,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 const TCP_ADDR: &str = "0.0.0.0:19000";
 const UDP_ADDR: &str = "0.0.0.0:19001";
 const READY: &[u8] = b"READY\n";
+/// Accept queue depth. Capped by `net.core.somaxconn` on the host.
+const LISTEN_BACKLOG: u32 = 65535;
 
 #[tokio::main]
 async fn main() {
@@ -22,7 +24,19 @@ async fn main() {
 }
 
 async fn run_tcp() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(TCP_ADDR).await?;
+    // Bind with a deep accept queue instead of `TcpListener::bind`, whose
+    // default is 128.
+    //
+    // The origin must never be the bottleneck: it is shared by every target, so
+    // anything it drops is charged to whichever proxy happened to dial hardest.
+    // Measured with the 128 default, a 10K-connection scenario overflowed this
+    // queue 732 times, and the proxy that opened upstream connections most
+    // concurrently ate the resulting SYN retransmits — scoring it on the
+    // origin's queue depth rather than on its own forwarding.
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(TCP_ADDR.parse()?)?;
+    let listener = socket.listen(LISTEN_BACKLOG)?;
     loop {
         let (stream, _) = listener.accept().await?;
         tokio::spawn(async move {
