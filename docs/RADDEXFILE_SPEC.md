@@ -730,12 +730,25 @@ tcp :8443 {
   counts oversized datagrams, and `recv_buffer`/`send_buffer` size the sockets
   (0 = OS default). IPv4 and IPv6 upstreams are supported. UDP and TCP may
   share an address and port. Metrics:
-  `raddex_l4_udp_*`. UDP zero-downtime upgrades are available on Linux:
-  raddex transfers the listener fd, every connected upstream flow fd, and
-  bounded flow metadata through a private handoff manifest. The kernel receive
-  queue remains attached to the transferred listener, so flows continue without
-  a rebind gap. If the handoff fails, the upgrade fails closed rather than
-  claiming success.
+  `raddex_l4_udp_*`.
+- **UDP listener fan-out**: the listener binds one `SO_REUSEPORT` socket per
+  worker thread (`--threads`), each drained by its own receive loop. The kernel
+  hashes a datagram's 4-tuple to a socket, so every datagram of one client flow
+  lands on the same loop. Two consequences are worth planning around:
+  `recv_buffer`/`send_buffer` apply **per socket**, so the listener's total
+  kernel buffer is that value times the worker count; and a datagram dropped
+  because a socket's receive buffer was full is counted by the kernel
+  (`UdpRcvbufErrors` in `/proc/net/snmp`), never by a `raddex_l4_udp_*` metric,
+  because the process never sees it. Check the kernel counter, not only the
+  Raddex ones, when diagnosing datagram loss.
+- **UDP zero-downtime upgrades** are available on Linux: raddex transfers every
+  listener fd, every connected upstream flow fd, and bounded flow metadata
+  through a private handoff manifest. The kernel receive queue remains attached
+  to the transferred listeners, so flows continue without a rebind gap. If the
+  handoff fails, the upgrade fails closed rather than claiming success. The
+  replacement must run the **same worker-thread count**: the listener socket
+  count is part of the handoff contract, so changing `--threads` requires a
+  normal restart rather than an upgrade.
 - **QUIC passthrough**: the UDP proxy can forward QUIC packets as ordinary
   datagrams, but Pingora 0.8.1 has no native QUIC/HTTP/3 stack. This does not
   terminate QUIC, route HTTP/3 requests, or support QUIC connection migration;

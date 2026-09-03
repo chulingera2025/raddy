@@ -51,29 +51,35 @@ section short.
 
   | Metric | Pingora path | Native path |
   | --- | ---: | ---: |
-  | Long-lived 10K · CPU | 129.9% | **79.2%** |
-  | Long-lived 10K · memory | 282.1% | **113.1%** |
-  | UDP flows 10K · memory | — | **56.4%** |
-  | UDP packets/s · CPU | — | **86.2%** |
-  | TCP connect rate | 90.5% | **44.5%** |
-  | TCP throughput 64 KiB | 81.9% | **46.1%** |
-  | TCP p99 / 64 B | 50.0% | **250.0%** |
+  | TCP throughput 64 KiB | 81.9% | **158.8%** |
+  | throughput · CPU | — | **62.1%** |
+  | Long-lived 10K · memory | 282.1% | **73.1%** |
+  | UDP flows 10K · memory | — | **51.2%** |
+  | TCP connect rate | 90.5% | **81.8%** |
+  | connect rate · CPU | 122.9% | **65.3%** |
+  | Long-lived 10K · CPU | 129.9% | **113.0%** |
 
-  **This is a trade, not a clean win.** Holding 10 000 idle connections now
-  costs 79.2% of Nginx's CPU and 113.1% of its memory, against 129.9% and
-  282.1% through Pingora — the workload the layer-4 proxy exists for. UDP
-  improved on both axes. But the native listener accepts more slowly than the
-  Pingora path did and moves large payloads more slowly, and neither has been
-  explained yet: adding one `SO_REUSEPORT` accept loop per worker eliminated the
-  connection-rate error rate but did not raise the rate itself, which points at
-  something other than accept concurrency.
+  **These figures are provisional and must not be advertised yet.** Two things
+  make them softer than they look:
 
-  Deployments dominated by long-lived connections or UDP benefit today.
-  Deployments dominated by short connections or bulk transfer should not upgrade
-  for performance yet. The `quick` profile runs one repetition and shows visible
-  run-to-run variance — Caddy's connection rate moved from 105.5% to 77.0%
-  between two runs of the same commit-pair — so these figures will be replaced
-  by a repeated `full`-profile run before any of them is advertised.
+  1. An earlier version of this table reported the connection rate at 44.5% and
+     64 KiB throughput at 46.1%. Those numbers were substantially a harness
+     defect, not a property of the code: the benchmark did not restart the
+     target between warm-up and measurement, so the measured phase ran against
+     a proxy still holding warm-up state. After that was fixed, *every* target
+     got roughly six times faster — Nginx's own connection rate went from
+     538/s to 3 224/s — and the ranking changed. Any conclusion drawn from the
+     old table should be discarded.
+  2. The `quick` profile runs one repetition over five seconds, and the
+     run-to-run variance is large. Across two runs of adjacent commits the
+     connection rate moved 89.5% → 81.8% and long-lived CPU moved 70.9% →
+     113.0%. A repeated `full`-profile run is required before any of this is
+     published.
+
+  What is solid across both runs: 64 KiB throughput beats Nginx (156–159%) at
+  roughly 62% of its CPU, and memory is the lowest of the three targets on
+  every scenario. Raddex also now beats Caddy on connection rate rather than
+  losing to it.
 
   No configuration changes. `tcp` listeners, `lb_policy`, `health_check`,
   `sni`, `tls`, `transparent`, timeouts, and limits all behave as documented.
@@ -117,6 +123,41 @@ section short.
   time. Existing GitHub URLs keep working through GitHub's rename redirect.
 
 ### Fixed
+
+- **UDP listeners dropped datagrams under a burst of new flows.** In the
+  `udp_flows_10k` benchmark Raddex lost datagrams that Nginx did not. Reading
+  the kernel counters in each container's network namespace attributed the loss
+  exactly — `loadgen failed = 36`, `Udp:InErrors = 36`,
+  `Udp:RcvbufErrors = 36` — so every lost flow was a datagram the kernel
+  dropped because the listener socket's receive buffer was full. None was lost
+  in Raddex's own code and none on the upstream path, which is why no
+  `raddex_l4_udp_*` metric counted them: the process never saw them.
+
+  The cause was structural. The listener bound one socket drained by one task,
+  so its kernel buffer was a single `net.core.rmem_max` (208 KiB on the test
+  host) and its drain rate was one task's. Creating a flow means creating and
+  connecting an upstream socket, and datagrams arriving during that work had
+  nowhere to queue. Nginx's own benchmark config says `listen 18001 udp
+  reuseport` and it ran two workers, so it had two sockets, two buffers and two
+  drain loops, and lost nothing.
+
+  The listener now binds one `SO_REUSEPORT` socket per worker thread, each with
+  its own receive loop, mirroring what the TCP listener already does for
+  accept. Re-measured on the same host, the error rate went from 0.360% to
+  **0.000%**, `Udp:InDatagrams` from 19 928 to the full 20 000, and
+  `RcvbufErrors` to zero. See the fan-out notes in the Raddexfile
+  specification: `recv_buffer`/`send_buffer` now apply per socket, and changing
+  `--threads` requires a restart rather than a hot upgrade.
+
+- **Layer-4 listeners could hang on shutdown.** The TCP accept loops and the
+  UDP receive loops were stopped with `Notify::notify_waiters()`, which wakes
+  only waiters already registered — and a freshly spawned loop registers
+  nothing until first polled. If shutdown was already signalled when the
+  service started, the parent broke out without ever yielding, the wake reached
+  nobody, and the `worker.await` that followed never returned, so the process
+  could not shut down. Both paths now use a `watch` channel, which carries the
+  value instead of only signalling registered waiters. Found while auditing the
+  UDP fan-out change, which had copied the pattern from the TCP path.
 
 - Layer-4 `ip_hash` distributed client IPs from one subnet very unevenly.
   Selection hashed with FNV-1a, whose high-bit avalanche is weak for inputs

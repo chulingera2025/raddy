@@ -15,6 +15,14 @@ TCP listeners  -> Tokio TcpListener and Raddex relay
 UDP listeners  -> Tokio UdpSocket and Raddex flow table
 ```
 
+Both layer-4 transports fan their listener out across the configured worker
+threads: one `SO_REUSEPORT` socket per thread, each drained by its own accept
+or receive loop. For UDP this is load-bearing rather than an optimization —
+each socket carries its own kernel receive buffer, so a burst of new flows that
+would overflow one socket's buffer is spread across several. A datagram lost
+that way is counted only by the kernel (`UdpRcvbufErrors`), never by a Raddex
+metric, because the process never receives it.
+
 Both layer-4 transports are native Tokio end to end: Raddex binds the socket,
 accepts, terminates TLS, selects and health-checks upstreams, and relays. No
 forwarded byte passes through Pingora, which hosts the process (background
@@ -51,6 +59,8 @@ and dual-stack conflicts.
   and packet size. Capacity eviction is oldest-first.
 - IPv4 and IPv6 upstream families are preserved when creating flow sockets.
 - Oversized datagrams are dropped and counted rather than forwarded partially.
+- `recv_buffer` and `send_buffer` size each listener socket, so the listener's
+  total kernel buffer is the configured value times the worker-thread count.
 
 ## Reload and upgrade invariants
 
@@ -64,13 +74,15 @@ replacement as complete.
 
 Linux UDP upgrade transfers:
 
-1. the UDP listener file descriptor;
+1. every UDP listener file descriptor;
 2. every connected upstream flow descriptor;
 3. bounded JSON metadata that reconstructs the flow table.
 
-The receiver queue stays attached to the transferred listener. Any missing
+The receiver queue stays attached to the transferred listeners. Any missing
 descriptor, malformed metadata, or listener status error fails the handoff
-rather than silently dropping active flows.
+rather than silently dropping active flows. The listener socket count is part
+of the contract, so a replacement started with a different worker-thread count
+is refused: change `--threads` with a normal restart, not an upgrade.
 
 ## Observability
 
