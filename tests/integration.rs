@@ -3467,6 +3467,92 @@ fn zero_downtime_upgrade_hands_off_udp_listener_and_flow() {
 }
 
 #[test]
+fn zero_downtime_upgrade_hands_off_every_udp_reuseport_listener() {
+    // With `--threads 2` the listener binds one SO_REUSEPORT socket per worker,
+    // so the handoff must carry *both* descriptors and the replacement must
+    // rebuild the same fan-out. At the default one thread the multi-descriptor
+    // path is never exercised, which is how it would rot unnoticed.
+    let tag = format!(
+        "{}_{}",
+        std::process::id(),
+        UPGRADE_TAG.fetch_add(1, Ordering::Relaxed)
+    );
+    let (pidfile, upgrade_sock, cert_dir) = upgrade_paths(&tag);
+    let extra = vec![
+        format!("--pidfile={}", pidfile.display()),
+        format!("--upgrade-sock={}", upgrade_sock.display()),
+        format!("--cert-dir={}", cert_dir.display()),
+        "--threads=2".to_string(),
+    ];
+    let (up_port, _upstream) = UdpEchoUpstream::spawn("fanout");
+    let raddex = RadRaddex::spawn_udp_with_args(
+        |port| format!("udp 127.0.0.1:{port} {{\n    to 127.0.0.1:{up_port}\n}}\n"),
+        &extra,
+    );
+    let client = UdpSocket::bind("127.0.0.1:0").expect("bind persistent UDP client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set persistent UDP timeout");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut before = None;
+    while Instant::now() < deadline {
+        before = udp_roundtrip_on(&client, raddex.port(), "before");
+        if before.as_deref() == Some("fanout:before") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(before.as_deref(), Some("fanout:before"));
+    let old_pid = read_pid_file(&pidfile);
+
+    let mut cmd = Command::new(BIN);
+    cmd.args(["upgrade", "-c"]).arg(&raddex.config_path);
+    cmd.args(&extra);
+    cmd.env("RUST_LOG", "error");
+    let status = cmd.status().expect("failed to spawn UDP fan-out upgrade");
+    assert!(
+        status.success(),
+        "UDP upgrade with two receive loops should succeed: {status:?}"
+    );
+
+    assert_eq!(
+        udp_roundtrip_on(&client, raddex.port(), "after").as_deref(),
+        Some("fanout:after"),
+        "the persistent client flow must survive a multi-listener handoff"
+    );
+    let new_pid = read_pid_file(&pidfile);
+    assert_ne!(new_pid, old_pid, "UDP upgrade should replace the process");
+    assert!(process_alive(new_pid), "replacement UDP process should run");
+    // A fresh client must also be served, proving every transferred socket is
+    // being drained rather than only the one the old flow happened to use.
+    let fresh = UdpSocket::bind("127.0.0.1:0").expect("bind fresh UDP client");
+    fresh
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set fresh UDP timeout");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut fresh_reply = None;
+    while Instant::now() < deadline {
+        fresh_reply = udp_roundtrip_on(&fresh, raddex.port(), "fresh");
+        if fresh_reply.as_deref() == Some("fanout:fresh") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(fresh_reply.as_deref(), Some("fanout:fresh"));
+    // SAFETY: new_pid is the replacement process written by the test instance.
+    unsafe {
+        libc::kill(new_pid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && process_alive(new_pid) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = std::fs::remove_file(&upgrade_sock);
+    let _ = std::fs::remove_dir_all(&cert_dir);
+}
+
+#[test]
 fn upgrade_aborts_on_broken_config_without_disturbing_instance() {
     let tag = format!(
         "{}_{}",
