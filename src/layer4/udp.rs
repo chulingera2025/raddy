@@ -1102,13 +1102,31 @@ impl BackgroundService for UdpProxy {
         // Convert the bound std sockets to tokio here, where a runtime exists.
         // They are cloned rather than consumed so the handoff can still send
         // the original descriptors during an upgrade.
-        let std_sockets: Vec<std::net::UdpSocket> = self
+        //
+        // A failed clone is fatal rather than skipped: silently dropping one
+        // socket would leave the listener running with fewer receive loops than
+        // configured, which is exactly the under-provisioned state this fan-out
+        // exists to avoid, and nothing would report it.
+        let cloned: std::io::Result<Vec<std::net::UdpSocket>> = self
             .std_sockets
             .lock()
             .expect("UDP socket lock poisoned")
             .iter()
-            .filter_map(|socket| socket.try_clone().ok())
+            .map(|socket| socket.try_clone())
             .collect();
+        let std_sockets = match cloned {
+            Ok(sockets) => sockets,
+            Err(e) => {
+                tracing::error!(
+                    "udp {}: failed to clone a listener socket: {e}",
+                    self.listener
+                );
+                if self.upgrade {
+                    std::process::exit(1);
+                }
+                return;
+            }
+        };
         if std_sockets.is_empty() {
             tracing::error!("udp {}: listener sockets are unavailable", self.listener);
             if self.upgrade {
@@ -1171,11 +1189,18 @@ impl BackgroundService for UdpProxy {
 
         // One receive loop per `SO_REUSEPORT` socket. `stop` ends them all at
         // once, so shutdown and the upgrade handoff stay single-signal.
-        let stop = Arc::new(tokio::sync::Notify::new());
+        // A `watch` channel rather than a `Notify`: `notify_waiters()` wakes
+        // only waiters that are *already registered*, and a freshly spawned
+        // loop registers nothing until it is first polled. If shutdown is
+        // already signalled when this service starts, the parent below breaks
+        // without ever yielding, the wake reaches nobody, and `worker.await`
+        // hangs forever. A watch carries the value, so a receiver that
+        // registers later still observes it.
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
         let mut workers = Vec::with_capacity(sockets.len());
         for socket in sockets {
             let app = self.app.clone();
-            let stop = stop.clone();
+            let stop = stop_tx.subscribe();
             workers.push(tokio::spawn(
                 async move { recv_loop(socket, app, stop).await },
             ));
@@ -1210,7 +1235,7 @@ impl BackgroundService for UdpProxy {
             } => {}
         }
 
-        stop.notify_waiters();
+        let _ = stop_tx.send(true);
         for worker in workers {
             let _ = worker.await;
         }
@@ -1236,12 +1261,14 @@ impl BackgroundService for UdpProxy {
 /// upstream socket, and datagrams that arrive on this socket while that work is
 /// in progress are dropped by the kernel — counted as `UdpRcvbufErrors`, not by
 /// any Raddex metric, because the process never sees them.
-async fn recv_loop(socket: Arc<UdpSocket>, app: Arc<UdpApp>, stop: Arc<tokio::sync::Notify>) {
-    // Register the stop notification once. Building a `Notified` inside the
-    // select would take the notify list's lock on every datagram, and every
-    // receive loop shares this `Notify`.
-    let stopped = stop.notified();
-    tokio::pin!(stopped);
+async fn recv_loop(
+    socket: Arc<UdpSocket>,
+    app: Arc<UdpApp>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    if *stop.borrow_and_update() {
+        return;
+    }
     let mut max = app.current_state().max_datagram_size;
     // Buffer one byte larger than the cap so an oversized datagram is
     // detectable (a full read means it was truncated / too big).
@@ -1257,7 +1284,7 @@ async fn recv_loop(socket: Arc<UdpSocket>, app: Arc<UdpApp>, stop: Arc<tokio::sy
         }
         let received = tokio::select! {
             biased;
-            _ = &mut stopped => break,
+            _ = stop.changed() => break,
             result = socket.recv_from(&mut buf) => result,
         };
         let (n, client) = match received {

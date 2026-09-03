@@ -874,13 +874,20 @@ impl BackgroundService for TcpListenerService {
 
         // One accept task per `SO_REUSEPORT` socket. `stop` ends them all at
         // once, so the handoff and the shutdown watch stay single-signal.
-        let stop = Arc::new(tokio::sync::Notify::new());
+        // A `watch` channel rather than a `Notify`: `notify_waiters()` wakes
+        // only waiters that are *already registered*, and a freshly spawned
+        // accept loop registers nothing until it is first polled. If shutdown
+        // is already signalled when this service starts, the parent below
+        // breaks without ever yielding, the wake reaches nobody, and
+        // `worker.await` hangs forever. A watch carries the value, so a
+        // receiver that registers later still observes it.
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
         let mut workers = Vec::with_capacity(listeners.len());
         for listener in listeners {
             let app = self.app.clone();
             let tls = self.tls.clone();
             let shutdown = shutdown.clone();
-            let stop = stop.clone();
+            let stop = stop_tx.subscribe();
             workers.push(tokio::spawn(async move {
                 accept_loop(listener, app, tls, shutdown, stop).await;
             }));
@@ -908,7 +915,7 @@ impl BackgroundService for TcpListenerService {
         }
         // Stop accepting. In-flight relays keep running until they drain or the
         // shutdown watch cancels them.
-        stop.notify_waiters();
+        let _ = stop_tx.send(true);
         for worker in workers {
             let _ = worker.await;
         }
@@ -924,18 +931,15 @@ async fn accept_loop(
     app: Arc<TcpProxyApp>,
     tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
     shutdown: ShutdownWatch,
-    stop: Arc<tokio::sync::Notify>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    // Register the stop notification once. Building a `Notified` inside the
-    // select would take the notify list's lock on *every* accepted connection,
-    // and both accept loops share this `Notify` — per-connection contention on
-    // the hottest path in the listener.
-    let stopped = stop.notified();
-    tokio::pin!(stopped);
+    if *stop.borrow_and_update() {
+        return;
+    }
     loop {
         let accepted = tokio::select! {
             biased;
-            _ = &mut stopped => break,
+            _ = stop.changed() => break,
             result = listener.accept() => result,
         };
         let (stream, peer) = match accepted {
