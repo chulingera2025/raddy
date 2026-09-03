@@ -49,7 +49,7 @@ raddex run -c Raddexfile
 | `--metrics-addr <addr>` | unset | Expose Prometheus `/metrics` |
 | `--pidfile <file>` | unset | PID file used by `raddex upgrade` |
 | `--upgrade-sock <sock>` | `/tmp/raddex_upgrade.sock` | Unix socket used for listener handoff |
-| `--threads <n>` | `1` | Pingora worker threads allocated to the HTTP service |
+| `--threads <n>` | `1` | Worker threads per listener runtime: the HTTP service and each layer-4 TCP/UDP listener. Each layer-4 listener also binds one `SO_REUSEPORT` socket per thread, so this sets its accept and receive parallelism |
 | `-t, --test` | off | Validate construction without binding listeners |
 | `-u, --upgrade` | off | Start as the replacement side of an upgrade |
 

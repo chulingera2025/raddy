@@ -19,6 +19,7 @@ description: raddex 的每个子命令及其选项。
 | `--metrics-addr <addr>` | — | 在此地址暴露 Prometheus `/metrics`(例如 `127.0.0.1:9100`) |
 | `--pidfile <file>` | — | 将本进程 PID 写入此文件,供 `raddex upgrade` 定位 |
 | `--upgrade-sock <sock>` | `/tmp/raddex_upgrade.sock` | 升级期间移交监听 fd 的 Unix 套接字 |
+| `--threads <n>` | `1` | 每个监听器运行时的工作线程数:HTTP 服务与每个四层 TCP/UDP 监听器各分配这么多。四层监听器还会按线程数各绑定一个 `SO_REUSEPORT` 套接字,因此该值同时决定其 accept 与收包并行度 |
 | `-u, --upgrade` | — | 以零停机升级的*新*一侧启动(通常由 `raddex upgrade` 派生) |
 | `-t, --test` | — | 校验配置与构造后退出 0/1,不绑定任何监听器(`raddex upgrade` 的预检) |
 
