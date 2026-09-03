@@ -15,10 +15,18 @@
 //!
 //! One [`UdpProxy`] is bound to one `udp <address> { ... }` listener and runs
 //! as a Pingora [`BackgroundService`] so it starts and stops with the server.
-//! A Tokio `UdpSocket` owns the listener; the datagram loop looks up or creates
-//! a flow per client. Each flow has a *connected* upstream UDP socket whose
-//! ephemeral local port demultiplexes upstream responses, plus a reader task
-//! that sends those responses back to the client.
+//! The listener binds one `SO_REUSEPORT` socket per worker thread, each drained
+//! by its own receive loop; the kernel hashes a datagram's 4-tuple to a socket,
+//! so every datagram of one client flow lands on the same loop. This is what
+//! makes the kernel receive buffer and the drain rate scale with `--threads`:
+//! one socket cannot be drained faster than one task manages, and datagrams
+//! arriving while that task is creating a flow are dropped by the kernel
+//! (counted as `UdpRcvbufErrors`, never seen by the process).
+//!
+//! Each receive loop looks up or creates a flow per client. A flow has a
+//! *connected* upstream UDP socket whose ephemeral local port demultiplexes
+//! upstream responses, plus a reader task that sends those responses back to
+//! the client.
 //!
 //! Resources are bounded: the flow table is capped (max_flows, with
 //! deterministic oldest-first eviction), oversized datagrams are dropped and
@@ -26,8 +34,8 @@
 //! released). Selection (source-IP hash / round-robin / random) happens once
 //! per new flow. A SIGHUP reload updates the upstream set for new flows
 //! (existing flows keep their socket). On Linux, zero-downtime upgrades transfer
-//! the listener, connected upstream sockets, and bounded flow metadata through
-//! a dedicated handoff protocol.
+//! every listener socket, the connected upstream sockets, and bounded flow
+//! metadata through a dedicated handoff protocol.
 
 use crate::config::ast::{L4Upstream, Layer4Listener, LbPolicy, ListenAddress, UdpProxyConfig};
 use crate::config::snapshot::ConfigStore;
@@ -42,7 +50,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -71,11 +79,20 @@ struct UdpHandoffFlow {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct UdpHandoffManifest {
     chunks: usize,
+    /// How many `SO_REUSEPORT` listener descriptors chunk zero carries. Absent
+    /// in manifests written before the listener fan-out existed, which always
+    /// carried exactly one descriptor named `listener`; `0` therefore means
+    /// "one legacy listener" rather than "no listeners".
+    #[serde(default)]
+    listeners: usize,
     flows: Vec<UdpHandoffFlow>,
 }
 
 #[cfg(unix)]
-type UdpHandoffState = (std::net::UdpSocket, Vec<(UdpHandoffFlow, Arc<UdpSocket>)>);
+type UdpHandoffState = (
+    Vec<std::net::UdpSocket>,
+    Vec<(UdpHandoffFlow, Arc<UdpSocket>)>,
+);
 
 /// Keep the number of descriptors in every SCM_RIGHTS message below Pingora's
 /// receiver limit, leaving room for the listener descriptor in chunk zero.
@@ -230,29 +247,32 @@ pub struct UdpFlowRecord {
 /// A sink for typed UDP flow records (the access-log file, when configured).
 type AccessLogSink = dyn Fn(&UdpFlowRecord) + Send + Sync;
 
-/// The UDP proxy background service for one listener.
-pub struct UdpProxy {
+/// The datagram-path state of one UDP listener, shared by every receive loop.
+///
+/// Split out of [`UdpProxy`] because [`BackgroundService::start`] only receives
+/// `&self`: a receive loop that runs on its own worker thread must own an `Arc`
+/// of everything it touches, so this state cannot live behind that borrow.
+/// Mirrors `TcpProxyApp` on the TCP side.
+struct UdpApp {
     listener: String,
-    /// The bound std socket. Converted to tokio in start (where a runtime
-    /// exists); normal processes bind in new, while upgrade replacements
-    /// receive the socket during startup.
-    std_socket: Mutex<Option<std::net::UdpSocket>>,
-    /// True when this process must receive the UDP socket and flow table from
-    /// the old process during a Pingora upgrade.
-    upgrade: bool,
-    #[cfg(unix)]
-    upgrade_sock: String,
-    #[cfg(unix)]
-    handoff_id: String,
-    #[cfg(unix)]
-    phase_watch: Mutex<Option<tokio::sync::broadcast::Receiver<ExecutionPhase>>>,
     listen: ListenAddress,
     config_store: Arc<ConfigStore>,
     /// Reload-updatable selection state.
-    state: Mutex<UdpState>,
+    ///
+    /// `ArcSwap`, not `Mutex`: this is read on the datagram path for every
+    /// packet, by every receive loop at once, so a mutex here would serialise
+    /// the loops against each other. A rebuild serialises on `rebuild_lock`.
+    state: arc_swap::ArcSwap<UdpState>,
+    /// Held only while rebuilding `state`, so two loops observing the same
+    /// reload do not both resolve upstreams.
+    rebuild_lock: Mutex<()>,
+    /// The config generation `state` was last reconciled against, so the
+    /// common case (no reload) costs one atomic load instead of a config scan.
+    applied_generation: AtomicU64,
     /// Bounded flow table keyed by client address. `Arc` so flow reader tasks
-    /// hold a `Weak` to detect when their flow is evicted. A single lock is a
-    /// P2 simplification; the critical sections are short (lookup + insert).
+    /// hold a `Weak` to detect when their flow is evicted. One lock is shared
+    /// by every receive loop; the critical sections are short (lookup +
+    /// insert) and the upstream socket is built outside it.
     flows: Arc<Mutex<HashMap<SocketAddr, UdpFlow>>>,
     /// Set on shutdown so flow reader tasks stop and release their sockets.
     stop: Arc<AtomicBool>,
@@ -262,52 +282,69 @@ pub struct UdpProxy {
     access_log: Option<Arc<AccessLogSink>>,
 }
 
+/// The UDP proxy background service for one listener.
+pub struct UdpProxy {
+    listener: String,
+    /// How many `SO_REUSEPORT` listener sockets this listener binds, one per
+    /// receive loop. Each socket carries its own kernel receive buffer, so
+    /// both the buffer and the drain rate scale with the worker-thread count
+    /// instead of funnelling every client through a single socket.
+    recv_loops: usize,
+    /// The bound std sockets, one per receive loop. Converted to tokio in
+    /// start (where a runtime exists); normal processes bind in new, while
+    /// upgrade replacements receive them during startup.
+    std_sockets: Mutex<Vec<std::net::UdpSocket>>,
+    /// True when this process must receive the UDP sockets and flow table from
+    /// the old process during a Pingora upgrade.
+    upgrade: bool,
+    #[cfg(unix)]
+    upgrade_sock: String,
+    #[cfg(unix)]
+    handoff_id: String,
+    #[cfg(unix)]
+    phase_watch: Mutex<Option<tokio::sync::broadcast::Receiver<ExecutionPhase>>>,
+    app: Arc<UdpApp>,
+}
+
 impl UdpProxy {
-    /// Bind the listener socket and build the proxy. Normal processes bind the
-    /// socket here; upgrade replacements receive it during background startup.
+    /// Bind the listener sockets and build the proxy. Normal processes bind
+    /// here; upgrade replacements receive the sockets during background
+    /// startup.
+    ///
+    /// `recv_loops` is the worker-thread count: that many `SO_REUSEPORT`
+    /// sockets are bound, each drained by its own receive loop, so the kernel
+    /// receive buffer and the drain rate both scale with `--threads`. A single
+    /// socket cannot be drained faster than one thread manages, and datagrams
+    /// that arrive while it is busy creating a flow are dropped by the kernel
+    /// (`UdpRcvbufErrors`) rather than queued.
     ///
     /// Returns the proxy on success. Errors include bind, socket-option, and
     /// upstream-resolution failures.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         udp: &UdpProxyConfig,
         config_store: Arc<ConfigStore>,
         access_log: Option<Arc<AccessLogSink>>,
         upgrade: bool,
+        recv_loops: usize,
         #[cfg(unix)] upgrade_sock: String,
         #[cfg(unix)] handoff_id: String,
         #[cfg(unix)] phase_watch: Option<tokio::sync::broadcast::Receiver<ExecutionPhase>>,
     ) -> Result<Self, String> {
         let listener = format!("udp/{}", udp.listen.display());
-        let mut socket = if upgrade {
-            None
+        let ListenAddress::Socket(address) = &udp.listen;
+        let recv_loops = recv_loops.max(1);
+        let sockets = if upgrade {
+            Vec::new()
         } else {
-            let socket = std::net::UdpSocket::bind(udp.listen.display()).map_err(|e| {
-                format!("failed to bind udp listener {}: {e}", udp.listen.display())
-            })?;
-            socket.set_nonblocking(true).map_err(|e| {
-                format!(
-                    "failed to set udp listener {} non-blocking: {e}",
-                    udp.listen.display()
-                )
-            })?;
-            Some(socket)
+            (0..recv_loops)
+                .map(|_| {
+                    bind_udp_listener(*address, recv_loops > 1, udp.recv_buffer, udp.send_buffer)
+                })
+                .collect::<Result<Vec<_>, _>>()?
         };
-        // Configure socket buffers via socket2 (0 = OS default); `std::net`
-        // no longer exposes the buffer setters directly.
-        if udp.recv_buffer > 0 || udp.send_buffer > 0 {
-            if let Some(bound) = socket.take() {
-                let sock = socket2::Socket::from(bound);
-                if udp.recv_buffer > 0 {
-                    let _ = sock.set_recv_buffer_size(udp.recv_buffer);
-                }
-                if udp.send_buffer > 0 {
-                    let _ = sock.set_send_buffer_size(udp.send_buffer);
-                }
-                socket = Some(sock.into());
-            }
-        }
         let upstreams = resolve_udp_upstreams(udp)?;
-        let state = Mutex::new(UdpState {
+        let state = arc_swap::ArcSwap::from_pointee(UdpState {
             configured: udp.upstreams.clone(),
             upstreams,
             policy: udp.lb_policy,
@@ -316,9 +353,9 @@ impl UdpProxy {
             max_datagram_size: udp.max_datagram_size,
         });
         Ok(Self {
-            cursor: AtomicUsize::new(0),
-            listener,
-            std_socket: Mutex::new(socket),
+            listener: listener.clone(),
+            recv_loops,
+            std_sockets: Mutex::new(sockets),
             upgrade,
             #[cfg(unix)]
             upgrade_sock,
@@ -326,13 +363,19 @@ impl UdpProxy {
             handoff_id: handoff_key(&handoff_id),
             #[cfg(unix)]
             phase_watch: Mutex::new(phase_watch),
-            listen: udp.listen.clone(),
-            config_store,
-            state,
-            flows: Arc::new(Mutex::new(HashMap::new())),
-            stop: Arc::new(AtomicBool::new(false)),
-            metrics: UdpMetrics::register(&format!("udp/{}", udp.listen.display())),
-            access_log,
+            app: Arc::new(UdpApp {
+                cursor: AtomicUsize::new(0),
+                listener,
+                listen: udp.listen.clone(),
+                applied_generation: AtomicU64::new(config_store.generation()),
+                config_store,
+                state,
+                rebuild_lock: Mutex::new(()),
+                flows: Arc::new(Mutex::new(HashMap::new())),
+                stop: Arc::new(AtomicBool::new(false)),
+                metrics: UdpMetrics::register(&format!("udp/{}", udp.listen.display())),
+                access_log,
+            }),
         })
     }
 
@@ -355,47 +398,6 @@ impl UdpProxy {
     /// Return the status path for this listener's UDP handoff.
     fn handoff_status_path(&self) -> String {
         format!("{}.udp.{}.status", self.upgrade_sock, self.handoff_id)
-    }
-
-    /// The current selection state, rebuilt on reload when the upstream set or
-    /// policy changed (new flows use it; existing flows keep their socket).
-    fn current_state(&self) -> UdpState {
-        let mut state = self.state.lock().expect("UDP state lock poisoned");
-        if let Some(udp) = self
-            .config_store
-            .load()
-            .layer4
-            .iter()
-            .find_map(|l| match l {
-                Layer4Listener::Udp(udp) if udp.listen == self.listen => Some(udp),
-                _ => None,
-            })
-        {
-            let spec_changed = udp.upstreams != state.configured
-                || udp.lb_policy != state.policy
-                || udp.idle_timeout != state.idle_timeout
-                || udp.max_flows != state.max_flows
-                || udp.max_datagram_size != state.max_datagram_size;
-            if spec_changed {
-                if let Ok(upstreams) = resolve_udp_upstreams(udp) {
-                    tracing::info!("udp {}: upstream set changed on reload", self.listener);
-                    state.configured = udp.upstreams.clone();
-                    state.upstreams = upstreams;
-                    state.policy = udp.lb_policy;
-                    state.idle_timeout = udp.idle_timeout;
-                    state.max_flows = udp.max_flows;
-                    state.max_datagram_size = udp.max_datagram_size;
-                }
-            }
-        }
-        UdpState {
-            configured: state.configured.clone(),
-            upstreams: state.upstreams.clone(),
-            policy: state.policy,
-            idle_timeout: state.idle_timeout,
-            max_flows: state.max_flows,
-            max_datagram_size: state.max_datagram_size,
-        }
     }
 
     #[cfg(unix)]
@@ -423,12 +425,13 @@ impl UdpProxy {
 
     #[cfg(unix)]
     async fn send_handoff_inner(&self) -> Result<(), String> {
-        let (listener_fd, flow_fds, manifest) = {
-            let socket_guard = self.std_socket.lock().expect("UDP socket lock poisoned");
-            let socket = socket_guard
-                .as_ref()
-                .ok_or("UDP listener socket is unavailable")?;
-            let flows = self.flows.lock().expect("UDP flows lock poisoned");
+        let (listener_fds, flow_fds, manifest) = {
+            let socket_guard = self.std_sockets.lock().expect("UDP socket lock poisoned");
+            if socket_guard.is_empty() {
+                return Err("UDP listener sockets are unavailable".to_string());
+            }
+            let listener_fds: Vec<_> = socket_guard.iter().map(|s| s.as_raw_fd()).collect();
+            let flows = self.app.flows.lock().expect("UDP flows lock poisoned");
             let mut metadata = Vec::with_capacity(flows.len());
             let mut fds = Vec::with_capacity(flows.len());
             for (client, flow) in flows.iter() {
@@ -444,11 +447,13 @@ impl UdpProxy {
                 fds.push(flow.upstream.as_raw_fd());
             }
             let chunks = metadata.len().div_ceil(HANDOFF_FLOWS_PER_CHUNK);
+            let listeners = listener_fds.len();
             (
-                socket.as_raw_fd(),
+                listener_fds,
                 fds,
                 UdpHandoffManifest {
                     chunks: chunks.max(1),
+                    listeners,
                     flows: metadata,
                 },
             )
@@ -466,7 +471,9 @@ impl UdpProxy {
                 let end = (start + HANDOFF_FLOWS_PER_CHUNK).min(manifest.flows.len());
                 let mut fds = Fds::new();
                 if chunk == 0 {
-                    fds.add("listener".to_string(), listener_fd);
+                    for (index, fd) in listener_fds.iter().enumerate() {
+                        fds.add(format!("listener-{index}"), *fd);
+                    }
                 }
                 for (index, fd) in flow_fds.iter().enumerate().take(end).skip(start) {
                     fds.add(format!("flow-{index}"), *fd);
@@ -483,13 +490,70 @@ impl UdpProxy {
     }
 
     #[cfg(unix)]
-    /// Receive the inherited UDP listener and connected flow sockets.
+    /// Receive the inherited UDP listeners and connected flow sockets.
     async fn receive_handoff(&self) -> Result<UdpHandoffState, String> {
         let upgrade_sock = self.upgrade_sock.clone();
         let handoff_id = self.handoff_id.clone();
-        tokio::task::spawn_blocking(move || receive_udp_handoff(&upgrade_sock, &handoff_id))
-            .await
-            .map_err(|e| format!("UDP handoff receiver failed: {e}"))?
+        let expected = self.recv_loops;
+        tokio::task::spawn_blocking(move || {
+            receive_udp_handoff(&upgrade_sock, &handoff_id, expected)
+        })
+        .await
+        .map_err(|e| format!("UDP handoff receiver failed: {e}"))?
+    }
+}
+
+impl UdpApp {
+    /// The current selection state, rebuilt on reload when the upstream set or
+    /// policy changed (new flows use it; existing flows keep their socket).
+    ///
+    /// The generation check short-circuits the common case — no reload since
+    /// the last datagram — to one atomic load and an `Arc` clone. It matters
+    /// because this runs per datagram on every receive loop at once, and the
+    /// slow path below scans the config and clones the listener's upstream
+    /// vectors; doing that per datagram is pure allocation churn when reloads
+    /// are rare, which they are.
+    fn current_state(&self) -> Arc<UdpState> {
+        let generation = self.config_store.generation();
+        if self.applied_generation.load(Ordering::Acquire) == generation {
+            return self.state.load_full();
+        }
+        let config = self.config_store.load();
+        let _rebuild = self.rebuild_lock.lock().expect("UDP rebuild lock poisoned");
+        if let Some(udp) = config.layer4.iter().find_map(|l| match l {
+            Layer4Listener::Udp(udp) if udp.listen == self.listen => Some(udp),
+            _ => None,
+        }) {
+            let current = self.state.load();
+            let spec_changed = udp.upstreams != current.configured
+                || udp.lb_policy != current.policy
+                || udp.idle_timeout != current.idle_timeout
+                || udp.max_flows != current.max_flows
+                || udp.max_datagram_size != current.max_datagram_size;
+            if spec_changed {
+                match resolve_udp_upstreams(udp) {
+                    Ok(upstreams) => {
+                        tracing::info!("udp {}: upstream set changed on reload", self.listener);
+                        self.state.store(Arc::new(UdpState {
+                            configured: udp.upstreams.clone(),
+                            upstreams,
+                            policy: udp.lb_policy,
+                            idle_timeout: udp.idle_timeout,
+                            max_flows: udp.max_flows,
+                            max_datagram_size: udp.max_datagram_size,
+                        }));
+                    }
+                    Err(error) => tracing::error!(
+                        "udp {}: reload upstream rebuild failed, keeping previous: {error}",
+                        self.listener
+                    ),
+                }
+            }
+        }
+        // Record the generation only after reconciling it, so a reload racing
+        // with this check is picked up by the next datagram rather than lost.
+        self.applied_generation.store(generation, Ordering::Release);
+        self.state.load_full()
     }
 
     /// Select the upstream address for a new flow, per the policy (source-IP
@@ -515,8 +579,17 @@ impl UdpProxy {
 
     /// Forward one client datagram: look up or create the flow, then send it
     /// to the flow's upstream (the flow's reader handles the response path).
-    async fn handle_datagram(&self, socket: &Arc<UdpSocket>, data: &[u8], client: SocketAddr) {
-        let state = self.current_state();
+    ///
+    /// `state` is the selection state the caller already loaded for this
+    /// datagram, so the config generation is consulted once per packet rather
+    /// than once per phase of handling it.
+    async fn handle_datagram(
+        &self,
+        socket: &Arc<UdpSocket>,
+        data: &[u8],
+        client: SocketAddr,
+        state: &UdpState,
+    ) {
         self.metrics.client_datagrams.inc();
         // Fast path: an existing flow forwards directly.
         let upstream_to_send = {
@@ -537,7 +610,7 @@ impl UdpProxy {
 
         // New flow: select an upstream and bind a connected socket (async, so
         // outside the table lock), then insert under the capacity bound.
-        let Some(upstream_addr) = self.select(&state, client) else {
+        let Some(upstream_addr) = self.select(state, client) else {
             self.metrics.no_upstream_drops.inc();
             return;
         };
@@ -712,6 +785,63 @@ impl UdpProxy {
     }
 }
 
+/// Bind one UDP listener socket for an L4 listener address.
+///
+/// `reuse_port` sets `SO_REUSEPORT`, which is what lets several sockets share
+/// the address so each receive loop has its own — and, critically, its own
+/// kernel receive buffer. The kernel hashes each datagram's 4-tuple to a
+/// socket, so every datagram of one client flow lands on the same loop. It is
+/// only set when more than one loop is requested, so a single-loop listener
+/// keeps the stricter "one bind wins" behaviour and a genuine port conflict is
+/// still an error.
+///
+/// An unspecified IPv6 address is left dual-stack (`IPV6_V6ONLY` off) so one
+/// listener serves both families, matching the TCP listeners. `recv_buffer` /
+/// `send_buffer` of 0 mean "OS default". Returns a blocking `std` socket:
+/// binding happens on the startup thread, before a Tokio runtime exists, so
+/// reactor registration is deferred to [`BackgroundService::start`].
+fn bind_udp_listener(
+    address: SocketAddr,
+    reuse_port: bool,
+    recv_buffer: usize,
+    send_buffer: usize,
+) -> Result<std::net::UdpSocket, String> {
+    let domain = if address.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .map_err(|e| format!("create UDP socket: {e}"))?;
+    if reuse_port {
+        socket
+            .set_reuse_port(true)
+            .map_err(|e| format!("set UDP reuseport: {e}"))?;
+    }
+    if let SocketAddr::V6(v6) = address {
+        if v6.ip().is_unspecified() {
+            socket
+                .set_only_v6(false)
+                .map_err(|e| format!("set UDP dual-stack: {e}"))?;
+        }
+    }
+    // Buffer sizes are applied before bind so the first datagram already sees
+    // the configured capacity.
+    if recv_buffer > 0 {
+        let _ = socket.set_recv_buffer_size(recv_buffer);
+    }
+    if send_buffer > 0 {
+        let _ = socket.set_send_buffer_size(send_buffer);
+    }
+    socket
+        .bind(&socket2::SockAddr::from(address))
+        .map_err(|e| format!("failed to bind udp listener {address}: {e}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to set udp listener {address} non-blocking: {e}"))?;
+    Ok(socket.into())
+}
+
 #[cfg(unix)]
 /// Atomically publish a bounded handoff manifest with private permissions.
 fn write_handoff_file(path: &str, payload: &[u8]) -> Result<(), String> {
@@ -733,7 +863,16 @@ fn write_handoff_file(path: &str, payload: &[u8]) -> Result<(), String> {
 
 #[cfg(unix)]
 /// Receive one complete UDP handoff transaction from the old process.
-fn receive_udp_handoff(upgrade_sock: &str, handoff_id: &str) -> Result<UdpHandoffState, String> {
+///
+/// `expected_listeners` is this process's receive-loop count. The transfer
+/// fails closed when the outgoing process ran a different count, because
+/// silently starting with fewer listener sockets than the port needs would
+/// leave part of the `SO_REUSEPORT` group unserved.
+fn receive_udp_handoff(
+    upgrade_sock: &str,
+    handoff_id: &str,
+    expected_listeners: usize,
+) -> Result<UdpHandoffState, String> {
     let manifest_path = format!("{upgrade_sock}.udp.{handoff_id}.manifest");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let manifest = loop {
@@ -773,16 +912,46 @@ fn receive_udp_handoff(upgrade_sock: &str, handoff_id: &str) -> Result<UdpHandof
             manifest.flows.len()
         ));
     }
+    // A manifest without the field came from a process that transferred a
+    // single descriptor named `listener`.
+    let sent_listeners = if manifest.listeners == 0 {
+        1
+    } else {
+        manifest.listeners
+    };
+    if sent_listeners != expected_listeners {
+        return Err(format!(
+            "UDP handoff carries {sent_listeners} listener descriptors but this process runs \
+             {expected_listeners} receive loops; restart instead of upgrading when the \
+             worker-thread count changes"
+        ));
+    }
     let mut sockets: Vec<Option<Arc<UdpSocket>>> =
         (0..manifest.flows.len()).map(|_| None).collect();
-    let mut listener_fd = None;
+    let mut listener_fds: Vec<std::os::fd::RawFd> = Vec::with_capacity(expected_listeners);
     for chunk in 0..manifest.chunks {
         let path = format!("{upgrade_sock}.udp.{handoff_id}.part.{chunk}");
         let mut fds = Fds::new();
         fds.get_from_sock(path.as_str())
             .map_err(|e| format!("receive UDP handoff chunk {chunk}: {e}"))?;
         if chunk == 0 {
-            listener_fd = fds.get("listener").copied();
+            if manifest.listeners == 0 {
+                let fd = fds
+                    .get("listener")
+                    .copied()
+                    .ok_or("UDP handoff is missing the listener fd")?;
+                listener_fds.push(fd);
+            } else {
+                for index in 0..expected_listeners {
+                    let fd = fds
+                        .get(&format!("listener-{index}"))
+                        .copied()
+                        .ok_or_else(|| {
+                            format!("UDP handoff is missing listener descriptor {index}")
+                        })?;
+                    listener_fds.push(fd);
+                }
+            }
         }
         let start = chunk * HANDOFF_FLOWS_PER_CHUNK;
         let end = (start + HANDOFF_FLOWS_PER_CHUNK).min(manifest.flows.len());
@@ -811,13 +980,24 @@ fn receive_udp_handoff(upgrade_sock: &str, handoff_id: &str) -> Result<UdpHandof
             *slot = Some(Arc::new(socket));
         }
     }
-    let listener_fd = listener_fd.ok_or("UDP handoff is missing the listener fd")?;
-    // SAFETY: the listener fd was transferred through SCM_RIGHTS and is now
-    // owned by this process.
-    let listener = unsafe { std::net::UdpSocket::from_raw_fd(listener_fd) };
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("set inherited UDP listener nonblocking: {e}"))?;
+    if listener_fds.len() != expected_listeners {
+        return Err(format!(
+            "UDP handoff delivered {} of {expected_listeners} listener descriptors",
+            listener_fds.len()
+        ));
+    }
+    let listeners = listener_fds
+        .into_iter()
+        .map(|fd| {
+            // SAFETY: the listener fd was transferred through SCM_RIGHTS and is
+            // now owned by this process.
+            let listener = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("set inherited UDP listener nonblocking: {e}"))?;
+            Ok(listener)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let flows = manifest
         .flows
         .into_iter()
@@ -830,7 +1010,7 @@ fn receive_udp_handoff(upgrade_sock: &str, handoff_id: &str) -> Result<UdpHandof
         })
         .collect::<Result<Vec<_>, String>>()?;
     let _ = std::fs::remove_file(&manifest_path);
-    Ok((listener, flows))
+    Ok((listeners, flows))
 }
 
 /// A deterministic (FNV-1a) hash of bytes for source-IP stickiness.
@@ -904,9 +1084,9 @@ impl BackgroundService for UdpProxy {
         let inherited = None;
 
         #[cfg(unix)]
-        if let Some((listener, flows)) = inherited {
-            *self.std_socket.lock().expect("UDP socket lock poisoned") = Some(listener);
-            let mut guard = self.flows.lock().expect("UDP flows lock poisoned");
+        if let Some((listeners, flows)) = inherited {
+            *self.std_sockets.lock().expect("UDP socket lock poisoned") = listeners;
+            let mut guard = self.app.flows.lock().expect("UDP flows lock poisoned");
             for (flow, upstream) in flows {
                 guard.insert(
                     flow.client,
@@ -919,16 +1099,27 @@ impl BackgroundService for UdpProxy {
             }
         }
 
-        // Convert the bound std socket to tokio here, where a runtime exists.
-        let std_socket = self
-            .std_socket
+        // Convert the bound std sockets to tokio here, where a runtime exists.
+        // They are cloned rather than consumed so the handoff can still send
+        // the original descriptors during an upgrade.
+        let std_sockets: Vec<std::net::UdpSocket> = self
+            .std_sockets
             .lock()
             .expect("UDP socket lock poisoned")
-            .as_ref()
-            .and_then(|socket| socket.try_clone().ok());
-        let socket = match std_socket {
-            Some(s) => match UdpSocket::from_std(s) {
-                Ok(s) => Arc::new(s),
+            .iter()
+            .filter_map(|socket| socket.try_clone().ok())
+            .collect();
+        if std_sockets.is_empty() {
+            tracing::error!("udp {}: listener sockets are unavailable", self.listener);
+            if self.upgrade {
+                std::process::exit(1);
+            }
+            return;
+        }
+        let mut sockets = Vec::with_capacity(std_sockets.len());
+        for std_socket in std_sockets {
+            match UdpSocket::from_std(std_socket) {
+                Ok(socket) => sockets.push(Arc::new(socket)),
                 Err(e) => {
                     tracing::error!("udp {}: failed to wrap listener socket: {e}", self.listener);
                     if self.upgrade {
@@ -936,36 +1127,26 @@ impl BackgroundService for UdpProxy {
                     }
                     return;
                 }
-            },
-            None => {
-                tracing::error!("udp {}: listener socket is unavailable", self.listener);
-                if self.upgrade {
-                    std::process::exit(1);
-                }
-                return;
             }
-        };
-        let inherited_clients: Vec<SocketAddr> = self
+        }
+
+        // Restart reader tasks for flows inherited from the old process. Any
+        // listener socket can carry the reply — they share the bound address,
+        // and `SO_REUSEPORT` only decides which socket *receives* — so the
+        // first one is used.
+        let inherited_flows: Vec<(SocketAddr, Arc<UdpSocket>)> = self
+            .app
             .flows
             .lock()
             .expect("UDP flows lock poisoned")
-            .keys()
-            .copied()
+            .iter()
+            .map(|(client, flow)| (*client, flow.upstream.clone()))
             .collect();
-        for client in inherited_clients {
-            let upstream = self
-                .flows
-                .lock()
-                .expect("UDP flows lock poisoned")
-                .get(&client)
-                .map(|flow| flow.upstream.clone());
-            if let Some(upstream) = upstream {
-                self.spawn_flow_reader(
-                    socket.clone(),
-                    client,
-                    upstream,
-                    self.current_state().idle_timeout,
-                );
+        if !inherited_flows.is_empty() {
+            let idle_timeout = self.app.current_state().idle_timeout;
+            for (client, upstream) in inherited_flows {
+                self.app
+                    .spawn_flow_reader(sockets[0].clone(), client, upstream, idle_timeout);
             }
         }
 
@@ -987,55 +1168,111 @@ impl BackgroundService for UdpProxy {
                 }
             });
         }
-        let mut max = self.current_state().max_datagram_size;
-        // Buffer one byte larger than the cap so an oversized datagram is
-        // detectable (a full read means it was truncated / too big).
-        let mut buf = vec![0u8; max.saturating_add(1)];
-        loop {
-            // The listener topology is fixed, but UDP limits are reloadable.
-            // Resize before the next receive so a larger post-reload limit is
-            // effective instead of remaining stuck at the startup buffer size.
-            let current_max = self.current_state().max_datagram_size;
-            if current_max != max {
-                max = current_max;
-                buf.resize(max.saturating_add(1), 0);
+
+        // One receive loop per `SO_REUSEPORT` socket. `stop` ends them all at
+        // once, so shutdown and the upgrade handoff stay single-signal.
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let mut workers = Vec::with_capacity(sockets.len());
+        for socket in sockets {
+            let app = self.app.clone();
+            let stop = stop.clone();
+            workers.push(tokio::spawn(
+                async move { recv_loop(socket, app, stop).await },
+            ));
+        }
+
+        // Wait for whichever ends the listener: shutdown, or the upgrade
+        // handoff. The receive loops keep draining until `stop` is notified.
+        tokio::select! {
+            signal = handoff_rx.recv() => {
+                if signal.is_some() {
+                    // Stop the flow readers before transferring their
+                    // descriptors so the replacement owns them exclusively.
+                    self.app.stop.store(true, Ordering::Relaxed);
+                    #[cfg(unix)]
+                    if let Err(error) = self.send_handoff().await {
+                        tracing::error!(
+                            "udp {}: failed to send upgrade handoff: {error}",
+                            self.listener
+                        );
+                    }
+                }
             }
-            tokio::select! {
-                signal = shutdown.changed() => {
-                    if signal.is_err() || *shutdown.borrow() {
+            _ = async {
+                loop {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    if shutdown.changed().await.is_err() {
                         break;
                     }
                 }
-                signal = handoff_rx.recv() => {
-                    if signal.is_some() {
-                        self.stop.store(true, Ordering::Relaxed);
-                        #[cfg(unix)]
-                        if let Err(error) = self.send_handoff().await {
-                            tracing::error!("udp {}: failed to send upgrade handoff: {error}", self.listener);
-                        }
-                        break;
-                    }
-                }
-                r = socket.recv_from(&mut buf) => {
-                    let (n, client) = match r {
-                        Ok(x) => x,
-                        Err(_) => {
-                            self.metrics.socket_errors.inc();
-                            continue;
-                        }
-                    };
-                    if n > max {
-                        self.metrics.oversized_drops.inc();
-                        continue;
-                    }
-                    self.handle_datagram(&socket, &buf[..n], client).await;
-                }
-            }
+            } => {}
+        }
+
+        stop.notify_waiters();
+        for worker in workers {
+            let _ = worker.await;
         }
         // Shutdown: stop flow readers, then close all flows.
-        self.stop.store(true, Ordering::Relaxed);
-        self.flows.lock().expect("UDP flows lock poisoned").clear();
+        self.app.stop.store(true, Ordering::Relaxed);
+        self.app
+            .flows
+            .lock()
+            .expect("UDP flows lock poisoned")
+            .clear();
         tracing::info!("udp {}: stopped", self.listener);
+    }
+}
+
+/// Drain one listener socket until `stop` is notified.
+///
+/// Each `SO_REUSEPORT` socket gets one of these. The kernel hashes a datagram's
+/// 4-tuple to pick the receiving socket, so every datagram of one client flow
+/// lands on the same loop, and both the kernel receive buffer and the drain
+/// rate scale with the worker-thread count rather than with one socket.
+///
+/// That scaling is the point: creating a flow means creating and connecting an
+/// upstream socket, and datagrams that arrive on this socket while that work is
+/// in progress are dropped by the kernel — counted as `UdpRcvbufErrors`, not by
+/// any Raddex metric, because the process never sees them.
+async fn recv_loop(socket: Arc<UdpSocket>, app: Arc<UdpApp>, stop: Arc<tokio::sync::Notify>) {
+    // Register the stop notification once. Building a `Notified` inside the
+    // select would take the notify list's lock on every datagram, and every
+    // receive loop shares this `Notify`.
+    let stopped = stop.notified();
+    tokio::pin!(stopped);
+    let mut max = app.current_state().max_datagram_size;
+    // Buffer one byte larger than the cap so an oversized datagram is
+    // detectable (a full read means it was truncated / too big).
+    let mut buf = vec![0u8; max.saturating_add(1)];
+    loop {
+        // The listener topology is fixed, but UDP limits are reloadable.
+        // Resize before the next receive so a larger post-reload limit takes
+        // effect instead of remaining stuck at the startup buffer size.
+        let state = app.current_state();
+        if state.max_datagram_size != max {
+            max = state.max_datagram_size;
+            buf.resize(max.saturating_add(1), 0);
+        }
+        let received = tokio::select! {
+            biased;
+            _ = &mut stopped => break,
+            result = socket.recv_from(&mut buf) => result,
+        };
+        let (n, client) = match received {
+            Ok(pair) => pair,
+            Err(_) => {
+                app.metrics.socket_errors.inc();
+                continue;
+            }
+        };
+        if n > max {
+            app.metrics.oversized_drops.inc();
+            continue;
+        }
+        app.handle_datagram(&socket, &buf[..n], client, &state)
+            .await;
     }
 }
 
@@ -1045,4 +1282,51 @@ fn epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An address the OS has just confirmed is free.
+    fn free_addr() -> SocketAddr {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+        probe.local_addr().expect("probe addr")
+    }
+
+    #[test]
+    fn reuse_port_lets_every_receive_loop_own_a_socket() {
+        // The fix for the udp_flows error rate depends on this: N receive loops
+        // each need their own socket on the same address, because each socket
+        // carries its own kernel receive buffer. One socket's buffer is capped
+        // by net.core.rmem_max and drained by one task, so a burst of new flows
+        // overflows it and the kernel drops the excess (UdpRcvbufErrors).
+        let addr = free_addr();
+        let first = bind_udp_listener(addr, true, 0, 0).expect("first reuseport bind");
+        let second = bind_udp_listener(addr, true, 0, 0).expect("second reuseport bind");
+        assert_eq!(
+            first.local_addr().expect("addr"),
+            second.local_addr().expect("addr")
+        );
+    }
+
+    #[test]
+    fn without_reuse_port_a_second_bind_still_conflicts() {
+        // A single-loop listener must keep the stricter "one bind wins"
+        // behaviour, so a genuine port conflict is still reported as an error
+        // rather than silently sharing the port.
+        let addr = free_addr();
+        let _first = bind_udp_listener(addr, false, 0, 0).expect("first bind");
+        assert!(bind_udp_listener(addr, false, 0, 0).is_err());
+    }
+
+    #[test]
+    fn buffer_sizes_are_applied_when_configured() {
+        // 0 means "OS default"; a non-zero request must at least not fail the
+        // bind. The kernel may clamp the value to net.core.rmem_max, so the
+        // exact size is deliberately not asserted.
+        let addr = free_addr();
+        let socket = bind_udp_listener(addr, false, 65_536, 65_536).expect("bind with buffers");
+        assert_eq!(socket.local_addr().expect("addr"), addr);
+    }
 }

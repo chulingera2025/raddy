@@ -409,6 +409,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                     config_store.clone(),
                     sink,
                     opts.upgrade || opts.test,
+                    opts.threads,
                     opts.upgrade_sock.clone(),
                     udp.listen.display(),
                     Some(server.watch_execution_phase()),
