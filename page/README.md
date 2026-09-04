@@ -1,11 +1,11 @@
-# Raddy documentation site
+# Raddex documentation site
 
-The Raddy docs site, built with [Astro Starlight](https://starlight.astro.build).
+The Raddex docs site, built with [Astro Starlight](https://starlight.astro.build).
 English content lives at the site root; Simplified Chinese is under `/zh-CN/`.
 
 The site deploys to GitHub Pages on every `main` push via
 `.github/workflows/pages.yml` (in the repository root). It is served from the
-`/raddy/` sub-path — `site` and `base` are set in `astro.config.mjs`, and
+`/raddex/` sub-path — `site` and `base` are set in `astro.config.mjs`, and
 internal links in the content are **relative** so they resolve under any base.
 
 ## Project structure
@@ -44,6 +44,6 @@ Run from this directory:
 - Write new or rewritten documentation in English first. Keep the existing
   `zh-cn/` translations aligned when localization work is scheduled.
 - Use **relative** links between pages (never `/config/…` absolute paths) so
-  they keep working under the `/raddy/` base.
-- Raddyfile code blocks use the `caddyfile` language tag — a lightweight grammar
+  they keep working under the `/raddex/` base.
+- Raddexfile code blocks use the `caddyfile` language tag — a lightweight grammar
   is registered in `astro.config.mjs`.

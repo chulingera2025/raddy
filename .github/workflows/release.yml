@@ -40,16 +40,16 @@ jobs:
       - name: Package tarball
         run: |
           mkdir -p dist
-          # The tarball contains the binary named `raddy` (install.sh extracts
+          # The tarball contains the binary named `raddex` (install.sh extracts
           # and installs exactly that); the tarball name carries the target.
-          cp target/release/raddy dist/raddy
+          cp target/release/raddex dist/raddex
           cp LICENSE README.md dist/
-          tar -czf "raddy-${{ matrix.target }}.tar.gz" -C dist .
+          tar -czf "raddex-${{ matrix.target }}.tar.gz" -C dist .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: raddy-${{ matrix.target }}
-          path: raddy-${{ matrix.target }}.tar.gz
+          name: raddex-${{ matrix.target }}
+          path: raddex-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
@@ -80,6 +80,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/raddy-*/raddy-*.tar.gz
+            artifacts/raddex-*/raddex-*.tar.gz
             artifacts/SHA256SUMS
             install.sh

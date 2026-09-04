@@ -11,15 +11,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Raddyfile parser (minimal M2 subset), strictly per `RADDYFILE_SPEC`.
+//! Raddexfile parser (minimal M2 subset), strictly per `RADDEXFILE_SPEC`.
 //!
 //! Line-oriented grammar: one directive per line; a directive that opens a
 //! block ends its line with `{`, and the block closes with `}` on its own
-//! line. Unsupported syntax must be documented in `RADDYFILE_SPEC.md` before
+//! line. Unsupported syntax must be documented in `RADDEXFILE_SPEC.md` before
 //! being implemented here (CONTRIBUTING red line).
 
 use crate::config::ast::*;
 use crate::config::lexer::{lex, Token, TokenKind};
+use crate::server::dns::{self, DnsCredentials};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -36,14 +37,14 @@ const MAX_IMPORT_DEPTH: usize = 32;
 /// config with ~100k nested braces cannot exhaust the stack (SECURITY.md).
 const MAX_BLOCK_DEPTH: usize = 100;
 
-/// Parse a Raddyfile into its source AST.
+/// Parse a Raddexfile into its source AST.
 ///
 /// The input is preprocessed before the grammar parse (spec §5.12): `{$ENV}`
 /// placeholders are expanded from the environment (at the token level, so a
 /// value cannot change the configuration structure), `(name)` snippet
 /// definitions are captured, and `import` statements are spliced in
 /// (recursively).
-pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
+pub fn parse(file: &str, input: &str) -> Result<Raddexfile, ConfigError> {
     let tokens = lex(input).map_err(|message| ConfigError::Parse {
         file: file.to_string(),
         line: 1,
@@ -74,7 +75,7 @@ pub fn parse(file: &str, input: &str) -> Result<Raddyfile, ConfigError> {
         stmt_pos: (1, 1),
         depth: 0,
     }
-    .parse_raddyfile()
+    .parse_raddexfile()
 }
 
 /// Expand `{$ENV}` placeholders at the token level (spec §5.12): every
@@ -534,7 +535,7 @@ impl<'a> Parser<'a> {
         Ok((words, block_open))
     }
 
-    fn parse_raddyfile(&mut self) -> Result<Raddyfile, ConfigError> {
+    fn parse_raddexfile(&mut self) -> Result<Raddexfile, ConfigError> {
         let mut global = GlobalConfig::default();
 
         // Skip leading newlines (comment-only lines lex to newlines) before
@@ -576,10 +577,7 @@ impl<'a> Parser<'a> {
                 if words.is_empty() {
                     continue;
                 }
-                if block_open {
-                    return Err(self.err("unexpected '{' in global block"));
-                }
-                self.apply_global(&mut global, &words)?;
+                self.apply_global(&mut global, &words, block_open)?;
             }
         }
 
@@ -618,7 +616,7 @@ impl<'a> Parser<'a> {
                 _ => sites.extend(self.parse_site(&words, block_open)?),
             }
         }
-        Ok(Raddyfile {
+        Ok(Raddexfile {
             global,
             sites,
             layer4,
@@ -2001,8 +1999,131 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn apply_global(&self, global: &mut GlobalConfig, words: &[String]) -> Result<(), ConfigError> {
+    /// Parse `dns_challenge` in either accepted form (spec §5.3):
+    ///
+    /// ```text
+    /// dns_challenge cloudflare <api_token>     # shorthand, single-credential
+    /// dns_challenge <provider> {               # block, any provider
+    ///     <field> <value>
+    /// }
+    /// ```
+    ///
+    /// The provider keyword is resolved against the DNS-01 registry and the
+    /// credentials are checked against the fields that provider declares, so a
+    /// newly registered provider parses and validates without changing this
+    /// function.
+    fn parse_dns_challenge(
+        &mut self,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<DnsChallenge, ConfigError> {
+        let Some(keyword) = words.get(1) else {
+            return Err(self.err(format!(
+                "dns_challenge requires a provider (expected {})",
+                dns::keywords()
+            )));
+        };
+        let Some(spec) = dns::lookup(keyword) else {
+            return Err(self.err(format!(
+                "invalid dns_challenge provider '{keyword}' (expected {})",
+                dns::keywords()
+            )));
+        };
+        let entries = if block_open {
+            if words.len() != 2 {
+                return Err(self.err(format!(
+                    "dns_challenge {keyword} takes no arguments before '{{'"
+                )));
+            }
+            self.parse_dns_credentials(keyword)?
+        } else {
+            // The shorthand fills exactly one declared field; a provider that
+            // needs several credentials declares no shorthand and must use the
+            // block form.
+            let Some(field) = spec.shorthand_field else {
+                return Err(self.err(format!(
+                    "dns_challenge {keyword} needs several credentials: use the block form \
+                     'dns_challenge {keyword} {{ ... }}'"
+                )));
+            };
+            if words.len() != 3 {
+                return Err(self.err(format!(
+                    "dns_challenge {keyword} takes one argument ({field}), or a block"
+                )));
+            }
+            vec![(field.to_string(), words[2].clone())]
+        };
+        let credentials = DnsCredentials::from_pairs(entries);
+        spec.validate(&credentials).map_err(|m| self.err(m))?;
+        Ok(DnsChallenge {
+            provider: spec,
+            credentials,
+        })
+    }
+
+    /// Read the `<field> <value>` lines of a `dns_challenge` block. Field names
+    /// are not checked here; the provider's spec validates them so the error
+    /// text can list what that provider actually accepts.
+    fn parse_dns_credentials(
+        &mut self,
+        keyword: &str,
+    ) -> Result<Vec<(String, String)>, ConfigError> {
+        let mut entries: Vec<(String, String)> = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Token {
+                    kind: TokenKind::RBrace,
+                    ..
+                }) => {
+                    self.pos += 1;
+                    break;
+                }
+                None => {
+                    return Err(self.err(format!(
+                        "unexpected end of file in dns_challenge {keyword} block"
+                    )));
+                }
+                _ => {}
+            }
+            let (line, nested) = self.parse_statement()?;
+            if line.is_empty() {
+                continue;
+            }
+            if nested {
+                return Err(self.err(format!("unexpected '{{' in dns_challenge {keyword} block")));
+            }
+            if line.len() != 2 {
+                return Err(self.err(format!(
+                    "dns_challenge {keyword} credential '{}' takes exactly one value",
+                    line[0]
+                )));
+            }
+            if entries.iter().any(|(name, _)| name == &line[0]) {
+                return Err(self.err(format!(
+                    "duplicate dns_challenge {keyword} credential '{}'",
+                    line[0]
+                )));
+            }
+            entries.push((line[0].clone(), line[1].clone()));
+        }
+        Ok(entries)
+    }
+
+    /// Apply one global-block directive.
+    ///
+    /// `block_open` reports that the statement was followed by `{`. Only
+    /// `dns_challenge` accepts a block; every other global directive rejects one
+    /// so a stray brace stays an error rather than being silently swallowed.
+    fn apply_global(
+        &mut self,
+        global: &mut GlobalConfig,
+        words: &[String],
+        block_open: bool,
+    ) -> Result<(), ConfigError> {
         let name = words.first().expect("non-empty");
+        if block_open && name != "dns_challenge" {
+            return Err(self.err(format!("unexpected '{{' after {name} in global block")));
+        }
         match name.as_str() {
             "acme_email" => {
                 if words.len() != 2 {
@@ -2039,27 +2160,7 @@ impl<'a> Parser<'a> {
                 global.trusted_proxies = networks;
             }
             "dns_challenge" => {
-                if words.len() != 3 {
-                    return Err(self.err(
-                        "dns_challenge requires a provider and an API token: dns_challenge cloudflare <api_token>",
-                    ));
-                }
-                let provider = match words[1].as_str() {
-                    "cloudflare" => DnsProviderKind::Cloudflare,
-                    other => {
-                        return Err(self.err(format!(
-                            "invalid dns_challenge provider '{other}' (expected {})",
-                            DnsProviderKind::ALL.join(", ")
-                        )));
-                    }
-                };
-                if words[2].is_empty() {
-                    return Err(self.err("dns_challenge requires a non-empty API token"));
-                }
-                global.dns_challenge = Some(DnsChallenge {
-                    provider,
-                    api_token: words[2].clone(),
-                });
+                global.dns_challenge = Some(self.parse_dns_challenge(words, block_open)?);
             }
             "tls_alpn_challenge" => {
                 if words.len() != 1 {
@@ -2351,8 +2452,69 @@ mod tests {
         let input = "{ dns_challenge cloudflare abc123 }\napi.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
         let rf = parse("test", input).unwrap();
         let challenge = rf.global.dns_challenge.expect("dns_challenge parsed");
-        assert_eq!(challenge.provider, DnsProviderKind::Cloudflare);
-        assert_eq!(challenge.api_token, "abc123");
+        assert_eq!(challenge.provider.keyword, "cloudflare");
+        assert_eq!(challenge.credentials.get("api_token"), Some("abc123"));
+    }
+
+    #[test]
+    fn parses_dns_challenge_block_form() {
+        // The block form is the general shape every provider accepts; the
+        // shorthand is sugar for a provider with exactly one credential.
+        let input = "{\n    dns_challenge cloudflare {\n        api_token abc123\n    }\n}\n\
+                     api.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
+        let rf = parse("test", input).unwrap();
+        let challenge = rf.global.dns_challenge.expect("dns_challenge parsed");
+        assert_eq!(challenge.provider.keyword, "cloudflare");
+        assert_eq!(challenge.credentials.get("api_token"), Some("abc123"));
+    }
+
+    #[test]
+    fn dns_challenge_block_rejects_unknown_and_duplicate_credentials() {
+        // Both errors come from the provider's declared field list, so a new
+        // provider gets them without touching the parser.
+        let err = parse(
+            "test",
+            "{\n    dns_challenge cloudflare {\n        api_token t\n        region us-east-1\n    }\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown cloudflare credential 'region'"),
+            "got: {err}"
+        );
+
+        let err = parse(
+            "test",
+            "{\n    dns_challenge cloudflare {\n        api_token a\n        api_token b\n    }\n}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
+
+        let err = parse("test", "{\n    dns_challenge cloudflare {\n    }\n}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires 'api_token'"), "got: {err}");
+    }
+
+    #[test]
+    fn dns_challenge_credentials_are_redacted_in_debug() {
+        // GlobalConfig is `Debug`; a token must not reach a log or panic message.
+        let rf = parse("test", "{ dns_challenge cloudflare super-secret }\n").unwrap();
+        let rendered = format!("{:?}", rf.global.dns_challenge);
+        assert!(!rendered.contains("super-secret"), "got: {rendered}");
+        assert!(rendered.contains("api_token"), "got: {rendered}");
+    }
+
+    #[test]
+    fn global_block_still_rejects_a_brace_after_other_directives() {
+        let err = parse("test", "{\n    acme_email a@b.c {\n    }\n}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unexpected '{' after acme_email"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2369,14 +2531,22 @@ mod tests {
 
     #[test]
     fn rejects_invalid_dns_challenge() {
-        // Unknown provider.
-        let err = parse("test", "{ dns_challenge route53 tok }\n").unwrap_err();
-        assert!(err.to_string().contains("invalid dns_challenge provider"));
-        // Missing token.
-        let err = parse("test", "{ dns_challenge cloudflare }\n").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("requires a provider and an API token"));
+        // Unknown provider: the error lists the registered keywords.
+        let err = parse("test", "{ dns_challenge route53 tok }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid dns_challenge provider"), "got: {err}");
+        assert!(err.contains("cloudflare"), "got: {err}");
+        // Provider given, credential missing.
+        let err = parse("test", "{ dns_challenge cloudflare }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("takes one argument (api_token)"), "got: {err}");
+        // No provider at all.
+        let err = parse("test", "{ dns_challenge }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a provider"), "got: {err}");
     }
 
     #[test]
@@ -2433,12 +2603,12 @@ mod tests {
         // The spec §5.12 example: `reverse_proxy https://{$BACKEND_HOST}:8443`
         // must expand to a single upstream target, not a three-argument parse
         // error (P1).
-        std::env::set_var("RADDY_TEST_EMBEDDED_UPSTREAM", "127.0.0.1");
+        std::env::set_var("RADDEX_TEST_EMBEDDED_UPSTREAM", "127.0.0.1");
         let parsed = parse(
             "test",
-            ":8080 {\n    reverse_proxy https://{$RADDY_TEST_EMBEDDED_UPSTREAM}:8443\n}\n",
+            ":8080 {\n    reverse_proxy https://{$RADDEX_TEST_EMBEDDED_UPSTREAM}:8443\n}\n",
         );
-        std::env::remove_var("RADDY_TEST_EMBEDDED_UPSTREAM");
+        std::env::remove_var("RADDEX_TEST_EMBEDDED_UPSTREAM");
         let rf = parsed.unwrap();
         match &rf.sites[0].directives[0] {
             Directive::ReverseProxy { to, .. } => {
@@ -2455,14 +2625,14 @@ mod tests {
     fn adjacent_env_placeholders_merge_into_one_word() {
         // Two adjacent `{$A}{$B}` placeholders (plus a trailing fragment) are
         // one logical argument; each placeholder expands.
-        std::env::set_var("RADDY_TEST_A", "a");
-        std::env::set_var("RADDY_TEST_B", "b");
+        std::env::set_var("RADDEX_TEST_A", "a");
+        std::env::set_var("RADDEX_TEST_B", "b");
         let parsed = parse(
             "test",
-            ":8080 {\n    redir https://{$RADDY_TEST_A}{$RADDY_TEST_B}.example.com\n}\n",
+            ":8080 {\n    redir https://{$RADDEX_TEST_A}{$RADDEX_TEST_B}.example.com\n}\n",
         );
-        std::env::remove_var("RADDY_TEST_A");
-        std::env::remove_var("RADDY_TEST_B");
+        std::env::remove_var("RADDEX_TEST_A");
+        std::env::remove_var("RADDEX_TEST_B");
         let rf = parsed.unwrap();
         match &rf.sites[0].directives[0] {
             Directive::Redir { to, code } => {
@@ -3134,7 +3304,7 @@ mod tests {
         }
     }
 
-    /// A charset mixing Raddyfile tokens, whitespace, braces, comments, and
+    /// A charset mixing Raddexfile tokens, whitespace, braces, comments, and
     /// multi-byte UTF-8 (non-ASCII hosts/values must not panic the lexer).
     const FUZZ_CHARS: &[char] = &[
         'a', 'b', 'z', '0', '9', ':', '/', '.', '{', '}', '#', '\n', ' ', '\t', '@', '-', '_', '*',
@@ -3351,7 +3521,7 @@ mod tests {
     fn snippet_import_is_spliced() {
         // A `(name)` definition is captured and `import name` splices it
         // (spec §5.12), including inside a site block.
-        let input = "(base) {\n    header_up X-Raddy yes\n}\n:8080 {\n    import base\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let input = "(base) {\n    header_up X-Raddex yes\n}\n:8080 {\n    import base\n    reverse_proxy 127.0.0.1:9000\n}\n";
         let rf = parse("test", input).unwrap();
         assert_eq!(rf.sites.len(), 1);
         let directives = &rf.sites[0].directives;
@@ -3363,7 +3533,7 @@ mod tests {
     #[test]
     fn file_import_is_spliced() {
         let dir = std::env::temp_dir();
-        let imported = dir.join(format!("raddy_import_{}.Raddyfile", std::process::id()));
+        let imported = dir.join(format!("raddex_import_{}.Raddexfile", std::process::id()));
         std::fs::write(&imported, "reverse_proxy 127.0.0.1:9000\n").unwrap();
         let input = format!(":8080 {{\n    import {}\n}}\n", imported.display());
         let rf = parse("test", &input).unwrap();
@@ -3379,7 +3549,7 @@ mod tests {
     fn missing_import_file_is_an_error() {
         let err = parse(
             "test",
-            ":8080 {\n    import /nonexistent/raddy_import_file\n}\n",
+            ":8080 {\n    import /nonexistent/raddex_import_file\n}\n",
         )
         .unwrap_err();
         assert!(err.to_string().contains("failed to read imported file"));
@@ -3387,7 +3557,7 @@ mod tests {
 
     #[test]
     fn parses_global_access_log_directive() {
-        let input = "{\n    access_log /tmp/raddy.log format=common\n}\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n";
+        let input = "{\n    access_log /tmp/raddex.log format=common\n}\n:8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n";
         let rf = parse("test", input).unwrap();
         assert!(matches!(
             rf.global.access_log,
@@ -3445,8 +3615,8 @@ mod tests {
     #[test]
     fn import_cycle_is_detected_via_canonical_path() {
         let dir = std::env::temp_dir();
-        let a = dir.join(format!("raddy_cycle_a_{}.Raddyfile", std::process::id()));
-        let b = dir.join(format!("raddy_cycle_b_{}.Raddyfile", std::process::id()));
+        let a = dir.join(format!("raddex_cycle_a_{}.Raddexfile", std::process::id()));
+        let b = dir.join(format!("raddex_cycle_b_{}.Raddexfile", std::process::id()));
         let a_name = a.file_name().unwrap().to_str().unwrap().to_string();
         let b_name = b.file_name().unwrap().to_str().unwrap().to_string();
         // Textually different `./` prefixes still canonicalize to the same file,

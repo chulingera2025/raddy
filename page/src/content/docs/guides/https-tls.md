@@ -3,10 +3,10 @@ title: HTTPS and TLS
 description: Choose automatic HTTPS, static certificates, mTLS, upstream TLS, or explicit HTTP/2 behavior.
 ---
 
-Raddy has two separate TLS decisions:
+Raddex has two separate TLS decisions:
 
-1. **Downstream TLS** protects the connection from the client to Raddy.
-2. **Upstream TLS** protects the connection from Raddy to the backend.
+1. **Downstream TLS** protects the connection from the client to Raddex.
+2. **Upstream TLS** protects the connection from Raddex to the backend.
 
 Configure them independently. A TLS client connection does not imply that the
 backend connection also uses TLS.
@@ -34,7 +34,7 @@ example.com {
 ```
 
 A named site without a port uses port 443 and obtains a certificate through
-ACME. Raddy stores certificates and account credentials under `raddy_certs/`
+ACME. Raddex stores certificates and account credentials under `raddex_certs/`
 by default; use `--cert-dir` to persist them elsewhere.
 
 The challenge methods are mutually exclusive at the instance level:
@@ -55,7 +55,7 @@ also want to redirect normal HTTP traffic:
 }
 ```
 
-For wildcard certificates, use DNS-01. Raddy's v0.3.5 implementation includes
+For wildcard certificates, use DNS-01. Raddex's v0.3.6 implementation includes
 Cloudflare only; other DNS providers are outside this release.
 
 ## Local or private TLS
@@ -75,12 +75,12 @@ Static certificates use the same shape:
 
 ```caddyfile
 intranet.example.com {
-    tls /etc/raddy/certs/intranet.pem /etc/raddy/certs/intranet.key
+    tls /etc/raddex/certs/intranet.pem /etc/raddex/certs/intranet.key
     reverse_proxy 127.0.0.1:9000
 }
 ```
 
-Raddy does not renew a static certificate. The external certificate owner must
+Raddex does not renew a static certificate. The external certificate owner must
 replace the files and trigger the appropriate reload or restart procedure.
 
 ## TLS options and mTLS
@@ -92,7 +92,7 @@ secure.example.com {
     tls min_version 1.2
     tls max_version 1.3
     tls ciphers ECDHE-ECDSA-AES128-GCM-SHA256
-    tls client_auth require /etc/raddy/certs/clients-ca.pem
+    tls client_auth require /etc/raddex/certs/clients-ca.pem
     reverse_proxy 127.0.0.1:9000
 }
 ```
@@ -122,8 +122,8 @@ api.example.com {
     reverse_proxy {
         to https://10.0.0.11:8443 https://10.0.0.12:8443
         tls_servername api.internal
-        tls_ca /etc/raddy/root-ca.pem
-        tls_cert /etc/raddy/client.pem /etc/raddy/client.key
+        tls_ca /etc/raddex/root-ca.pem
+        tls_cert /etc/raddex/client.pem /etc/raddex/client.key
     }
 }
 ```
@@ -159,7 +159,7 @@ Enable the method globally:
 }
 ```
 
-Raddy serves a temporary RFC 8737 certificate with the `acme-tls/1` ALPN
+Raddex serves a temporary RFC 8737 certificate with the `acme-tls/1` ALPN
 protocol on TCP 443 during the challenge. It cannot be combined with
 `dns_challenge`, and it does not turn an arbitrary TLS listener into an ACME
 challenge endpoint.

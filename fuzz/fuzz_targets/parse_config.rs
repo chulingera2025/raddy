@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fuzz target for the Raddyfile parser: the parser must never panic, only
+//! Fuzz target for the Raddexfile parser: the parser must never panic, only
 //! return `Ok` or `Err`.
 //!
 //! Run with (requires the nightly toolchain + `cargo-fuzz`):
@@ -31,5 +31,5 @@ fuzz_target!(|data: &[u8]| {
     // The parser takes `&str`; lossy conversion lets arbitrary bytes (even
     // invalid UTF-8) still exercise every lexer/parser path.
     let input = String::from_utf8_lossy(data);
-    let _ = raddy::config::parser::parse("fuzz", &input);
+    let _ = raddex::config::parser::parse("fuzz", &input);
 });

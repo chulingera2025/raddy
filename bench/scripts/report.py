@@ -15,9 +15,9 @@ from typing import Any
 import matplotlib.pyplot as plt
 
 
-TARGETS = ("nginx", "caddy", "raddy")
-TARGET_LABELS = {"nginx": "Nginx", "caddy": "Caddy", "raddy": "Raddy"}
-TARGET_COLORS = {"nginx": "#5b6573", "caddy": "#2f80ed", "raddy": "#e45756"}
+TARGETS = ("nginx", "caddy", "raddex")
+TARGET_LABELS = {"nginx": "Nginx", "caddy": "Caddy", "raddex": "Raddex"}
+TARGET_COLORS = {"nginx": "#5b6573", "caddy": "#2f80ed", "raddex": "#e45756"}
 CHARTS = {
     "throughput_pct": {
         "filename": "throughput",
@@ -249,14 +249,14 @@ def write_markdown(summary: dict[str, Any], output: Path) -> None:
         chart_lines.append(f"![{chart['title']}](charts/{chart['filename']}.svg)")
     content = "\n".join(
         [
-            "# Raddy benchmark report",
+            "# Raddex benchmark report",
             "",
-            "This report compares Nginx, Caddy, and Raddy within each scenario.",
+            "This report compares Nginx, Caddy, and Raddex within each scenario.",
             "Nginx is the baseline: `100%` means `1.00x`. Percentages are not",
             "combined into a single score.",
             "",
             f"- Profile: `{manifest['profile']}`",
-            f"- Raddy commit: `{manifest['raddy_commit']}`",
+            f"- Raddex commit: `{manifest['raddex_commit']}`",
             f"- Run ID: `{manifest['run_id']}`",
             "",
             "## Relative charts",
@@ -308,7 +308,7 @@ def write_html(summary: dict[str, Any], output: Path) -> None:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Raddy benchmark report</title>
+  <title>Raddex benchmark report</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; line-height: 1.5; }}
     figure {{ margin: 2rem 0; }}
@@ -318,11 +318,11 @@ def write_html(summary: dict[str, Any], output: Path) -> None:
   </style>
 </head>
 <body>
-  <h1>Raddy benchmark report</h1>
+  <h1>Raddex benchmark report</h1>
   <p>Nginx is the baseline: <code>100%</code> means <code>1.00x</code>.</p>
   <ul>
     <li>Profile: <code>{html.escape(str(manifest['profile']))}</code></li>
-    <li>Raddy commit: <code>{html.escape(str(manifest['raddy_commit']))}</code></li>
+    <li>Raddex commit: <code>{html.escape(str(manifest['raddex_commit']))}</code></li>
     <li>Run ID: <code>{html.escape(str(manifest['run_id']))}</code></li>
   </ul>
   {images}

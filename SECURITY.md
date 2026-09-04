@@ -8,12 +8,12 @@ so it can be fixed and released before it is disclosed.
 1. **Preferred:** use GitHub's [private vulnerability reporting][gh-pvr] on this
    repository (Security → "Report a vulnerability").
 2. If that is not available, email the maintainer directly (see the repository
-   owner's profile) with the subject prefix `[raddy-security]`.
+   owner's profile) with the subject prefix `[raddex-security]`.
 
 Please include, when possible:
 
 - The affected version / commit
-- A minimal reproduction (Raddyfile + request)
+- A minimal reproduction (Raddexfile + request)
 - Impact assessment and any suggested fix
 
 ## Handling
@@ -26,11 +26,11 @@ vulnerability is disclosed publicly.
 
 The security-relevant surface of this project includes, but is not limited to:
 
-- The config parser (hand-written; fuzz-verified) — untrusted Raddyfiles must
+- The config parser (hand-written; fuzz-verified) — untrusted Raddexfiles must
   never panic the process
 - TLS / ACME (on-demand certificate issuance, the `ask` authorization callback)
 - `trusted_proxies` / client-IP trust model (when shipped)
 - Path handling in `file_server` (directory traversal)
-- The `raddy upgrade` zero-downtime mechanism (listener fd handoff)
+- The `raddex upgrade` zero-downtime mechanism (listener fd handoff)
 
 [gh-pvr]: https://docs.github.com/en/code-security/security-advisories/working-with-repository-security-advisories/creating-a-repository-security-advisory

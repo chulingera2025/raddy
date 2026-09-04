@@ -13,7 +13,7 @@
 
 //! Pure-data AST and compiled types for the config plane.
 //!
-//! A [`Raddyfile`] is parsed from source into the AST below, then validated,
+//! A [`Raddexfile`] is parsed from source into the AST below, then validated,
 //! resolved, and compiled into [`CompiledConfig`] — the pure data that becomes
 //! the runtime [`crate::config::snapshot::ConfigSnapshot`]. Per ADR-012 the
 //! compiled form separates *terminal* directives (which directive serves a
@@ -21,6 +21,7 @@
 //! applied to whichever terminal serves), so the request plane never interprets
 //! the file line by line.
 
+use crate::server::dns::{DnsCredentials, DnsProviderSpec};
 use pingora::tls::x509::X509;
 use pingora::utils::tls::CertKey;
 use std::collections::BTreeSet;
@@ -237,9 +238,9 @@ impl ValueTemplate {
 // Source AST
 // ---------------------------------------------------------------------------
 
-/// The parsed Raddyfile: a global block plus site blocks.
+/// The parsed Raddexfile: a global block plus site blocks.
 #[derive(Debug, Clone)]
-pub struct Raddyfile {
+pub struct Raddexfile {
     pub global: GlobalConfig,
     pub sites: Vec<Site>,
     /// Top-level layer-4 listener blocks (`tcp`/`udp`), peers of HTTP sites.
@@ -286,28 +287,19 @@ pub enum AccessLogDirective {
 }
 
 /// DNS-01 challenge configuration (spec §5.3).
+///
+/// The provider is resolved against [`dns::REGISTRY`](crate::server::dns::REGISTRY)
+/// at parse time, and its credentials are validated against the fields that
+/// provider declares. Nothing here is provider-specific, so a new provider needs
+/// no change to the configuration types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsChallenge {
-    /// The DNS provider kind used to publish the challenge TXT record. The
-    /// runtime client is built from this via `server::dns::build`.
-    pub provider: DnsProviderKind,
-    /// The provider's API token (a secret; e.g. a Cloudflare token with
-    /// `Zone: DNS: Edit` permission).
-    pub api_token: String,
-}
-
-/// The configured DNS-01 provider kinds (spec §5.3). Each kind is backed by a
-/// runtime [`DnsProvider`](crate::server::dns::DnsProvider) implementation;
-/// adding one here plus a `server::dns::build` arm is the whole surface for a
-/// new provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DnsProviderKind {
-    Cloudflare,
-}
-
-impl DnsProviderKind {
-    /// The accepted keyword spellings, for error messages.
-    pub const ALL: [&'static str; 1] = ["cloudflare"];
+    /// The registry entry for the configured provider. Carries the credential
+    /// schema and the constructor for the runtime client.
+    pub provider: &'static DnsProviderSpec,
+    /// The credential values parsed from the directive. Values are secrets and
+    /// are redacted from `Debug`.
+    pub credentials: DnsCredentials,
 }
 
 /// Global log level.

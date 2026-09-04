@@ -1,105 +1,70 @@
 ---
-title: Raddy
-description: 基于 Cloudflare Pingora 构建的极简高性能反向代理网关。
+title: Raddex
+description: 基于 Rust 的可预测反向代理网关，HTTP 核心构建于 Cloudflare Pingora，四层核心基于原生 Tokio。
 template: splash
 hero:
-  tagline: 基于 Rust 的极简高性能反向代理网关
+  tagline: 基于 Rust 的小型、可预测反向代理网关
   actions:
     - text: 快速开始
       link: quickstart/
       variant: primary
-    - text: 安装 raddy
+    - text: 安装 Raddex
       link: install/
 ---
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-Raddy 是基于 [Cloudflare Pingora](https://github.com/cloudflare/pingora) 构建的
-反向代理网关(Rust)——Pingora 正是为 Cloudflare 边缘网络提供动力的代理框架。
-你只需写一份 **Raddyfile**(Caddyfile 风格的配置),raddy 便负责路由、自动
-HTTPS、静态文件、压缩、限流与访问日志,并享有 Pingora 的性能与内存安全。
+Raddex 是用 Rust 编写的反向代理网关。它通过一份可读的配置文件统一承载
+HTTP/HTTPS 路由、自动 TLS、静态文件、上游负载均衡，以及经过严格边界约束的
+TCP/UDP 四层代理服务。
 
-结果是一个单一的小型二进制,做反向代理该做的事——配置可读、行为可预测。
+## 为什么选择 Raddex？
 
-## 为什么选 Raddy
+- **配置行为可预测。** 站点块内的指令严格按书写顺序执行，没有隐式的全局排序表。
+- **开箱即用的自动 HTTPS。** 原生支持 ACME HTTP-01、Cloudflare DNS-01 与 TLS-ALPN-01，
+  同时支持静态证书、内部自签证书与 mTLS。TLS-ALPN-01 仅限 443 端口上符合条件的 ACME 站点，且不能与 DNS-01 混用。
+- **运维开销轻量。** 使用 `raddex check` 预检配置，通过 SIGHUP 原子重载路由快照，支持无中断热升级二进制。
+- **清晰的协议与架构边界。** HTTP 核心运行在 Pingora 上，四层（TCP/UDP）运行在独立的原生 Tokio 数据面上；支持 UDP/QUIC 数据报透传，但 QUIC/HTTP-3 终止保持为独立的 sidecar 边界。
 
-- **天生高速。** raddy 构建于 Pingora:多线程事件循环、共享连接池、无垃圾
-  回收。相对裸 Pingora,代理热路径只增加极小开销。
-- **配置可以推理。** 指令**严格按书写顺序**执行。所见即所执行——没有隐藏的
-  指令排序表。每条指令要么是终端("谁服务这个请求"),要么是修饰符
-  ("如何服务"),要么是守卫("谁可以被服务")。
-- **开箱即用的生产级 TLS。** 基于 ACME 的自动 HTTPS(HTTP-01 或 DNS-01)、
-  SNI 证书选择、按站点的 TLS 选项、双向 TLS,以及下游 HTTP/2。
-- **零停机运维。** SIGHUP 重载原子替换路由快照;`raddy upgrade` 将监听套接字
-  移交给新二进制,连接零中断。
-- **默认安全。** 未经声明不信任任何东西:raddy 在配置 `trusted_proxies` 之前
-  忽略 `X-Forwarded-For`;无法读取的凭据会失败关闭(fail closed)。
+## v0.3.6 包含哪些能力？
 
-## 功能亮点
+| 能力 | 发布状态 |
+| --- | --- |
+| HTTP/1.1 与下游 HTTP/2 | 支持 |
+| 上游 HTTP/1.1、`https://`、`h2://` 与 `h2c://` | 支持 |
+| 多域名、IPv6、精确与单标签通配符匹配 | 支持 |
+| 静态文件、流式压缩、认证守卫、单机限流、日志与指标 | 支持 |
+| TCP 代理、SNI 透传、TCP TLS 终止与 UDP 流代理 | 支持 |
+| Linux 透明 TCP 与 UDP flow 升级交接 | 仅限 Linux |
+| QUIC / HTTP/3 终止 | 需要独立 sidecar |
 
-- **路由与匹配** —— 按 `path`、`host`、`method`、`header`、`query`、
-  `remote_ip` 或 `protocol` 路由,支持 `!` 取反与空格分隔的 AND 条件;
-  `handle`、`handle_path`、`rewrite`、`respond`、`error` 让你精确控制每个请求
-  由谁服务。
-- **反向代理** —— 单个或多个上游,轮询 / 随机 / IP 哈希负载均衡,主动健康
-  检查,**到后端的 TLS**(`https://` 上游,含 SNI、自定义 CA 与客户端证书),
-  以及透明的 **WebSocket** 升级转发。
-- **自动 HTTPS** —— 经 HTTP-01 或 DNS-01 签发 ACME 证书并自动续期;另有
-  `tls` 指令支持自签(`internal`)、静态证书、协议版本与密码套件限制,以及
-  **mTLS** 客户端认证。
-- **认证守卫** —— `basic_auth`(bcrypt 哈希)与 `forward_auth`(交给专用认证
-  上游)。
-- **压缩** —— gzip、zstd 与 **Brotli**(`encode br`),按客户端的
-  `Accept-Encoding` 协商。
-- **限流** —— 基于真实客户端 IP 或任意请求头的令牌桶限制。
-- **静态文件** —— `file_server` 支持索引文件、路径穿越防护与压缩。
-- **配置 DX** —— 多文件 `import`、可复用的 `(name)` 片段,以及 `{$ENV}`
-  变量替换。
-- **可观测性** —— Prometheus 指标、JSON 或 Common Log Format 访问日志,可按
-  站点配置。
-
-## 何时使用 raddy
-
-当你想用一个又小又快的、可预测的反向代理时,raddy 很合适:
-
-- 把一个或多个 HTTP/HTTPS 服务放到公网并自动启用 TLS。
-- 在单个进程中同时托管静态内容与代理 API。
-- 用 `raddy check` 校验、用 SIGHUP 重载的配置文件,精确掌控路由、限流与认证。
-
-raddy 是**单实例**的:限流按进程计数,不跨集群共享。如果你需要跨集群协调、
-外部共享服务或插件系统,更大的代理更合适。
+Raddex 目前尚未达到 1.0。「支持」代表该行为已在 v0.3.6 验证套件中通过测试；部署前置条件与边界说明详见 [能力矩阵](architecture/capabilities/)。
 
 <CardGrid>
 	<Card title="可预测的配置" icon="cursor-click">
-		指令严格按书写顺序执行。所见即所执行——没有隐藏的排序表。
+		Raddexfile 指令具备显式的作用域与书写顺序执行语义。
 	</Card>
-	<Card title="自动 HTTPS" icon="lock">
-		原生 ACME —— 默认 HTTP-01,或经
-		[`dns_challenge cloudflare`](config/directives/#dns_challenge) 走 DNS-01 ——
-		SNI 动态证书与 HTTP/2,开箱即用。
+	<Card title="免胶水代码的 TLS" icon="lock">
+		自动 ACME 证书与站点级 TLS 配置与路由同级声明。
 	</Card>
-	<Card title="热重载" icon="refresh">
-		SIGHUP 原子替换路由快照;连接保持不断。
+	<Card title="安全运维" icon="refresh">
+		启动前自动校验、SIGHUP 热重载路由、二进制平滑升级。
 	</Card>
-	<Card title="边缘防护" icon="shield">
-		限流与认证守卫,基于可信代理模型识别真实客户端 IP。
-	</Card>
-	<Card title="可观测性" icon="chart">
-		Prometheus 指标与结构化 JSON 或 Common Log Format 访问日志。
-	</Card>
-	<Card title="零停机升级" icon="rocket">
-		`raddy upgrade` 将监听套接字移交给新二进制,连接零中断。
+	<Card title="HTTP 与四层双核心" icon="rocket">
+		同一进程内统一管理 HTTP 站点与原生 Tokio 驱动的高性能 TCP/UDP 监听器。
 	</Card>
 </CardGrid>
 
-## 下一步
+## 快速导航
 
 <CardGrid>
-	<LinkCard title="快速上手" href="quickstart/" description="五分钟内写出第一个 Raddyfile 并跑通流量。" />
-	<LinkCard title="配置指南" href="config/" description="Raddyfile 背后的心智模型:请求如何流经你的配置。" />
+	<LinkCard title="快速上手" href="quickstart/" description="五分钟内写出第一个 Raddexfile 并跑通流量。" />
+	<LinkCard title="安装部署" href="install/" description="安装已验证的发布版或通过源码编译部署。" />
 	<LinkCard title="HTTPS 与 TLS" href="guides/https-tls/" description="自动 HTTPS、tls 指令、上游 TLS、mTLS 与 HTTP/2。" />
 	<LinkCard title="路由与匹配器" href="guides/routing/" description="按路径、主机、方法、请求头、查询参数、客户端 IP 或协议路由。" />
-	<LinkCard title="指令参考" href="config/directives/" description="每条指令的语法与示例。" />
-	<LinkCard title="CLI 参考" href="cli/" description="所有 `raddy` 子命令与选项。" />
-	<LinkCard title="运维" href="operations/metrics/" description="指标、访问日志与性能基线。" />
+	<LinkCard title="四层代理" href="guides/layer4/" description="代理 TCP 和 UDP，具备明确的资源上限与协议边界。" />
+	<LinkCard title="运维指南" href="operations/metrics/" description="指标、访问日志与性能基线。" />
+	<LinkCard title="指令参考" href="config/directives/" description="每条指令的语法、作用域、默认值与示例。" />
+	<LinkCard title="能力矩阵" href="architecture/capabilities/" description="查看完整支持、仅限 Linux、透传与外部 sidecar 边界。" />
 </CardGrid>
+

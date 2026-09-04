@@ -1,15 +1,15 @@
 ---
 title: Troubleshooting
-description: Diagnose configuration, binding, TLS, upstream, reload, and upgrade failures in Raddy.
+description: Diagnose configuration, binding, TLS, upstream, reload, and upgrade failures in Raddex.
 ---
 
 Start with the process output or service journal, then reproduce the smallest
-configuration that still fails. `raddy check` is the first diagnostic command.
+configuration that still fails. `raddex check` is the first diagnostic command.
 
 ## Configuration fails
 
 ```bash
-raddy check -c Raddyfile
+raddex check -c Raddexfile
 ```
 
 The parser reports a file, line, and column. Common causes include:
@@ -81,7 +81,7 @@ connection preface directly rather than only HTTP/1.1 upgrade syntax.
 Run the same check with the exact configuration and flags used by the service:
 
 ```bash
-raddy check -c /etc/raddy/Raddyfile
+raddex check -c /etc/raddex/Raddexfile
 ```
 
 A listener topology change is intentionally rejected by reload and upgrade.
@@ -109,7 +109,7 @@ does not, the remaining fault is usually in kernel policy or service capability.
 
 ## QUIC and HTTP/3 expectations
 
-Successful UDP forwarding proves only datagram passthrough. Raddy does not
+Successful UDP forwarding proves only datagram passthrough. Raddex does not
 terminate QUIC, parse HTTP/3, route HTTP/3 requests, or manage QUIC connection
-migration. Put a dedicated QUIC/HTTP/3 implementation beside Raddy when those
+migration. Put a dedicated QUIC/HTTP/3 implementation beside Raddex when those
 functions are required.

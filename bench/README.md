@@ -1,7 +1,7 @@
-# Raddy proxy comparison benchmark
+# Raddex proxy comparison benchmark
 
 This directory contains an independent Docker benchmark for Nginx, Caddy, and
-Raddy. It measures only capabilities shared by the three HTTP proxies and
+Raddex. It measures only capabilities shared by the three HTTP proxies and
 normalizes every chart against Nginx.
 
 ## Requirements
@@ -15,16 +15,18 @@ The origin server, oha, report generator, and proxy builds run in containers.
 
 ## Run it
 
-From the repository root:
-
-```bash
-./bench/scripts/run.sh quick
-```
-
-Use the complete matrix when a longer run is appropriate:
+From the repository root, the comparable run — this is the profile the
+published numbers come from:
 
 ```bash
 ./bench/scripts/run.sh full
+```
+
+A 3-second-per-point smoke test, for checking that the harness works. Its
+numbers are **not** comparable and must not be published:
+
+```bash
+./bench/scripts/run.sh quick
 ```
 
 Run the report-script unit tests without starting proxy containers:
@@ -36,15 +38,15 @@ Run the report-script unit tests without starting proxy containers:
 The resource limit can be changed for a controlled local experiment:
 
 ```bash
-BENCH_CPUS=4 BENCH_MEMORY_LIMIT=2g ./bench/scripts/run.sh quick
+BENCH_CPUS=4 BENCH_MEMORY_LIMIT=2g ./bench/scripts/run.sh full
 ```
 
-Each run starts the origin once and starts Nginx, Caddy, and Raddy one at a
+Each run starts the origin once and starts Nginx, Caddy, and Raddex one at a
 time. This prevents the targets from competing with one another. Every target
 uses the same response body, paths, TLS certificate, Docker resource limits,
 load-generator image, warm-up, duration, and repetition count.
-The benchmark defaults Raddy to two Pingora workers to match the Nginx
-configuration; override this explicitly with `RADDY_THREADS=1` or another
+The benchmark defaults Raddex to two Pingora workers to match the Nginx
+configuration; override this explicitly with `RADDEX_THREADS=1` or another
 positive value when investigating worker scaling.
 
 ## Scenarios
@@ -95,7 +97,7 @@ Throughput is normalized as `target / nginx`; latency, CPU per request, and
 memory use the same ratio but are interpreted as lower-is-better. Error rate is
 shown as an absolute percentage. No combined score is produced.
 
-The raw manifest records the Raddy commit, tool versions, scenario profile, and
+The raw manifest records the Raddex commit, tool versions, scenario profile, and
 configuration hashes. It does not attempt to make absolute results from
 different machines directly comparable.
 
@@ -111,3 +113,29 @@ different machines directly comparable.
 The benchmark does not measure ACME, caching, TCP/UDP, QUIC/HTTP3, or
 implementation-specific features that would make a common comparison
 misleading.
+
+## Contribute a run
+
+Every published number comes from one host, and seven of the nine scenarios
+drive a **fixed** request rate — so they measure cost at that rate, not capacity.
+Both limits shrink as more people run the suite on hardware that is not this one.
+
+If you run it, a result is worth contributing. Open an issue titled
+`benchmark: <cpu> / <distro>` and attach:
+
+- `bench/results/<run-id>/summary.json` — the aggregated data, which carries the
+  normalized values, the profile, and the Raddex commit;
+- the host: CPU model and core count, total RAM, kernel version, Docker version,
+  and whether it is bare metal, a VM, or a container host;
+- any non-default `BENCH_CPUS` / `BENCH_MEMORY_LIMIT` / `RADDEX_THREADS`.
+
+A submission is comparable when it used `run.sh full` on an otherwise idle host,
+with the pinned images from `bench/versions.env` unchanged. `quick` runs and
+runs on a busy machine are still interesting for spotting a large discrepancy,
+but say so — they are not directly comparable with the numbers above.
+
+Results that contradict these are the most useful ones to receive.
+
+## License
+
+This benchmark suite and its tools are licensed under the [MIT License](LICENSE).

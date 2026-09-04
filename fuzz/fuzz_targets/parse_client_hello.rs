@@ -27,5 +27,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = raddy::layer4::tls::parse_client_hello_sni(data);
+    let _ = raddex::layer4::tls::parse_client_hello_sni(data);
 });

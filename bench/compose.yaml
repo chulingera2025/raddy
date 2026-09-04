@@ -1,4 +1,4 @@
-name: raddy-bench
+name: raddex-bench
 
 services:
   origin:
@@ -44,10 +44,10 @@ services:
     networks:
       - bench
 
-  raddy:
+  raddex:
     build:
       context: ..
-      dockerfile: bench/raddy/Dockerfile
+      dockerfile: bench/raddex/Dockerfile
       args:
         RUST_IMAGE: ${RUST_IMAGE}
         RUNTIME_IMAGE: ${RUNTIME_IMAGE}
@@ -57,9 +57,9 @@ services:
       origin:
         condition: service_healthy
     volumes:
-      - ./configs/raddy/Raddyfile:/etc/raddy/Raddyfile:ro
-      - ./tls:/etc/raddy/tls:ro
-    command: ["run", "-c", "/etc/raddy/Raddyfile", "--threads", "${RADDY_THREADS:-2}"]
+      - ./configs/raddex/Raddexfile:/etc/raddex/Raddexfile:ro
+      - ./tls:/etc/raddex/tls:ro
+    command: ["run", "-c", "/etc/raddex/Raddexfile", "--threads", "${RADDEX_THREADS:-2}"]
     networks:
       - bench
 

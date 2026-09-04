@@ -8,12 +8,12 @@ import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
 // bilingual content that `docs/404.md` used to provide.
 //
 // Links MUST be absolute site-root paths carrying the `base` prefix
-// (`/raddy/...`) — because the page is served at whatever URL was requested, a
+// (`/raddex/...`) — because the page is served at whatever URL was requested, a
 // relative link would resolve against that missing URL and break. `scripts/check-links.mjs`
 // enforces this.
 const frontmatter = {
 	title: 'Page not found',
-	description: 'The page you are looking for could not be found on the Raddy documentation site.',
+	description: 'The page you are looking for could not be found on the Raddex documentation site.',
 	template: 'splash',
 	editUrl: false,
 	pagefind: false,
@@ -33,26 +33,26 @@ const frontmatter = {
 	<p>You can try:</p>
 	<ul>
 		<li>
-			<a href="/raddy/quickstart/">Quick start</a> — write your first Raddyfile in five
+			<a href="/raddex/quickstart/">Quick start</a> — write your first Raddexfile in five
 			minutes
 		</li>
 		<li>
-			<a href="/raddy/config/">Configuration guide</a> — the mental model behind the Raddyfile
+			<a href="/raddex/config/">Configuration guide</a> — the mental model behind the Raddexfile
 		</li>
 		<li>
-			<a href="/raddy/cli/">CLI reference</a> — every <code>raddy</code> subcommand and option
+			<a href="/raddex/cli/">CLI reference</a> — every <code>raddex</code> subcommand and option
 		</li>
 	</ul>
-	<p><a href="/raddy/">Back to the homepage</a></p>
+	<p><a href="/raddex/">Back to the homepage</a></p>
 	<hr />
 	<p>你尝试打开的页面不存在——它可能已被移动、重命名，或链接已失效。</p>
 	<p>你可以尝试：</p>
 	<ul>
 		<li>
-			<a href="/raddy/zh-cn/quickstart/">快速上手</a> —— 五分钟写出你的第一个 Raddyfile
+			<a href="/raddex/zh-cn/quickstart/">快速上手</a> —— 五分钟写出你的第一个 Raddexfile
 		</li>
-		<li><a href="/raddy/zh-cn/config/">核心概念</a> —— Raddyfile 背后的心智模型</li>
-		<li><a href="/raddy/zh-cn/cli/">CLI 参考</a> —— 所有 <code>raddy</code> 子命令与选项</li>
+		<li><a href="/raddex/zh-cn/config/">核心概念</a> —— Raddexfile 背后的心智模型</li>
+		<li><a href="/raddex/zh-cn/cli/">CLI 参考</a> —— 所有 <code>raddex</code> 子命令与选项</li>
 	</ul>
-	<p><a href="/raddy/zh-cn/">返回首页</a></p>
+	<p><a href="/raddex/zh-cn/">返回首页</a></p>
 </StarlightPage>

@@ -1,10 +1,10 @@
 ---
 title: Deployment and operations
-description: Deploy Raddy with a verified binary, systemd, or Docker and operate reloads, upgrades, certificates, and permissions safely.
+description: Deploy Raddex with a verified binary, systemd, or Docker and operate reloads, upgrades, certificates, and permissions safely.
 ---
 
 This guide covers the operational decisions that matter after the first local
-request works. Start with [Installation](../../install/) if Raddy is not on the
+request works. Start with [Installation](../../install/) if Raddex is not on the
 machine yet.
 
 ## Choose a process model
@@ -15,13 +15,13 @@ machine yet.
 | systemd | Linux hosts with local listeners | Use the provided unit as a starting point |
 | Docker | Containerized HTTP deployments | Mount configuration and certificate storage explicitly |
 
-Raddy does not daemonize itself. Let the service manager own restart policy,
+Raddex does not daemonize itself. Let the service manager own restart policy,
 resource limits, and standard output handling.
 
 ## Validate before every change
 
 ```bash
-raddy check -c /etc/raddy/Raddyfile
+raddex check -c /etc/raddex/Raddexfile
 ```
 
 Keep the command in deployment automation. A successful check proves the file
@@ -30,27 +30,27 @@ upstreams, firewall rules, or external credentials are reachable.
 
 ## systemd
 
-The repository includes [`examples/raddy.service`](https://github.com/chulingera2025/raddy/blob/main/examples/raddy.service).
+The repository includes [`examples/raddex.service`](https://github.com/chulingera2025/raddex/blob/main/examples/raddex.service).
 Install it, then adjust the paths and user model to your host:
 
 ```bash
-sudo install -Dm644 examples/raddy.service /etc/systemd/system/raddy.service
-sudo install -d -m0750 /etc/raddy /var/lib/raddy/certs
-sudo install -m0640 Raddyfile /etc/raddy/Raddyfile
+sudo install -Dm644 examples/raddex.service /etc/systemd/system/raddex.service
+sudo install -d -m0750 /etc/raddex /var/lib/raddex/certs
+sudo install -m0640 Raddexfile /etc/raddex/Raddexfile
 sudo systemctl daemon-reload
-sudo systemctl enable --now raddy
+sudo systemctl enable --now raddex
 ```
 
 Automatic HTTPS normally needs ports 80 and 443. Use root, `CAP_NET_BIND_SERVICE`,
 or a socket/port arrangement that gives the service access to those ports. The
-certificate directory must be writable by the account running Raddy and should
+certificate directory must be writable by the account running Raddex and should
 not be world-readable because it contains the ACME account credentials.
 
 Check the service and recent logs:
 
 ```bash
-sudo systemctl status raddy
-sudo journalctl -u raddy -n 100 --no-pager
+sudo systemctl status raddex
+sudo journalctl -u raddex -n 100 --no-pager
 ```
 
 ## Reload versus upgrade
@@ -58,22 +58,22 @@ sudo journalctl -u raddy -n 100 --no-pager
 Use reload for configuration changes that keep the listener topology stable:
 
 ```bash
-sudo raddy check -c /etc/raddy/Raddyfile
-sudo systemctl reload raddy
+sudo raddex check -c /etc/raddex/Raddexfile
+sudo systemctl reload raddex
 ```
 
 SIGHUP swaps the routing snapshot atomically. Existing HTTP, TCP, and UDP work
 keeps its selected upstream; new work uses the new configuration.
 
-Use `raddy upgrade` when replacing the binary or when a listener handoff is
+Use `raddex upgrade` when replacing the binary or when a listener handoff is
 needed:
 
 ```bash
-sudo raddy upgrade \
-  -c /etc/raddy/Raddyfile \
-  --cert-dir /var/lib/raddy/certs \
-  --pidfile /run/raddy.pid \
-  --upgrade-sock /run/raddy_upgrade.sock
+sudo raddex upgrade \
+  -c /etc/raddex/Raddexfile \
+  --cert-dir /var/lib/raddex/certs \
+  --pidfile /run/raddex.pid \
+  --upgrade-sock /run/raddex_upgrade.sock
 ```
 
 Pass the same deployment flags used by the running instance. The replacement
@@ -98,14 +98,14 @@ started.
 
 ## Docker
 
-Mount the Raddyfile read-only and persist the certificate directory:
+Mount the Raddexfile read-only and persist the certificate directory:
 
 ```bash
 docker run --rm \
   -p 80:80 -p 443:443 \
-  -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
-  -v raddy_certs:/etc/raddy/certs \
-  raddy run -c /etc/raddy/Raddyfile --cert-dir /etc/raddy/certs
+  -v "$PWD/Raddexfile:/etc/raddex/Raddexfile:ro" \
+  -v raddex_certs:/etc/raddex/certs \
+  raddex run -c /etc/raddex/Raddexfile --cert-dir /etc/raddex/certs
 ```
 
 For transparent TCP, a container also needs the host networking and Linux
@@ -117,7 +117,7 @@ verify the kernel routing rules independently.
 Enable metrics on a private address:
 
 ```bash
-raddy run -c /etc/raddy/Raddyfile --metrics-addr 127.0.0.1:9100
+raddex run -c /etc/raddex/Raddexfile --metrics-addr 127.0.0.1:9100
 curl http://127.0.0.1:9100/metrics
 ```
 
@@ -128,7 +128,7 @@ and [Access log](../access-log/) for field and rotation details.
 ## Production checklist
 
 - Pin the release version and verify `SHA256SUMS`.
-- Run `raddy check` before start and reload.
+- Run `raddex check` before start and reload.
 - Persist and protect the ACME certificate directory.
 - Confirm DNS, ports 80/443, upstream reachability, and IPv6 behavior.
 - Bind metrics to a private address and configure log rotation.

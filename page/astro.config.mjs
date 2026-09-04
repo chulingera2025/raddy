@@ -2,7 +2,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
-// Lightweight TextMate grammar for the Raddyfile (Caddyfile-like DSL), so
+// Lightweight TextMate grammar for the Raddexfile (Caddyfile-like DSL), so
 // `caddyfile` code blocks get real syntax highlighting instead of a txt
 // fallback. Covers comments, strings, numbers, directive keywords,
 // `{placeholder}` tokens, and block braces.
@@ -36,10 +36,10 @@ const caddyfileLang = {
 // https://astro.build/config
 export default defineConfig({
 	site: 'https://chulingera2025.github.io',
-	base: '/raddy/',
+	base: '/raddex/',
 	integrations: [
 		starlight({
-			title: 'Raddy',
+			title: 'Raddex',
 			description: 'A minimal high-performance reverse proxy gateway built on Cloudflare Pingora.',
 			// English is the default (root) locale; Simplified Chinese lives
 			// under /zh-CN/. Locale directories:
@@ -51,10 +51,10 @@ export default defineConfig({
 				'zh-cn': { label: '简体中文', lang: 'zh-CN' },
 			},
 			social: [
-				{ icon: 'github', label: 'GitHub', href: 'https://github.com/chulingera2025/raddy' },
+				{ icon: 'github', label: 'GitHub', href: 'https://github.com/chulingera2025/raddex' },
 			],
 			editLink: {
-				baseUrl: 'https://github.com/chulingera2025/raddy/edit/main/page',
+				baseUrl: 'https://github.com/chulingera2025/raddex/edit/main/page',
 			},
 			// The 404 fallback is a fully custom page (`src/pages/404.astro`) so the
 			// injected Starlight 404 route is disabled to avoid the `/404` route
@@ -97,13 +97,14 @@ export default defineConfig({
 				},
 				{
 					label: 'Architecture',
+					translations: { 'zh-CN': '架构' },
 					items: [
-						{ label: 'Capability matrix', slug: 'architecture/capabilities' },
+						{ label: 'Capability matrix', translations: { 'zh-CN': '能力矩阵' }, slug: 'architecture/capabilities' },
 					],
 				},
 				{
-					label: 'Raddyfile',
-					translations: { 'zh-CN': 'Raddyfile' },
+					label: 'Raddexfile',
+					translations: { 'zh-CN': 'Raddexfile' },
 					items: [
 						{ label: 'Concepts', translations: { 'zh-CN': '核心概念' }, slug: 'config' },
 						{ label: 'Directives', translations: { 'zh-CN': '指令参考' }, slug: 'config/directives' },

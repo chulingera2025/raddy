@@ -17,9 +17,10 @@
 //! reads. [`ConfigStore`] holds it behind an `arc-swap` pointer so a reload
 //! swaps the whole snapshot atomically (ADR-011). [`build`] is the single
 //! read → parse → validate → compile pipeline shared by startup, SIGHUP
-//! reload, and `raddy check` (Q7).
+//! reload, and `raddex check` (Q7).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -40,6 +41,13 @@ pub type ConfigSnapshot = CompiledConfig;
 #[derive(Debug)]
 pub struct ConfigStore {
     current: ArcSwap<ConfigSnapshot>,
+    /// Incremented on every [`Self::store`].
+    ///
+    /// Readers that cache work derived from the snapshot compare this instead of
+    /// re-deriving and re-comparing that work per request. Reloads are rare and
+    /// this is the difference between an atomic load and, on the layer-4 accept
+    /// path, cloning and comparing the whole listener spec for every connection.
+    generation: AtomicU64,
 }
 
 impl ConfigStore {
@@ -47,6 +55,7 @@ impl ConfigStore {
     pub fn new(initial: ConfigSnapshot) -> Self {
         Self {
             current: ArcSwap::from(Arc::new(initial)),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -55,13 +64,24 @@ impl ConfigStore {
         self.current.load_full()
     }
 
+    /// The current snapshot's generation. Changes exactly when [`Self::store`]
+    /// installs a new snapshot.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Atomically replace the current snapshot.
+    ///
+    /// The snapshot is published before the generation is bumped, so a reader
+    /// that observes a new generation is guaranteed to load at least that
+    /// snapshot.
     pub fn store(&self, snapshot: ConfigSnapshot) {
         self.current.store(Arc::new(snapshot));
+        self.generation.fetch_add(1, Ordering::Release);
     }
 }
 
-/// Build a config snapshot from a Raddyfile: read, parse, validate, compile —
+/// Build a config snapshot from a Raddexfile: read, parse, validate, compile —
 /// one atomic step (Q6). On any error nothing is produced and nothing changes.
 pub fn build(path: &Path) -> Result<ConfigSnapshot, ConfigError> {
     let file = path.display().to_string();
@@ -69,8 +89,8 @@ pub fn build(path: &Path) -> Result<ConfigSnapshot, ConfigError> {
         file: file.clone(),
         source,
     })?;
-    let raddyfile = parser::parse(&file, &input)?;
-    validate::validate_and_compile(&file, &raddyfile)
+    let raddexfile = parser::parse(&file, &input)?;
+    validate::validate_and_compile(&file, &raddexfile)
 }
 
 #[cfg(test)]
@@ -79,12 +99,12 @@ mod tests {
 
     #[test]
     fn store_swap_is_visible() {
-        let snapshot = build(Path::new("examples/Raddyfile")).unwrap();
+        let snapshot = build(Path::new("examples/Raddexfile")).unwrap();
         let store = ConfigStore::new(snapshot);
         let a = store.load();
         assert_eq!(a.sites.len(), 2);
 
-        let b = build(Path::new("examples/Raddyfile")).unwrap();
+        let b = build(Path::new("examples/Raddexfile")).unwrap();
         store.store(b);
         assert_eq!(store.load().sites.len(), 2);
     }

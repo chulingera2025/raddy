@@ -1,0 +1,9 @@
+[package]
+name = "l4-bench-origin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }

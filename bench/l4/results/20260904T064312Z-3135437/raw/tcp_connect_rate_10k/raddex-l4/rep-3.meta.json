@@ -1,0 +1,1 @@
+{"scenario_id":"tcp_connect_rate_10k","title":"TCP connection rate / 10K connections","kind":"tcp_connect_rate","target":"raddex-l4","transport":"tcp","connections":10000,"payload_bytes":1,"repetition":3,"exit_code":0,"connect_timeout_ms":5000}

@@ -1,26 +1,26 @@
 ---
 title: 快速上手
-description: 写出第一个 Raddyfile 并在约五分钟内跑通流量。
+description: 写出第一个 Raddexfile 并在约五分钟内跑通流量。
 ---
 
-本教程带你从空目录到一个运行中的反向代理:安装 raddy、写 Raddyfile、校验、
+本教程带你从空目录到一个运行中的反向代理:安装 raddex、写 Raddexfile、校验、
 运行、观察流量流动。随后几个简短片段演示限流、Basic 认证与 HTTPS。大约需要
 五分钟和一个终端。
 
 ## 开始之前
 
-先[安装 raddy](../install/)。你还需要一个本地 HTTP 服务作为代理目标 —— 如果
+先[安装 raddex](../install/)。你还需要一个本地 HTTP 服务作为代理目标 —— 如果
 `127.0.0.1:8080` 上没跑任何东西,启动一个简易的:
 
 ```bash
 python3 -m http.server 8080 --bind 127.0.0.1
 ```
 
-让它保持运行;raddy 会把请求转发给它。
+让它保持运行;raddex 会把请求转发给它。
 
-## 1. 写你的第一个 Raddyfile
+## 1. 写你的第一个 Raddexfile
 
-创建一个名为 `Raddyfile` 的文件,包含一个站点。这个站点服务 `example.local`
+创建一个名为 `Raddexfile` 的文件,包含一个站点。这个站点服务 `example.local`
 主机上的 8090 端口,并把每个请求代理给你的本地服务:
 
 ```caddyfile
@@ -35,39 +35,39 @@ example.local:8090 {
 
 ## 2. 校验配置
 
-`raddy check` 执行**与重载完全相同的校验** —— 若此处通过,raddy 即可干净
+`raddex check` 执行**与重载完全相同的校验** —— 若此处通过,raddex 即可干净
 启动:
 
 ```bash
-raddy check -c Raddyfile
+raddex check -c Raddexfile
 ```
 
 预期输出:
 
 ```
-Raddyfile: ok
+Raddexfile: ok
 ```
 
-## 3. 运行 raddy
+## 3. 运行 raddex
 
 ```bash
-raddy run -c Raddyfile
+raddex run -c Raddexfile
 ```
 
-raddy 在前台启动,绑定 8090 端口,等待请求。
+raddex 在前台启动,绑定 8090 端口,等待请求。
 
 ## 4. 发送请求
 
-在另一个终端里,经由 raddy 请求该站点:
+在另一个终端里,经由 raddex 请求该站点:
 
 ```bash
 curl -H 'Host: example.local' http://127.0.0.1:8090/
 ```
 
-`Host` 头匹配该站点,于是 raddy 把请求代理到 `127.0.0.1:8080`,你会看到本地
+`Host` 头匹配该站点,于是 raddex 把请求代理到 `127.0.0.1:8080`,你会看到本地
 服务的响应。
 
-再看站点选择的实际效果。与单纯的端口转发不同,raddy 按主机路由 —— 试试:
+再看站点选择的实际效果。与单纯的端口转发不同,raddex 按主机路由 —— 试试:
 
 ```bash
 curl http://127.0.0.1:8090/                             # 缺失 Host → 400
@@ -79,7 +79,7 @@ curl -H 'Host: unknown.example' http://127.0.0.1:8090/  # 无匹配站点 → 40
 建一个含文件的目录,然后在你的代理旁加一个静态站点:
 
 ```bash
-mkdir public && echo 'hello from raddy' > public/hello.txt
+mkdir public && echo 'hello from raddex' > public/hello.txt
 ```
 
 ```caddyfile
@@ -93,25 +93,25 @@ static.local:8090 {
 }
 ```
 
-停止 raddy(Ctrl-C),用更新后的文件重新启动:
+停止 raddex(Ctrl-C),用更新后的文件重新启动:
 
 ```bash
-raddy run -c Raddyfile
+raddex run -c Raddexfile
 ```
 
 然后通过静态站点取文件:
 
 ```bash
 curl -H 'Host: static.local' http://127.0.0.1:8090/hello.txt
-# → hello from raddy
+# → hello from raddex
 ```
 
-> raddy 还能**无停机重载**配置:给运行中的进程发 `SIGHUP`
-> (`kill -HUP <raddy pid>`)。重载会原子替换路由快照,并保持既有连接不断。
+> raddex 还能**无停机重载**配置:给运行中的进程发 `SIGHUP`
+> (`kill -HUP <raddex pid>`)。重载会原子替换路由快照,并保持既有连接不断。
 
 ## 再试试:限流
 
-给代理站点加一条限流。停止 raddy,加一行 `rate_limit`,再重新启动:
+给代理站点加一条限流。停止 raddex,加一行 `rate_limit`,再重新启动:
 
 ```caddyfile
 example.local:8090 {
@@ -154,7 +154,7 @@ curl -u admin:'s3cret' -H 'Host: admin.local' http://127.0.0.1:8090/   # → 200
 
 ## 再试试:HTTPS
 
-在有真实域名且解析到本机的机器上,去掉 `:8090` 端口,让 raddy 自动签发证书:
+在有真实域名且解析到本机的机器上,去掉 `:8090` 端口,让 raddex 自动签发证书:
 
 ```caddyfile
 example.com {

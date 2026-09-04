@@ -1,52 +1,81 @@
 # Architecture and capability boundaries
 
-This document records the boundary between Raddy, Pingora 0.8.1, the operating
+This document records the boundary between Raddex, Pingora 0.8.1, the operating
 system, and protocols that require a separate service. It is intentionally
 written for deployment and design review rather than as a historical work
 plan.
 
 ## Runtime layers
 
+Raddex has two independent cores. The HTTP core runs on Pingora; the layer-4
+core is native Tokio and forwards no byte through Pingora.
+
 ```text
-                         Raddy
+                         Raddex
                            |
              +-------------+-------------+
              |                           |
-        HTTP / TLS                    Layer 4
+          L4 Core                     L7 Core
              |                           |
-       Pingora proxy       +------------+------------+
-                           |                         |
-                       TCP / TLS                  UDP
-                    Pingora ServerApp          Tokio socket
+           Tokio                      Pingora
+             |                           |
+         TCP / UDP                      HTTP
 ```
 
-Raddy owns configuration, site selection, ACME policy, routing, access
+Raddex owns configuration, site selection, ACME policy, routing, access
 records, and the release/upgrade protocol. Pingora supplies the HTTP proxy,
-upstream pools, TLS listener integration, and transport-level server app. The
-UDP service is Raddy-owned because Pingora 0.8.1 does not expose a UDP listener
-abstraction.
+upstream pools, and TLS listener integration for L7.
+
+The layer-4 core binds its own sockets, runs its own accept loops, terminates
+its own TLS, selects and health-checks its own upstreams, and relays with
+`tokio::io`. Pingora remains the *process* host — L4 listeners register as
+background services, observe the shutdown watch, and use its descriptor-passing
+helper for the upgrade handoff — but that is lifecycle, not data.
+
+This split is a measured choice. On the test machine (`bench/l4`, `full` profile,
+3 repetitions, Nginx stream = 100%):
+
+- **TCP bulk throughput (64 KiB):** 156.5% of Nginx at 16 connections and 176.6%
+  at 64 connections, while using only 57.6%–64.4% of its CPU and a fraction of
+  its memory (9.3%–25.1%).
+- **TCP connection rate:** 84.6% of Nginx at 10K connections (beating Caddy's
+  73.3%), and 114.5% of Nginx at 50K connections with the lowest error rate
+  among all user-space proxies.
+- **UDP flow capacity (10K):** 100.0% of Nginx with a 0.000% error rate (fixed
+  via per-thread `SO_REUSEPORT` socket fan-out) and 52.2% of its memory.
+- **p99 latency:** Matches Nginx (100.0%) across all tested concurrencies,
+  avoiding Caddy's 200% degradation under high connection counts.
+- **Memory footprint:** Lowest among all user-space proxies across every scenario.
+
+See [the performance record](PERFORMANCE.md) and [`bench/l4/`](../bench/l4/) for
+the complete scenario matrix, raw data, and methodology.
+
+HTTP keeps using Pingora, where its proxy engine, connection pooling, and
+protocol handling are the reason to depend on it at all.
 
 ## Capability matrix
 
 | Capability | Boundary | Release behavior |
 | --- | --- | --- |
-| HTTP/1.1 reverse proxy | Pingora primitive plus Raddy routing | Supported |
+| HTTP/1.1 reverse proxy | Pingora primitive plus Raddex routing | Supported |
 | Downstream HTTP/2 | Pingora TLS/HTTP integration | Supported on TLS listeners |
-| Upstream HTTP/2 | Pingora connector plus Raddy scheme selection | `h2://` |
-| Upstream h2c | Pingora prior-knowledge H2 connector plus Raddy scheme selection | `h2c://` |
-| Multi-domain and wildcard sites | Raddy application logic | Exact-first, one-label wildcard matching |
-| IPv4/IPv6 HTTP listeners | Pingora listener plus Raddy bind planning | Explicit dual-stack behavior |
-| TLS termination for L4 | Pingora TLS listener plus raw relay | Static or internal certificates |
-| TLS-ALPN-01 | OpenSSL callbacks plus Raddy challenge store | Temporary RFC 8737 certificate on port 443 |
+| Upstream HTTP/2 | Pingora connector plus Raddex scheme selection | `h2://` |
+| Upstream h2c | Pingora prior-knowledge H2 connector plus Raddex scheme selection | `h2c://` |
+| Multi-domain and wildcard sites | Raddex application logic | Exact-first, one-label wildcard matching |
+| IPv4/IPv6 HTTP listeners | Pingora listener plus Raddex bind planning | Explicit dual-stack behavior |
+| Raw TCP proxying | Raddex-owned Tokio listener and relay | Native accept, relay, and admission |
+| L4 load balancing and health checks | Raddex-owned | Round-robin, random, consistent-hash `ip_hash`; TCP-connect probes |
+| TLS termination for L4 | Raddex-owned OpenSSL acceptor plus raw relay | Static or internal certificates |
+| TLS-ALPN-01 | OpenSSL callbacks plus Raddex challenge store | Temporary RFC 8737 certificate on port 443 |
 | Transparent TCP | Linux socket and routing integration | Requires TPROXY, policy routing, and network privilege |
-| UDP proxying | Raddy-owned Tokio flow service | Bounded per-client flows |
-| UDP lossless upgrade | Raddy-owned fd and metadata handoff | Linux-only, fail-closed verification |
+| UDP proxying | Raddex-owned Tokio flow service | Bounded per-client flows |
+| L4 listener upgrade handoff | Raddex-owned descriptor transfer | Linux-only, fail-closed verification |
 | QUIC / HTTP/3 termination | Missing in Pingora 0.8.1 | Separate QUIC service or sidecar required |
 
 ## What the QUIC boundary means
 
 The UDP listener can forward QUIC packets because it treats them as datagrams.
-That is passthrough only. Raddy does not currently provide:
+That is passthrough only. Raddex does not currently provide:
 
 - QUIC handshake or connection state;
 - HTTP/3 request parsing or routing;
@@ -55,23 +84,33 @@ That is passthrough only. Raddy does not currently provide:
 - QUIC-aware load balancing.
 
 A deployment that needs those capabilities must terminate QUIC in a dedicated
-service and then hand HTTP/1.1, HTTP/2, or another supported protocol to Raddy.
+service and then hand HTTP/1.1, HTTP/2, or another supported protocol to Raddex.
 
 ## Reload and upgrade seam
 
 SIGHUP replaces the compiled routing snapshot and applies new policies to new
 work. Existing connections and UDP flows retain their selected upstream.
 
-The zero-downtime upgrade path transfers compatible listener file descriptors.
-Raddy adds a topology digest so a replacement cannot silently start with a
-different set of listeners. The standard handoff path does not own transparent
-TCP listeners; those deployments use a normal restart. UDP handoff transfers
-the listener, connected upstream flow descriptors, and bounded metadata through
-a private protocol and reports failure before claiming success.
+The zero-downtime upgrade path transfers listener file descriptors, and Raddex
+adds a topology digest so a replacement cannot silently start with a different
+set of listeners.
+
+HTTP listeners are transferred by Pingora. **Layer-4 listeners are not**: they
+are Raddex-owned sockets, outside Pingora's automatic transfer, so each one
+hands its descriptor over explicitly during the upgrade's fd-transfer phase and
+publishes the outcome. `raddex upgrade` refuses to report success until every
+configured TCP and UDP listener has published `ok`, so a failed transfer is a
+failed upgrade rather than a silently unserved port. The UDP handoff carries
+more: the listener, connected upstream flow descriptors, and bounded flow
+metadata.
+
+The handoff path does not own transparent TCP listeners; those deployments use
+a normal restart.
 
 ## Operational consequence
 
-Use the Pingora process when Raddy needs to terminate HTTP, TLS, TCP, or UDP.
-Treat Linux transparent routing and UDP handoff as privileged integrations that
-need host-level validation. Treat HTTP/3 termination as a separate protocol
+Use the Raddex process when it needs to terminate HTTP, TLS, TCP, or UDP.
+Treat Linux transparent routing and the layer-4 descriptor handoff as
+privileged integrations that need host-level validation. Treat HTTP/3
+termination as a separate protocol
 service, not as an implied feature of UDP passthrough.

@@ -11,19 +11,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! nginx.conf → Raddyfile converter (common subset, ARCHITECTURE §7).
+//! nginx.conf → Raddexfile converter (common subset, ARCHITECTURE §7).
 //!
 //! Supported subset: `server` blocks with `listen` / `server_name`, `root`,
 //! `location` blocks containing `proxy_pass` (plain HTTP) or `root`, server
 //! `proxy_pass`, `add_header` → `header_down`, and `return <3xx> <url>` →
 //! `redir`. nginx's static-serving mechanics (`try_files`, `index`) are
-//! approximated by Raddy's `file_server`; anything else is skipped with a
+//! approximated by Raddex's `file_server`; anything else is skipped with a
 //! warning. nginx variables (`$host`, `$request_uri`, …) are mapped to the
-//! Raddy placeholders.
+//! Raddex placeholders.
 
 use super::{parse_stmts, Converted, Stmt};
 
-/// Convert an nginx.conf to a Raddyfile.
+/// Convert an nginx.conf to a Raddexfile.
 pub fn convert(input: &str) -> Result<Converted, String> {
     let lines: Vec<&str> = input.lines().collect();
     let stmts = parse_stmts(&lines)?;
@@ -39,7 +39,7 @@ pub fn convert(input: &str) -> Result<Converted, String> {
         }
     }
     Ok(Converted {
-        raddyfile: conv.out,
+        raddexfile: conv.out,
         warnings: conv.warnings,
     })
 }
@@ -268,7 +268,7 @@ impl NginxConv {
         self.out.push_str(&format!("{addr} {{\n{body}}}\n"));
     }
 
-    /// Map a `location` header line to a Raddy path (or warn and skip it).
+    /// Map a `location` header line to a Raddex path (or warn and skip it).
     fn location_path(&mut self, location: &Stmt) -> Option<String> {
         match location.words.get(1).map(String::as_str) {
             Some(path) if path.starts_with('/') => Some(path.to_string()),
@@ -314,7 +314,7 @@ impl NginxConv {
         }
     }
 
-    /// Map a `proxy_pass` value to a Raddy upstream (plain HTTP host:port).
+    /// Map a `proxy_pass` value to a Raddex upstream (plain HTTP host:port).
     fn map_proxy_pass(&mut self, words: &[String], line: usize) -> Option<String> {
         let url = words.get(1)?;
         let rest = match url.split_once("://") {
@@ -322,7 +322,7 @@ impl NginxConv {
             Some(("https", _)) => {
                 self.warn(
                     line,
-                    format!("https proxy_pass '{url}' skipped (raddy supports plain-HTTP upstreams only)"),
+                    format!("https proxy_pass '{url}' skipped (raddex supports plain-HTTP upstreams only)"),
                 );
                 return None;
             }
@@ -375,7 +375,7 @@ fn is_3xx(token: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Map nginx `$variables` and `{placeholders}` to Raddy value placeholders.
+/// Map nginx `$variables` and `{placeholders}` to Raddex value placeholders.
 fn map_nginx_value(raw: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = raw;
@@ -408,7 +408,7 @@ mod tests {
         let input = "server {\n    listen 80;\n    server_name example.com;\n    location / {\n        proxy_pass http://127.0.0.1:8080;\n    }\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com:80 {\n    reverse_proxy 127.0.0.1:8080\n}\n"
         );
         assert!(
@@ -424,7 +424,7 @@ mod tests {
             "server {\n    listen 80;\n    server_name example.com;\n    root /var/www/html;\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com:80 {\n    root /var/www/html\n    file_server\n}\n"
         );
     }
@@ -436,7 +436,7 @@ mod tests {
         let input = "server {\n    listen 80;\n    server_name example.com;\n    location / {\n        root /var/www/html;\n    }\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com:80 {\n    root /var/www/html\n    file_server\n}\n"
         );
     }
@@ -446,7 +446,7 @@ mod tests {
         let input = "server {\n    listen 443 ssl;\n    server_name example.com;\n    root /var/www/html;\n    location /api/ {\n        proxy_pass http://127.0.0.1:8080;\n    }\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com:443 {\n    root /var/www/html\n    handle /api/ {\n        reverse_proxy 127.0.0.1:8080\n    }\n    file_server\n}\n"
         );
     }
@@ -456,18 +456,18 @@ mod tests {
         let input = "server {\n    listen 80;\n    server_name example.com;\n    location / {\n        return 301 https://$host$request_uri;\n    }\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "example.com:80 {\n    redir https://{host}{uri} 301\n}\n"
         );
     }
 
     #[test]
     fn add_header_maps_to_header_down() {
-        let input = "server {\n    listen 80;\n    server_name example.com;\n    add_header X-A raddy;\n    location / {\n        proxy_pass http://127.0.0.1:8080;\n    }\n}\n";
+        let input = "server {\n    listen 80;\n    server_name example.com;\n    add_header X-A raddex;\n    location / {\n        proxy_pass http://127.0.0.1:8080;\n    }\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
-            "example.com:80 {\n    header_down X-A raddy\n    reverse_proxy 127.0.0.1:8080\n}\n"
+            c.raddexfile,
+            "example.com:80 {\n    header_down X-A raddex\n    reverse_proxy 127.0.0.1:8080\n}\n"
         );
     }
 
@@ -476,7 +476,7 @@ mod tests {
         let input = "server {\n    listen 8080;\n    location / {\n        proxy_pass http://127.0.0.1:9000;\n    }\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             ":8080 {\n    reverse_proxy 127.0.0.1:9000\n}\n"
         );
     }
@@ -486,7 +486,7 @@ mod tests {
         let input = "server {\n    listen 80;\n    server_name a.test;\n    location / {\n        proxy_pass http://127.0.0.1:9001;\n    }\n}\nserver {\n    listen 80;\n    server_name b.test;\n    location / {\n        proxy_pass http://127.0.0.1:9002;\n    }\n}\n";
         let c = convert(input).unwrap();
         assert_eq!(
-            c.raddyfile,
+            c.raddexfile,
             "a.test:80 {\n    reverse_proxy 127.0.0.1:9001\n}\nb.test:80 {\n    reverse_proxy 127.0.0.1:9002\n}\n"
         );
     }
@@ -495,7 +495,7 @@ mod tests {
     fn wildcard_server_name_is_approximated() {
         let input = "server {\n    listen 80;\n    server_name *.example.com;\n    location / {\n        proxy_pass http://127.0.0.1:8080;\n    }\n}\n";
         let c = convert(input).unwrap();
-        assert!(c.raddyfile.starts_with("example.com:80 {"));
+        assert!(c.raddexfile.starts_with("example.com:80 {"));
         assert!(c
             .warnings
             .iter()
@@ -506,7 +506,7 @@ mod tests {
     fn https_upstream_is_skipped_with_warning() {
         let input = "server {\n    listen 80;\n    server_name example.com;\n    location / {\n        proxy_pass https://127.0.0.1:8443;\n    }\n}\n";
         let c = convert(input).unwrap();
-        assert!(c.raddyfile.trim().is_empty());
+        assert!(c.raddexfile.trim().is_empty());
         assert!(c.warnings.iter().any(|w| w.contains("https proxy_pass")));
     }
 
@@ -514,7 +514,7 @@ mod tests {
     fn unsupported_directives_warn() {
         let input = "server {\n    listen 80;\n    server_name example.com;\n    client_max_body_size 10m;\n    location / {\n        proxy_pass http://127.0.0.1:8080;\n    }\n}\n";
         let c = convert(input).unwrap();
-        assert!(c.raddyfile.contains("reverse_proxy"));
+        assert!(c.raddexfile.contains("reverse_proxy"));
         assert!(c
             .warnings
             .iter()
@@ -525,7 +525,7 @@ mod tests {
     fn exact_match_location_is_skipped() {
         let input = "server {\n    listen 80;\n    server_name example.com;\n    location = /health {\n        proxy_pass http://127.0.0.1:8080;\n    }\n}\n";
         let c = convert(input).unwrap();
-        assert!(c.raddyfile.trim().is_empty());
+        assert!(c.raddexfile.trim().is_empty());
         assert!(c
             .warnings
             .iter()

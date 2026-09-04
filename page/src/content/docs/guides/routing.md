@@ -3,7 +3,7 @@ title: Routing & matchers
 description: Route requests by path, host, method, header, query, client IP, or protocol.
 ---
 
-Routing in raddy is built on **matchers** — terms that select which requests a
+Routing in raddex is built on **matchers** — terms that select which requests a
 directive serves. This guide shows how to combine them to route traffic.
 
 ## Matcher terms
@@ -115,7 +115,7 @@ api.example.com {
 }
 ```
 
-`error [<status>] [<message>]` serves raddy's internal error response with a
+`error [<status>] [<message>]` serves raddex's internal error response with a
 chosen status (default `500`) — useful to block an area with a matcher:
 
 ```caddyfile

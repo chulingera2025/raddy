@@ -16,7 +16,7 @@
 //! Implements the Q6 validation checklist (site conflicts, address/port range,
 //! upstream `host:port`, directive arity, global items, placeholder whitelist)
 //! and compiles the source AST into the ADR-012 terminal/modifier form. This is
-//! the single code path shared by startup, SIGHUP reload, and `raddy check`
+//! the single code path shared by startup, SIGHUP reload, and `raddex check`
 //! (Q7).
 
 use crate::config::ast::*;
@@ -25,16 +25,16 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Validate a parsed Raddyfile, resolve upstreams, and compile it.
+/// Validate a parsed Raddexfile, resolve upstreams, and compile it.
 ///
 /// Any semantic problem is reported as a [`ConfigError::Validate`]; nothing is
 /// produced on error (Q6: no partial config).
 pub fn validate_and_compile(
     file: &str,
-    raddyfile: &Raddyfile,
+    raddexfile: &Raddexfile,
 ) -> Result<CompiledConfig, ConfigError> {
-    validate_global(file, &raddyfile.global)?;
-    if raddyfile.sites.is_empty() && raddyfile.layer4.is_empty() {
+    validate_global(file, &raddexfile.global)?;
+    if raddexfile.sites.is_empty() && raddexfile.layer4.is_empty() {
         return Err(validate_error(
             file,
             "no sites or layer-4 listeners defined",
@@ -42,8 +42,8 @@ pub fn validate_and_compile(
     }
 
     let mut seen = HashSet::new();
-    let mut sites = Vec::with_capacity(raddyfile.sites.len());
-    for site in &raddyfile.sites {
+    let mut sites = Vec::with_capacity(raddexfile.sites.len());
+    for site in &raddexfile.sites {
         if !seen.insert(site.key.clone()) {
             return Err(validate_error(
                 file,
@@ -69,7 +69,7 @@ pub fn validate_and_compile(
             if tls_site
                 && acme
                 && host.starts_with("*.")
-                && raddyfile.global.dns_challenge.is_none()
+                && raddexfile.global.dns_challenge.is_none()
             {
                 return Err(validate_error(
                     file,
@@ -82,7 +82,7 @@ pub fn validate_and_compile(
         }
         sites.push(compiled);
     }
-    if raddyfile.global.tls_alpn_challenge
+    if raddexfile.global.tls_alpn_challenge
         && sites.iter().any(|site| {
             matches!(&site.key, SiteKey::Named { port, .. } if *port != 443)
                 && site
@@ -97,10 +97,10 @@ pub fn validate_and_compile(
         ));
     }
 
-    let layer4 = validate_layer4(file, raddyfile)?;
+    let layer4 = validate_layer4(file, raddexfile)?;
 
     Ok(CompiledConfig {
-        global: raddyfile.global.clone(),
+        global: raddexfile.global.clone(),
         sites,
         layer4,
     })
@@ -117,16 +117,19 @@ pub fn validate_and_compile(
 /// Wildcard binds (`0.0.0.0`, `::`) overlap any bind on the same port, and the
 /// IPv6 wildcard also captures IPv4-mapped traffic (dual-stack), so both are
 /// treated as overlapping everything on their port.
-fn validate_layer4(file: &str, raddyfile: &Raddyfile) -> Result<Vec<Layer4Listener>, ConfigError> {
+fn validate_layer4(
+    file: &str,
+    raddexfile: &Raddexfile,
+) -> Result<Vec<Layer4Listener>, ConfigError> {
     let mut seen: Vec<(SocketTransport, ListenAddress)> = Vec::new();
-    for listener in &raddyfile.layer4 {
+    for listener in &raddexfile.layer4 {
         let (transport, address) = match listener {
             Layer4Listener::Tcp(tcp) => (SocketTransport::Tcp, &tcp.listen),
             Layer4Listener::Udp(udp) => (SocketTransport::Udp, &udp.listen),
         };
         // Raw TCP shares the TCP listener namespace with the HTTP sites.
         if matches!(transport, SocketTransport::Tcp) {
-            for site in &raddyfile.sites {
+            for site in &raddexfile.sites {
                 if site.key.port() == address.port() {
                     return Err(validate_error(
                         file,
@@ -152,7 +155,7 @@ fn validate_layer4(file: &str, raddyfile: &Raddyfile) -> Result<Vec<Layer4Listen
         }
         seen.push((transport, address.clone()));
     }
-    for listener in &raddyfile.layer4 {
+    for listener in &raddexfile.layer4 {
         let Layer4Listener::Tcp(tcp) = listener else {
             continue;
         };
@@ -172,7 +175,7 @@ fn validate_layer4(file: &str, raddyfile: &Raddyfile) -> Result<Vec<Layer4Listen
             }
         }
     }
-    Ok(raddyfile.layer4.clone())
+    Ok(raddexfile.layer4.clone())
 }
 
 /// Whether two layer-4 binds of the same transport occupy overlapping socket
@@ -767,7 +770,7 @@ fn merge_tls(site_tls: &mut Option<TlsConfig>, config: &TlsConfig) {
 
 /// Validate a merged per-site `tls` config: static cert and mTLS CA files exist
 /// and parse, and the version range is consistent (spec §5.7). Runs at compile
-/// time so `raddy check` and reload catch it before the files are needed.
+/// time so `raddex check` and reload catch it before the files are needed.
 fn validate_tls_config(file: &str, config: &TlsConfig) -> Result<(), ConfigError> {
     if let TlsSource::Static {
         cert_file,
@@ -1096,7 +1099,7 @@ mod tests {
     #[test]
     fn resolution_timeout_propagates_diagnostic() {
         // The injectable resolver stands in for a timed-out lookup; the
-        // config error must carry the diagnostic for `raddy check`/reload.
+        // config error must carry the diagnostic for `raddex check`/reload.
         let to = vec![upstream("slow.test", 80)];
         let err = resolve_upstreams("test", &to, |_, _| {
             Err("failed to resolve upstream slow.test:80: timed out after 5s".to_string())
@@ -1240,7 +1243,7 @@ mod tests {
         // Generate a self-signed client cert and write it (plus its key) to
         // temp files; the compiled TLS config must parse them.
         let dir = std::env::temp_dir();
-        let stem = format!("raddy-tls-cert-{}", std::process::id());
+        let stem = format!("raddex-tls-cert-{}", std::process::id());
         let cert_path = dir.join(format!("{stem}.pem"));
         let key_path = dir.join(format!("{stem}.key"));
         let cert = rcgen::generate_simple_self_signed(vec!["client.test".to_string()]).unwrap();
@@ -1284,7 +1287,7 @@ mod tests {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir();
         let stem = format!(
-            "raddy-tls-site-{}-{}-{}",
+            "raddex-tls-site-{}-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed),
             host

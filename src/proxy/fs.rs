@@ -394,7 +394,7 @@ mod tests {
     fn hidden_files_are_rejected() {
         // `.env`, `.git/config`, and dot-directories must not be servable from
         // a static root (secret leakage), even when they exist on disk.
-        let root = std::env::temp_dir().join(format!("raddy_fs_hidden_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("raddex_fs_hidden_{}", std::process::id()));
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join(".well-known")).unwrap();
         std::fs::write(root.join(".env"), "SECRET=1").unwrap();
@@ -427,7 +427,7 @@ mod tests {
     fn missing_and_valid_paths() {
         // A non-existent path under an existing root resolves to None.
         let root = std::env::temp_dir();
-        assert!(resolve(root.to_str().unwrap(), "/definitely_missing_raddy_file").is_none());
+        assert!(resolve(root.to_str().unwrap(), "/definitely_missing_raddex_file").is_none());
         // The root itself is a directory with no index.html → None.
         assert!(resolve(root.to_str().unwrap(), "/").is_none());
     }

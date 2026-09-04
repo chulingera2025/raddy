@@ -3,7 +3,7 @@
 The filename is retained as a compatibility path for existing links. This file
 replaces the historical implementation plan with the current runtime contract
 for TCP and UDP listeners. The user-facing syntax is documented in the
-[Layer 4 guide](https://chulingera2025.github.io/raddy/guides/layer4/); this
+[Layer 4 guide](https://chulingera2025.github.io/raddex/guides/layer4/); this
 document records the invariants that should remain true when the subsystem
 changes.
 
@@ -11,9 +11,22 @@ changes.
 
 ```text
 HTTP sites     -> Pingora HTTP proxy
-TCP listeners  -> Pingora ServerApp over raw streams
-UDP listeners  -> Tokio UdpSocket and Raddy flow table
+TCP listeners  -> Tokio TcpListener and Raddex relay
+UDP listeners  -> Tokio UdpSocket and Raddex flow table
 ```
+
+Both layer-4 transports fan their listener out across the configured worker
+threads: one `SO_REUSEPORT` socket per thread, each drained by its own accept
+or receive loop. For UDP this is load-bearing rather than an optimization —
+each socket carries its own kernel receive buffer, so a burst of new flows that
+would overflow one socket's buffer is spread across several. A datagram lost
+that way is counted only by the kernel (`UdpRcvbufErrors`), never by a Raddex
+metric, because the process never receives it.
+
+Both layer-4 transports are native Tokio end to end: Raddex binds the socket,
+accepts, terminates TLS, selects and health-checks upstreams, and relays. No
+forwarded byte passes through Pingora, which hosts the process (background
+services, shutdown watch, descriptor passing) and runs the HTTP core.
 
 TCP and UDP are separate configuration types and separate listener identities.
 They may share an address and port because they use different transports. Two
@@ -30,7 +43,8 @@ and dual-stack conflicts.
   in either direction.
 - `sni` mode reads a bounded ClientHello prefix, selects an exact or one-label
   wildcard route, and forwards the original bytes unchanged.
-- TLS termination uses Pingora's TLS listener and then reuses the raw relay.
+- TLS termination uses a Raddex-owned OpenSSL acceptor, built once per listener
+  and bounded by a handshake timeout, and then reuses the raw relay.
 - Transparent mode is a Linux socket/TPROXY integration and is not part of the
   standard listener handoff path.
 
@@ -45,6 +59,8 @@ and dual-stack conflicts.
   and packet size. Capacity eviction is oldest-first.
 - IPv4 and IPv6 upstream families are preserved when creating flow sockets.
 - Oversized datagrams are dropped and counted rather than forwarded partially.
+- `recv_buffer` and `send_buffer` size each listener socket, so the listener's
+  total kernel buffer is the configured value times the worker-thread count.
 
 ## Reload and upgrade invariants
 
@@ -58,19 +74,21 @@ replacement as complete.
 
 Linux UDP upgrade transfers:
 
-1. the UDP listener file descriptor;
+1. every UDP listener file descriptor;
 2. every connected upstream flow descriptor;
 3. bounded JSON metadata that reconstructs the flow table.
 
-The receiver queue stays attached to the transferred listener. Any missing
+The receiver queue stays attached to the transferred listeners. Any missing
 descriptor, malformed metadata, or listener status error fails the handoff
-rather than silently dropping active flows.
+rather than silently dropping active flows. The listener socket count is part
+of the contract, so a replacement started with a different worker-thread count
+is refused: change `--threads` with a normal restart, not an upgrade.
 
 ## Observability
 
 HTTP and Layer 4 records are distinct. TCP and UDP access records include a
 listener identity and normalized outcome; Prometheus metrics use the
-`raddy_l4_tcp_*` and `raddy_l4_udp_*` families. The flow table must remain
+`raddex_l4_tcp_*` and `raddex_l4_udp_*` families. The flow table must remain
 bounded even when an upstream is unavailable or DNS resolution is slow.
 
 ## Explicit non-goals
@@ -80,5 +98,5 @@ bounded even when an upstream is unavailable or DNS resolution is slow.
 - Cluster-wide rate limiting or shared flow state.
 - A claim that UDP passthrough provides QUIC connection migration.
 
-Future changes should preserve these boundaries or update the Raddyfile
+Future changes should preserve these boundaries or update the Raddexfile
 specification, capability matrix, and integration tests in the same change.

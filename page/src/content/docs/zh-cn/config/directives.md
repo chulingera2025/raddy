@@ -1,9 +1,9 @@
 ---
 title: 指令参考
-description: 每一条 Raddyfile 指令的语法、参数与可运行示例。
+description: 每一条 Raddexfile 指令的语法、参数与可运行示例。
 ---
 
-这是 Raddyfile 的完整参考。每条指令采用统一结构:作用、语法、参数、示例。
+这是 Raddexfile 的完整参考。每条指令采用统一结构:作用、语法、参数、示例。
 如果你刚接触这门语言,请先读[核心概念](../)建立心智模型;[路由与
 匹配器](../../guides/routing/)介绍匹配器与路由指令如何配合使用。
 
@@ -220,7 +220,7 @@ api.example.com {
 
 ## `error`
 
-**作用。** 以选定的状态码与可选消息触发 raddy 的内部错误响应。
+**作用。** 以选定的状态码与可选消息触发 raddex 的内部错误响应。
 
 **语法。**
 
@@ -354,7 +354,7 @@ api.example.com {
 
 ## `encode`
 
-**作用。** 压缩响应。**参数顺序即优先级** —— raddy 选用客户端也支持的
+**作用。** 压缩响应。**参数顺序即优先级** —— raddex 选用客户端也支持的
 第一个算法。
 
 **语法。**
@@ -475,7 +475,7 @@ forward_auth <host:port>
 
 **参数。** `<host:port>` —— 认证上游,如 `auth.example.com:4181`。
 
-**行为。** 守卫指令:raddy 把请求转发给认证上游,携带原始 `Authorization` 与
+**行为。** 守卫指令:raddex 把请求转发给认证上游,携带原始 `Authorization` 与
 `X-Forwarded-For` 头,仅在 **2xx** 响应时放行。认证上游返回 **403** 时原样
 透传给客户端;其他情况一律返回 **401**。认证上游的响应头(例如身份头)会在
 真实上游看到请求之前被复制到请求上。
@@ -572,7 +572,7 @@ secure.example.com {
 
 ## `access_log`
 
-**作用。** 在 Raddyfile 中配置访问日志,替代(或补充)`--access-log` CLI 标志。
+**作用。** 在 Raddexfile 中配置访问日志,替代(或补充)`--access-log` CLI 标志。
 
 **语法。**
 
@@ -594,14 +594,14 @@ access_log off
 
 **行为。** 在全局块中,`access_log <path>` 设置实例日志文件与格式;`access_log
 off` 关闭整个实例的访问日志。在站点块中,`access_log off` 仅关闭该站点的
-访问日志。当 Raddyfile 与 `--access-log` 标志同时设置时,标志胜出。JSON 字段
+访问日志。当 Raddexfile 与 `--access-log` 标志同时设置时,标志胜出。JSON 字段
 见[访问日志](../../operations/access-log/)。
 
 **示例。**
 
 ```caddyfile
 {
-    access_log /var/log/raddy/access.log format=common
+    access_log /var/log/raddex/access.log format=common
 }
 
 api.example.com {
@@ -612,7 +612,7 @@ api.example.com {
 
 ## `trusted_proxies`
 
-**作用。** 声明哪些网络是可信代理,使 raddy 能从 `X-Forwarded-For` 推导真实
+**作用。** 声明哪些网络是可信代理,使 raddex 能从 `X-Forwarded-For` 推导真实
 客户端 IP。见[可信代理](../trusted-proxies/)。
 
 **语法。**
@@ -633,30 +633,51 @@ HTTPS](../sites/)。
 **语法。**
 
 ```caddyfile
-dns_challenge cloudflare <api_token>
+dns_challenge <provider> <value>        # 简写:单个凭证
+dns_challenge <provider> { ... }        # 块形式:任意数量凭证
 ```
 
-**参数。** 服务商(`cloudflare`——目前唯一)与服务商的 API 令牌,令牌需要
-**Zone: DNS: Edit** 权限。位于[全局块](../sites/#the-global-block)。
+**参数。** 服务商关键字及其凭证。简写只对「恰好需要一个凭证」的服务商可用;
+块形式每行一条 `<字段> <值>`,适用于所有服务商。位于[全局块](../sites/#the-global-block)。
 
-**行为。** 配置后,本实例上所有证书走 DNS-01 签发:raddy 在校验订单期间发布
+| 服务商 | 凭证 | 必填 | 说明 |
+|---|---|---|---|
+| `cloudflare` | `api_token` | 是 | 需要该 zone 的 **Zone: DNS: Edit** 权限。 |
+
+**行为。** 配置后,本实例上所有证书走 DNS-01 签发:raddex 在校验订单期间发布
 `_acme-challenge.<host>` TXT 记录,完成后移除。未配置 `dns_challenge` 时
-沿用 HTTP-01。
+沿用 HTTP-01。`raddex check` 会校验服务商关键字与凭证字段——必填凭证缺失或为
+空、字段名未知、字段重复,都是配置错误。
 
-> **安全:** API 令牌是机密——注意不要让 Raddyfile 落入版本控制。
+> **安全:** 所有凭证值都是机密。raddex 会在诊断输出中脱敏,但 Raddexfile 本身
+> 以明文保存它们——不要让它落入版本控制,或改用 `{$ENV}` 占位符注入。
 
 **示例。**
 
 ```caddyfile
 {
     acme_email ops@example.com
-    dns_challenge cloudflare <api_token>
+    dns_challenge cloudflare {$CLOUDFLARE_API_TOKEN}
 }
 
 api.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
+
+块形式等价,也是多凭证服务商所用的写法:
+
+```caddyfile
+{
+    acme_email ops@example.com
+    dns_challenge cloudflare {
+        api_token {$CLOUDFLARE_API_TOKEN}
+    }
+}
+```
+
+服务商是 `src/server/dns/` 里的注册表条目,新增服务商不会改动这套语法。参见
+[CONTRIBUTING.md](https://github.com/chulingera2025/raddex/blob/main/CONTRIBUTING.md)。
 
 ## `tls_alpn_challenge`
 
@@ -714,7 +735,7 @@ import <file|name>
 
 **行为。**
 
-- `import <file>` 在该位置拼入另一个 Raddyfile 的内容。路径相对于导入文件。
+- `import <file>` 在该位置拼入另一个 Raddexfile 的内容。路径相对于导入文件。
   导入可以嵌套(有深度限制)。站点块可以导入其指令归属于该站点的文件。
 - 顶层命名为 `(name) { ... }` 的块定义一个可复用的**片段**;`import name`
   在该位置将其拼入。片段仅对定义它的文件可见。
@@ -724,7 +745,7 @@ import <file|name>
 ```caddyfile
 (base) {
     rate_limit remote_ip 100r/s
-    header_up X-Raddy true
+    header_up X-Raddex true
 }
 
 api.example.com {
@@ -741,10 +762,10 @@ admin.example.com {
 
 ## 环境变量
 
-**作用。** 在解析时把环境变量的值注入 Raddyfile。
+**作用。** 在解析时把环境变量的值注入 Raddexfile。
 
 **语法。** 形如 `{$ENV_VAR}` 的指令参数会在解析时被 `ENV_VAR` 的值替换。
-变量缺失是校验错误,因此写错的变量名会让 `raddy check` 失败,而不是带着错误
+变量缺失是校验错误,因此写错的变量名会让 `raddex check` 失败,而不是带着错误
 值启动。
 
 **行为。** 适用于出现参数的任何位置 —— 上游目标、`root` 路径、`tls` 证书
@@ -780,7 +801,7 @@ api.example.com {
 时长是数字加单位(`ms` / `s` / `m` / `h`),或裸数字表示秒。
 
 **行为。** 不健康的上游永远不会被选中,恢复后自动回流。若**所有**上游都不
-健康,raddy 返回 `502`。健康状态跨 SIGHUP 重载存活,仅在上游列表、策略或
+健康,raddex 返回 `502`。健康状态跨 SIGHUP 重载存活,仅在上游列表、策略或
 健康检查参数变化时才重建。
 
 **示例。**
@@ -809,7 +830,7 @@ api.example.com {
 reverse_proxy {
     to https://10.0.0.1:8443 https://10.0.0.2:8443
     tls_servername api.internal
-    tls_ca /etc/raddy/root-ca.pem
+    tls_ca /etc/raddex/root-ca.pem
 }
 ```
 
@@ -830,7 +851,7 @@ api.example.com {
     reverse_proxy {
         to https://10.0.0.1:8443
         tls_servername api.internal
-        tls_ca /etc/raddy/root-ca.pem
+        tls_ca /etc/raddex/root-ca.pem
     }
 }
 ```
@@ -841,10 +862,10 @@ api.example.com {
 `Connection: upgrade` 协议)。
 
 **行为。** 客户端的升级请求发往上游;一旦上游应答 `101 Switching
-Protocols`,raddy 便双向隧道该连接。无需任何指令——这是 `reverse_proxy`
+Protocols`,raddex 便双向隧道该连接。无需任何指令——这是 `reverse_proxy`
 对 HTTP/1.1 升级请求的默认行为。
 
-- 升级是**端到端**的:raddy 不终止升级后的协议;后端必须能说该协议。
+- 升级是**端到端**的:raddex 不终止升级后的协议;后端必须能说该协议。
 - `header_up` / `header_down` 仍作用于升级请求 / 响应头;`encode` 绝不作用于
   `101`(升级)响应。
 
@@ -856,7 +877,7 @@ chat.example.com {
 }
 ```
 
-同一站点同时服务 WebSocket 与普通 HTTP 流量;raddy 只为携带 `Upgrade` 头的
+同一站点同时服务 WebSocket 与普通 HTTP 流量;raddex 只为携带 `Upgrade` 头的
 请求升级。
 
 ## 完整示例
@@ -866,12 +887,12 @@ chat.example.com {
     acme_email ops@example.com
     log_level info
     trusted_proxies 127.0.0.1
-    access_log /var/log/raddy/access.jsonl format=json
+    access_log /var/log/raddex/access.jsonl format=json
 }
 
 (base) {
     rate_limit remote_ip 50r/s burst=100
-    header_up X-Raddy true
+    header_up X-Raddex true
 }
 
 # HTTP → HTTPS 重定向

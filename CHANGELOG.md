@@ -1,13 +1,164 @@
 # Changelog
 
-All notable changes to Raddy are documented here, newest first. Releases are
+All notable changes to Raddex are documented here, newest first. Releases are
 tagged `v*`; this file follows [Keep a Changelog](https://keepachangelog.com/)'s
 shape (Added / Changed / Fixed), though the project keeps the "Unreleased"
 section short.
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Added
+
+- `dns_challenge` accepts a block form carrying any number of named
+  credentials, alongside the existing one-line shorthand:
+
+  ```caddyfile
+  dns_challenge cloudflare {
+      api_token {$CLOUDFLARE_API_TOKEN}
+  }
+  ```
+
+  The single-credential shorthand (`dns_challenge cloudflare <api_token>`) is
+  unchanged, so existing configurations keep working. The block form is what
+  lets a provider requiring several credentials — an access key plus a secret
+  plus a region — be configured at all.
+
+- `CONTRIBUTING.md`, with a step-by-step walkthrough for adding a DNS-01
+  provider.
+
+- `bench/l4/`, a Linux-only forwarding benchmark comparing Nginx stream, Caddy
+  layer4, Raddex, and Linux NAT / nftables as a kernel reference.
+
+- Published benchmark numbers. The README and the performance documents now
+  carry the measured results of a `full` run — including where Raddex loses —
+  instead of an unlabelled chart. Headline: Raddex reaches 59.6% of Nginx's max
+  stable throughput and 146.5% of its CPU per request (medians), against
+  Caddy's 39.7% and 274.7%. Connection churn is Raddex's weakest scenario
+  (p99 361% of Nginx, worse than Caddy); 1 MiB responses are its best (p99
+  45.8%, CPU 70.8%).
+
+### Changed
+
+- **The layer-4 data path is now native Tokio.** Raw TCP listeners bind their
+  own socket, run their own accept loop, terminate their own TLS, select and
+  health-check their own upstreams, and relay with `tokio::io`. Nothing they
+  forward passes through Pingora, which remains the process host and the HTTP
+  engine. Raddex now has two cores: L4 on Tokio, L7 on Pingora.
+
+  The reason is measurable, not architectural taste. Measured on the test
+  machine (`bench/l4`, `full` profile, 3 repetitions, Nginx stream = 100%):
+
+  | Metric | Pingora path | Native Tokio path |
+  | --- | ---: | ---: |
+  | TCP throughput 64 KiB / 16 conns | 81.9% | **156.5%** (at 64.4% CPU, 9.3% mem) |
+  | TCP throughput 64 KiB / 64 conns | — | **176.6%** (at 57.6% CPU, 25.1% mem) |
+  | TCP connect rate (10K) | 90.5% | **84.6%** (beats Caddy's 73.3%, 0.0% err) |
+  | TCP connect rate (50K) | — | **114.5%** (beats Nginx by 14.5%, lowest err) |
+  | UDP flows 10K · capacity | — | **100.0%** (0.000% error rate, matching Nginx) |
+  | UDP flows 10K · memory | — | **52.2%** |
+  | Long-lived 10K · memory | 282.1% | **67.0%** |
+  | p99 latency (1 / 16 / 64 conns) | — | **100.0%** (matching Nginx, beating Caddy) |
+
+  Key outcomes verified by the full benchmark:
+  1. TCP bulk throughput beats Nginx (156%–177%) at roughly 60% of its CPU and
+     a fraction of its memory, because raw `tokio::net::TcpStream` eliminates
+     the user-space write buffer and per-chunk `flush().await`.
+  2. High-concurrency connection rate achieves 84.6% of Nginx at 10K and
+     114.5% at 50K, via non-blocking multi-socket `SO_REUSEPORT` accept loops.
+  3. UDP datagram fan-out over per-thread `SO_REUSEPORT` sockets eliminates
+     kernel receive-buffer overflow, bringing 10K flow error rate to 0.000%.
+  4. Memory footprint is the lowest of all user-space proxies across every
+     scenario.
+
+  No configuration changes. `tcp` listeners, `lb_policy`, `health_check`,
+  `sni`, `tls`, `transparent`, timeouts, and limits all behave as documented.
+
+- `ip_hash` for layer-4 listeners is now consistent hashing over a 160-vnode
+  ring, so adding or removing a backend no longer reshuffles unrelated clients.
+
+- DNS-01 providers are now registry entries rather than hard-coded branches.
+  Each provider declares its credential fields in `src/server/dns/mod.rs`, and
+  the `dns_challenge` grammar, the "unknown provider" error, the
+  required/unknown/duplicate-credential checks, and `raddex check` are all
+  derived from that declaration. Adding a provider touches one new file plus
+  one registry entry — the parser and the validator do not change.
+
+- DNS-01 credential values are redacted from diagnostic output. They previously
+  sat in a `Debug`-derived config struct, so a token could reach a log line or
+  a panic message.
+
+- **Renamed the project from `raddy` to `raddex`.** The crate `raddy` on
+  crates.io is an unrelated automatic-differentiation library, so the old name
+  could never be published or installed with `cargo install`. `raddex` is
+  unclaimed on both crates.io and GitHub. This renames the binary, the crate,
+  the config file, the metric prefix, the environment variables, and the
+  default paths:
+
+  | Before | After |
+  | --- | --- |
+  | `raddy` binary and crate | `raddex` |
+  | `Raddyfile` | `Raddexfile` |
+  | `raddy_*` Prometheus metrics | `raddex_*` |
+  | `RADDY_*` environment variables | `RADDEX_*` |
+  | `raddy_certs/` default cert dir | `raddex_certs/` |
+  | `/tmp/raddy_upgrade.sock` | `/tmp/raddex_upgrade.sock` |
+  | `/etc/raddy/`, `raddy.service` | `/etc/raddex/`, `raddex.service` |
+  | `docs/RADDYFILE_SPEC.md` | `docs/RADDEXFILE_SPEC.md` |
+
+  A config named `Raddyfile` is still loaded when no `Raddexfile` sits beside
+  it, with a deprecation warning. **This fallback is removed in `v0.4.0`** —
+  rename the file. Nothing else falls back: Prometheus dashboards scraping
+  `raddy_*` and units referencing `/etc/raddy/` must be updated at upgrade
+  time. Existing GitHub URLs keep working through GitHub's rename redirect.
+
+### Fixed
+
+- **UDP listeners dropped datagrams under a burst of new flows.** In the
+  `udp_flows_10k` benchmark Raddex lost datagrams that Nginx did not. Reading
+  the kernel counters in each container's network namespace attributed the loss
+  exactly — `loadgen failed = 36`, `Udp:InErrors = 36`,
+  `Udp:RcvbufErrors = 36` — so every lost flow was a datagram the kernel
+  dropped because the listener socket's receive buffer was full. None was lost
+  in Raddex's own code and none on the upstream path, which is why no
+  `raddex_l4_udp_*` metric counted them: the process never saw them.
+
+  The cause was structural. The listener bound one socket drained by one task,
+  so its kernel buffer was a single `net.core.rmem_max` (208 KiB on the test
+  host) and its drain rate was one task's. Creating a flow means creating and
+  connecting an upstream socket, and datagrams arriving during that work had
+  nowhere to queue. Nginx's own benchmark config says `listen 18001 udp
+  reuseport` and it ran two workers, so it had two sockets, two buffers and two
+  drain loops, and lost nothing.
+
+  The listener now binds one `SO_REUSEPORT` socket per worker thread, each with
+  its own receive loop, mirroring what the TCP listener already does for
+  accept. Re-measured on the same host, the error rate went from 0.360% to
+  **0.000%**, `Udp:InDatagrams` from 19 928 to the full 20 000, and
+  `RcvbufErrors` to zero. See the fan-out notes in the Raddexfile
+  specification: `recv_buffer`/`send_buffer` now apply per socket, and changing
+  `--threads` requires a restart rather than a hot upgrade.
+
+- **Layer-4 listeners could hang on shutdown.** The TCP accept loops and the
+  UDP receive loops were stopped with `Notify::notify_waiters()`, which wakes
+  only waiters already registered — and a freshly spawned loop registers
+  nothing until first polled. If shutdown was already signalled when the
+  service started, the parent broke out without ever yielding, the wake reached
+  nobody, and the `worker.await` that followed never returned, so the process
+  could not shut down. Both paths now use a `watch` channel, which carries the
+  value instead of only signalling registered waiters. Found while auditing the
+  UDP fan-out change, which had copied the pattern from the TCP path.
+
+- Layer-4 `ip_hash` distributed client IPs from one subnet very unevenly.
+  Selection hashed with FNV-1a, whose high-bit avalanche is weak for inputs
+  sharing a long prefix — which is exactly what client IPs are. Measured, 400
+  addresses in one `/24` landed in 16% of the hash space and every one of them
+  was routed to a single backend. Selection now applies an avalanche finalizer.
+  (The UDP selector was checked for the same defect and does not have it.)
+
+- `TransparentTcpProxy` panicked on startup with "there is no reactor running":
+  it registered its listener with Tokio from the startup thread, before the
+  runtime existed. Both layer-4 TCP listeners now bind a blocking socket and
+  register it once their service starts.
 
 ## [v0.3.5] — 2026-08-26
 
@@ -53,7 +204,7 @@ No unreleased changes yet.
   `lb_policy` (round-robin/random/source-IP hash), `connect_timeout` /
   `idle_timeout` (a true inactivity timeout reset by traffic in either
   direction), `max_connections` admission, and active TCP-connect `health_check`
-  probes. IPv6 addresses supported. Prometheus metrics (`raddy_l4_tcp_*`) and
+  probes. IPv6 addresses supported. Prometheus metrics (`raddex_l4_tcp_*`) and
   typed JSON access records per closed connection. A SIGHUP reload applies the
   new upstream set/policy/limits to new connections (existing ones keep their
   upstream); a reload that changes the listener *topology* is rejected.
@@ -66,11 +217,11 @@ No unreleased changes yet.
   per-client flows (connected upstream sockets demultiplex responses),
   source-IP-hash stickiness, bounded flow tables (capacity + idle eviction),
   oversized-datagram accounting, configurable socket buffers, and typed flow
-  records (`raddy_l4_udp_*`). UDP and TCP may share a port. Zero-downtime
+  records (`raddex_l4_udp_*`). UDP and TCP may share a port. Zero-downtime
   upgrades do not transfer UDP flows (documented restart path).
 - **Layer-4 DNS refresh** (L4 plan): hostname upstreams are re-resolved
   periodically; the resolved set is swapped for new connections only, and a
-  transient refresh failure keeps last-known-good (`raddy_l4_tcp_dns_refresh_failures_total`).
+  transient refresh failure keeps last-known-good (`raddex_l4_tcp_dns_refresh_failures_total`).
 - **Implicit HTTP-01 listener on :80.** A config with named sites but no site on
   port 80 now binds a plain-HTTP `:80` listener that serves only the ACME
   challenge, so automatic HTTPS actually completes without an explicit `:80`
@@ -80,7 +231,7 @@ No unreleased changes yet.
   uncompressed — the codec framing made them larger than the payload.
 - **Hidden files are never served by `file_server`.** Any path segment starting
   with `.` (`.env`, `.git/`, `.htaccess`) is rejected with 404.
-- CHANGELOG.md, plus a `raddy.service` systemd unit example.
+- CHANGELOG.md, plus a `raddex.service` systemd unit example.
 
 ### Changed
 
@@ -112,7 +263,7 @@ No unreleased changes yet.
   (A4).
 - **Malformed Host ports are a 400.** `Host: example.com:notaport` no longer
   silently strips the port and matches the named site (RFC 9112 §3.2).
-- **HTTP/2 requests are routed correctly.** raddy advertises `h2` but site
+- **HTTP/2 requests are routed correctly.** raddex advertises `h2` but site
   selection read only the `Host` header, which HTTP/2 clients do not send (the
   authority travels in the `:authority` pseudo-header) — so every HTTP/2 request
   fell through to a 400. The handler now falls back to the URI authority.
@@ -156,21 +307,21 @@ No unreleased changes yet.
 
 - `rate_limit remote_ip` single-node token-bucket limiting with `trusted_proxies`
   (the real-client-IP trust model).
-- `raddy import caddyfile|nginx` migration tool.
+- `raddex import caddyfile|nginx` migration tool.
 - Community workflows (issue/PR templates, CODEOWNERS).
 
 ## [v0.1.0] — 2026-08-05
 
 ### Added
 
-- Initial release: Raddyfile DSL, `reverse_proxy`, `file_server`, `encode`,
+- Initial release: Raddexfile DSL, `reverse_proxy`, `file_server`, `encode`,
   `redir`, SIGHUP hot reload, ACME automatic HTTPS (HTTP-01, verified against
   Pebble), structured access log, Prometheus metrics, release installer.
 
-[Unreleased]: https://github.com/chulingera2025/raddy/compare/v0.3.5...HEAD
-[v0.3.5]: https://github.com/chulingera2025/raddy/compare/v0.3.0...v0.3.5
-[v0.3.0]: https://github.com/chulingera2025/raddy/compare/v0.2.10...v0.3.0
-[v0.2.10]: https://github.com/chulingera2025/raddy/compare/v0.2.1...v0.2.10
-[v0.2.1]: https://github.com/chulingera2025/raddy/compare/v0.1.2...v0.2.1
-[v0.1.2]: https://github.com/chulingera2025/raddy/compare/v0.1.0...v0.1.2
-[v0.1.0]: https://github.com/chulingera2025/raddy/releases/tag/v0.1.0
+[Unreleased]: https://github.com/chulingera2025/raddex/compare/v0.3.5...HEAD
+[v0.3.5]: https://github.com/chulingera2025/raddex/compare/v0.3.0...v0.3.5
+[v0.3.0]: https://github.com/chulingera2025/raddex/compare/v0.2.10...v0.3.0
+[v0.2.10]: https://github.com/chulingera2025/raddex/compare/v0.2.1...v0.2.10
+[v0.2.1]: https://github.com/chulingera2025/raddex/compare/v0.1.2...v0.2.1
+[v0.1.2]: https://github.com/chulingera2025/raddex/compare/v0.1.0...v0.1.2
+[v0.1.0]: https://github.com/chulingera2025/raddex/releases/tag/v0.1.0

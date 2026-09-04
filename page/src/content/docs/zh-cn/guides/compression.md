@@ -3,12 +3,12 @@ title: 压缩
 description: 用 gzip、zstd 与 Brotli 压缩响应。
 ---
 
-`encode` 指令在响应离开 raddy 之前压缩它。它支持三种算法——**gzip**、
+`encode` 指令在响应离开 raddex 之前压缩它。它支持三种算法——**gzip**、
 **zstd** 与 **Brotli**(`br`)——并同时作用于代理响应与静态文件。
 
 ## 工作原理
 
-`encode` 按**优先级顺序**接受算法。raddy 对照客户端的 `Accept-Encoding` 头
+`encode` 按**优先级顺序**接受算法。raddex 对照客户端的 `Accept-Encoding` 头
 协商,使用客户端也支持的第一个算法:
 
 ```caddyfile

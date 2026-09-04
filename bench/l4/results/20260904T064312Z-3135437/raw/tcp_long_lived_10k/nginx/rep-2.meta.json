@@ -1,0 +1,1 @@
+{"scenario_id":"tcp_long_lived_10k","title":"TCP long-lived connections / 10K","kind":"tcp_long_lived","target":"nginx","transport":"tcp","connections":10000,"payload_bytes":1,"repetition":2,"exit_code":0,"connect_timeout_ms":5000}

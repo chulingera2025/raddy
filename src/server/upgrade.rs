@@ -11,24 +11,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-downtime binary upgrade orchestration (`raddy upgrade`, M7, ADR-008).
+//! Zero-downtime binary upgrade orchestration (`raddex upgrade`, M7, ADR-008).
 //!
 //! Pingora's graceful-upgrade mechanism hands the running instance's listening
 //! file descriptors to a replacement process over a Unix socket: the
-//! replacement (`raddy run -u`) binds the upgrade socket and waits; on SIGQUIT
+//! replacement (`raddex run -u`) binds the upgrade socket and waits; on SIGQUIT
 //! the old process sends its fds over the socket, waits a short takeover
 //! window, then drains in-flight requests and exits.
 //!
-//! `raddy upgrade` is the operator-facing driver — it is executed with the
+//! `raddex upgrade` is the operator-facing driver — it is executed with the
 //! **new** binary, and orchestrates the whole dance: locate the running
 //! instance (pidfile), pre-flight the new binary against the same config
-//! (`raddy run -t`, which validates and exits before binding anything), spawn
+//! (`raddex run -t`, which validates and exits before binding anything), spawn
 //! the replacement in `-u` mode, wait for it to be listening on the upgrade
 //! socket, then SIGQUIT the old process. Any failure aborts before the running
 //! instance is disturbed.
 
 use crate::config::ast::CompiledConfig;
 use crate::config::snapshot;
+use crate::layer4::tcp::TcpListenerService;
 use crate::layer4::udp::UdpProxy;
 use crate::server::startup::RunOptions;
 use std::path::{Path, PathBuf};
@@ -50,16 +51,16 @@ const SOCKET_STABILIZE: Duration = Duration::from_millis(500);
 /// pidfile.
 ///
 /// On success the replacement is serving on the inherited listeners and the old
-/// process has exited; `raddy upgrade` itself then returns.
+/// process has exited; `raddex upgrade` itself then returns.
 pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     let pidfile = opts
         .pidfile
         .as_ref()
-        .ok_or("--pidfile is required to locate the running raddy instance")?;
+        .ok_or("--pidfile is required to locate the running raddex instance")?;
     let old_pid = read_pid(pidfile)?;
-    if !process_alive(old_pid) || !is_raddy_process(old_pid) {
+    if !process_alive(old_pid) || !is_raddex_process(old_pid) {
         return Err(format!(
-            "no running raddy instance: pidfile {} refers to pid {old_pid}, which is not a running raddy process",
+            "no running raddex instance: pidfile {} refers to pid {old_pid}, which is not a running raddex process",
             pidfile.display()
         ));
     }
@@ -96,7 +97,7 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
 
     // Pre-flight: the *new* binary must boot against the same config (and
     // construct the entire server) before the running instance is disturbed.
-    eprintln!("raddy: pre-flight check of the new binary");
+    eprintln!("raddex: pre-flight check of the new binary");
     let status = Command::new(&exe)
         .args(server_args("run", &["-t"], config_path, opts))
         .status()
@@ -112,31 +113,33 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
     // only ever observes the replacement's fresh socket.
     let _ = std::fs::remove_file(&opts.upgrade_sock);
     cleanup_udp_handoff_files(&opts.upgrade_sock);
+    cleanup_l4_handoff_files(&opts.upgrade_sock, ".tcp.");
 
     eprintln!(
-        "raddy: spawning replacement {} (waiting on {})",
+        "raddex: spawning replacement {} (waiting on {})",
         exe.display(),
         opts.upgrade_sock
     );
-    // The replacement is spawned detached and outlives `raddy upgrade`; it
+    // The replacement is spawned detached and outlives `raddex upgrade`; it
     // takes over the running instance's listeners.
     let _ = Command::new(&exe)
         .args(server_args("run", &["-u"], config_path, opts))
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| format!("failed to spawn replacement raddy: {e}"))?;
+        .map_err(|e| format!("failed to spawn replacement raddex: {e}"))?;
 
     // The replacement binds the upgrade socket during bootstrap and then waits
     // for fds; signal the old process only once it is listening.
     wait_for_socket(&opts.upgrade_sock, SOCKET_WAIT_TIMEOUT)?;
     thread::sleep(SOCKET_STABILIZE);
 
-    eprintln!("raddy: signaling running instance (pid {old_pid}) with SIGQUIT");
+    eprintln!("raddex: signaling running instance (pid {old_pid}) with SIGQUIT");
     signal_quit(old_pid)?;
 
     wait_for_exit(old_pid, OLD_PROCESS_EXIT_TIMEOUT)?;
     verify_udp_handoffs(&snapshot, &opts.upgrade_sock)?;
+    verify_tcp_handoffs(&snapshot, &opts.upgrade_sock)?;
 
     // Confirm the replacement actually took over: the pidfile must now name a
     // different, live process. Without this check a race where the old process
@@ -149,7 +152,7 @@ pub fn upgrade(config_path: &Path, opts: &RunOptions) -> Result<(), String> {
              check the replacement's logs"
         ));
     }
-    eprintln!("raddy: upgrade complete (now pid {new_pid})");
+    eprintln!("raddex: upgrade complete (now pid {new_pid})");
     Ok(())
 }
 
@@ -188,6 +191,73 @@ pub(crate) fn write_topology_state(pidfile: &Path, config: &CompiledConfig) -> R
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("failed to protect topology state {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Remove layer-4 handoff artifacts left by a previous interrupted upgrade.
+///
+/// `infix` selects the transport (`".udp."` or `".tcp."`). A stale status file
+/// would otherwise make the next upgrade believe a handoff already succeeded.
+fn cleanup_l4_handoff_files(upgrade_sock: &str, infix: &str) {
+    let Some(parent) = Path::new(upgrade_sock).parent() else {
+        return;
+    };
+    let Some(prefix) = Path::new(upgrade_sock).file_name() else {
+        return;
+    };
+    let prefix = format!("{}{infix}", prefix.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Verify that every configured raw-TCP listener completed its handoff.
+///
+/// The L4 TCP data path binds its own socket, so — unlike the HTTP listeners —
+/// Pingora does not transfer it. A listener that never publishes `ok` means the
+/// replacement did not inherit the port, so the upgrade must not be treated as
+/// successful.
+fn verify_tcp_handoffs(config: &CompiledConfig, upgrade_sock: &str) -> Result<(), String> {
+    let listeners: Vec<String> = config
+        .layer4
+        .iter()
+        .filter_map(|listener| match listener {
+            crate::config::ast::Layer4Listener::Tcp(tcp) if !tcp.transparent => {
+                Some(tcp.listen.display())
+            }
+            _ => None,
+        })
+        .collect();
+    if listeners.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for listener in listeners {
+        let path = TcpListenerService::status_path_for(upgrade_sock, &listener);
+        let status = loop {
+            if let Ok(status) = std::fs::read_to_string(&path) {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "TCP listener {listener} did not publish an upgrade status; use a normal restart"
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        if !status.trim().eq("ok") {
+            return Err(format!(
+                "TCP listener {listener} handoff failed: {}; use a normal restart",
+                status.trim()
+            ));
+        }
     }
     Ok(())
 }
@@ -249,7 +319,7 @@ fn verify_udp_handoffs(config: &CompiledConfig, upgrade_sock: &str) -> Result<()
     Ok(())
 }
 
-/// Build the `raddy run` argument list for a sub-invocation of this same binary
+/// Build the `raddex run` argument list for a sub-invocation of this same binary
 /// (`flags` carries the mode flag, `-t` for the pre-flight or `-u` for the
 /// replacement). Paths are absolutized so the child resolves them identically
 /// regardless of the current working directory.
@@ -340,19 +410,19 @@ fn process_alive(pid: i32) -> bool {
     }
 }
 
-/// Whether a process is a raddy instance, checked by its process name so an
+/// Whether a process is a raddex instance, checked by its process name so an
 /// upgrade never SIGQUITs an unrelated process that a stale or reused PID may
 /// point at.
-fn is_raddy_process(pid: i32) -> bool {
+fn is_raddex_process(pid: i32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
-        .map(|comm| comm.trim() == "raddy")
+        .map(|comm| comm.trim() == "raddex")
         .unwrap_or(false)
 }
 
 /// Send SIGQUIT — pingora's graceful-upgrade signal (ADR-008) — to `pid`.
 fn signal_quit(pid: i32) -> Result<(), String> {
-    // SAFETY: `pid` is the running raddy instance we verified alive.
+    // SAFETY: `pid` is the running raddex instance we verified alive.
     if unsafe { libc::kill(pid, libc::SIGQUIT) } != 0 {
         Err(format!(
             "failed to signal SIGQUIT to pid {pid}: {}",
@@ -398,10 +468,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_raddy_process_rejects_non_raddy() {
-        // The test binary is not named `raddy`, so the guard must refuse to
+    fn is_raddex_process_rejects_non_raddex() {
+        // The test binary is not named `raddex`, so the guard must refuse to
         // signal it (this is the "don't SIGQUIT an unrelated process" check).
-        assert!(!is_raddy_process(std::process::id() as i32));
-        assert!(!is_raddy_process(-1));
+        assert!(!is_raddex_process(std::process::id() as i32));
+        assert!(!is_raddex_process(-1));
     }
 }

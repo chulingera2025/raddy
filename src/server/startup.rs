@@ -13,7 +13,7 @@
 
 //! Startup sequence: parse → validate → snapshot → derive listeners → serve.
 //!
-//! The Raddyfile is fully parsed and validated before any listener is bound
+//! The Raddexfile is fully parsed and validated before any listener is bound
 //! (Q6): an invalid config returns an error and the process exits non-zero
 //! without serving. The listener set is derived from the snapshot and fixed for
 //! the process lifetime (ADR-010). Port 443 is served over TLS with SNI
@@ -31,7 +31,8 @@ use crate::config::ast::{
     TlsSource,
 };
 use crate::config::snapshot::{self, ConfigStore};
-use crate::layer4::tcp::{TcpAccessRecord, TcpProxyApp, TransparentTcpProxy};
+use crate::layer4::tcp::{TcpAccessRecord, TcpListenerService, TransparentTcpProxy};
+use crate::layer4::tls_accept::TlsAcceptor;
 use crate::layer4::udp::{UdpFlowRecord, UdpProxy};
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::lb::{spawn_health_check_runner, LoadBalancerPool};
@@ -40,8 +41,7 @@ use crate::server::issuance_queue::{EnqueueOutcome, RequestKind};
 use crate::server::reload;
 use crate::server::upgrade;
 use crate::tls::{
-    cert_store_key, configure_http_alpn, CertStore, SniCallback, StaticCertCallback,
-    TlsAlpnChallengeStore,
+    cert_store_key, configure_http_alpn, CertStore, SniCallback, TlsAlpnChallengeStore,
 };
 use pingora::listeners::{tls::TlsSettings, TcpSocketOptions, TlsAcceptCallbacks};
 use pingora::prelude::*;
@@ -71,14 +71,15 @@ pub struct RunOptions {
     /// instance's listening fds over the upgrade socket (ADR-008).
     pub upgrade: bool,
     /// Validate the config and construction, then exit 0/1 without binding any
-    /// listener (used as the `raddy upgrade` pre-flight).
+    /// listener (used as the `raddex upgrade` pre-flight).
     pub test: bool,
-    /// Write this process's PID here so `raddy upgrade` can find it (none =
-    /// don't write; `raddy upgrade` then requires an explicit `--pidfile`).
+    /// Write this process's PID here so `raddex upgrade` can find it (none =
+    /// don't write; `raddex upgrade` then requires an explicit `--pidfile`).
     pub pidfile: Option<PathBuf>,
     /// Unix socket both sides use to hand over listening fds (must match).
     pub upgrade_sock: String,
-    /// Number of Pingora worker threads allocated to the HTTP service.
+    /// Worker threads per listener runtime: the HTTP service and each
+    /// layer-4 TCP/UDP listener get this many.
     pub threads: usize,
 }
 
@@ -101,7 +102,7 @@ impl Default for RunOptions {
 
 /// Boot the proxy server and run until a shutdown signal.
 ///
-/// Returns an error if the Raddyfile is invalid or the server cannot be
+/// Returns an error if the Raddexfile is invalid or the server cannot be
 /// constructed; the caller reports it and exits non-zero.
 pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> {
     // The ACME/DNS-01 HTTP clients use rustls, which 0.23 refuses to
@@ -173,7 +174,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
         .count();
     let issuance_queue = acme.spawn_issuance_worker(configured_hosts + ISSUANCE_QUEUE_CAPACITY + 1);
     // Renewal: periodically re-issue certificates inside the renewal window.
-    // The interval is overridable via RADDY_RENEW_INTERVAL_SECS (a test hook so
+    // The interval is overridable via RADDEX_RENEW_INTERVAL_SECS (a test hook so
     // Pebble's short-lived certificates can be renewed quickly).
     acme.spawn_renewal_scheduler(issuance_queue.clone(), renew_interval());
 
@@ -273,7 +274,7 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
     );
     server.bootstrap();
 
-    // Record our PID for `raddy upgrade` once the server is actually going to
+    // Record our PID for `raddex upgrade` once the server is actually going to
     // serve (bootstrap exits the process in test mode, so a throwaway check
     // never clobbers the running instance's pidfile).
     if !opts.test {
@@ -335,47 +336,63 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                 });
                 if tcp.transparent {
                     let transparent = TransparentTcpProxy::new(tcp, config_store.clone(), sink)?;
-                    server.add_service(background_service(
+                    add_layer4_service(
+                        &mut server,
                         &format!("transparent-tcp/{}", tcp.listen.display()),
                         transparent,
-                    ));
+                        opts.threads,
+                    );
                     tracing::info!("listening (transparent TCP) on {}", tcp.listen.display());
                     continue;
                 }
-                let app = TcpProxyApp::new(tcp, config_store.clone(), sink)?;
-                let mut service = Service::new(format!("tcp/{}", tcp.listen.display()), app);
-                if let Some(tls) = &tcp.tls {
-                    let cert = match &tls.source {
-                        TlsSource::Internal => generate_internal_cert("localhost")?,
-                        TlsSource::Static {
-                            cert_file,
-                            key_file,
-                        } => {
-                            let cert_pem = std::fs::read_to_string(cert_file).map_err(|e| {
-                                format!("failed to read certificate {cert_file}: {e}")
-                            })?;
-                            let key_pem = std::fs::read_to_string(key_file)
-                                .map_err(|e| format!("failed to read key {key_file}: {e}"))?;
-                            crate::tls::cert_key_from_pem(&cert_pem, &key_pem)?
-                        }
-                        TlsSource::Acme => {
-                            return Err(
-                                "TCP TLS termination cannot use ACME without a site identity"
-                                    .into(),
-                            )
-                        }
-                    };
-                    let callbacks =
-                        Box::new(StaticCertCallback::with_options(cert, Some(tls.clone())))
-                            as TlsAcceptCallbacks;
-                    let settings = TlsSettings::with_callbacks(callbacks)?;
-                    service.add_tls_with_settings(&tcp.listen.display(), None, settings);
+                let tls_acceptor = match &tcp.tls {
+                    None => None,
+                    Some(tls) => {
+                        let cert = match &tls.source {
+                            TlsSource::Internal => generate_internal_cert("localhost")?,
+                            TlsSource::Static {
+                                cert_file,
+                                key_file,
+                            } => {
+                                let cert_pem = std::fs::read_to_string(cert_file).map_err(|e| {
+                                    format!("failed to read certificate {cert_file}: {e}")
+                                })?;
+                                let key_pem = std::fs::read_to_string(key_file)
+                                    .map_err(|e| format!("failed to read key {key_file}: {e}"))?;
+                                crate::tls::cert_key_from_pem(&cert_pem, &key_pem)?
+                            }
+                            TlsSource::Acme => {
+                                return Err(
+                                    "TCP TLS termination cannot use ACME without a site identity"
+                                        .into(),
+                                )
+                            }
+                        };
+                        Some(Arc::new(TlsAcceptor::new(&cert, Some(tls))?))
+                    }
+                };
+                let terminates_tls = tls_acceptor.is_some();
+                let service = TcpListenerService::new(
+                    tcp,
+                    config_store.clone(),
+                    sink,
+                    tls_acceptor,
+                    opts.upgrade,
+                    opts.threads,
+                    opts.upgrade_sock.clone(),
+                    Some(server.watch_execution_phase()),
+                )?;
+                add_layer4_service(
+                    &mut server,
+                    &format!("tcp/{}", tcp.listen.display()),
+                    service,
+                    opts.threads,
+                );
+                if terminates_tls {
                     tracing::info!("listening (TLS-terminated TCP) on {}", tcp.listen.display());
                 } else {
-                    service.add_tcp(&tcp.listen.display());
                     tracing::info!("listening (raw TCP) on {}", tcp.listen.display());
                 }
-                server.add_service(service);
             }
             Layer4Listener::Udp(udp) => {
                 let sink = l4_access_log.as_ref().map(|log| {
@@ -392,14 +409,17 @@ pub fn run(config_path: &Path, opts: &RunOptions) -> Result<(), Box<dyn Error>> 
                     config_store.clone(),
                     sink,
                     opts.upgrade || opts.test,
+                    opts.threads,
                     opts.upgrade_sock.clone(),
                     udp.listen.display(),
                     Some(server.watch_execution_phase()),
                 )?;
-                server.add_service(background_service(
+                add_layer4_service(
+                    &mut server,
                     &format!("udp/{}", udp.listen.display()),
                     proxy,
-                ));
+                    opts.threads,
+                );
                 tracing::info!("listening (UDP) on {}", udp.listen.display());
             }
         }
@@ -429,10 +449,28 @@ fn ipv6_dual_stack_options() -> TcpSocketOptions {
     options
 }
 
+/// Register a layer-4 listener as a Pingora background service with `threads`
+/// runtime workers.
+///
+/// `background_service()` pins every background service to a single worker
+/// thread and never consults `ServerConf::threads`, so without this the L4
+/// listeners run every accept loop and relay on one core no matter what
+/// `--threads` says. Measured on the L4 benchmark: the TCP connection-rate
+/// scenario ran at half of Nginx's rate with the whole listener on one thread,
+/// while the other worker threads sat idle.
+fn add_layer4_service<S>(server: &mut Server, name: &str, service: S, threads: usize)
+where
+    S: pingora::services::background::BackgroundService + Send + Sync + 'static,
+{
+    let mut service = background_service(name, service);
+    service.threads = Some(threads.max(1));
+    server.add_service(service);
+}
+
 /// The listeners to serve: the configured sites' ports, plus an implicit
 /// plain-HTTP :80 listener when automatic HTTPS needs HTTP-01.
 ///
-/// raddy proves domain control with HTTP-01 on a plain-HTTP listener, so a
+/// raddex proves domain control with HTTP-01 on a plain-HTTP listener, so a
 /// config with named sites but no explicit :80 listener would otherwise be
 /// unreachable by the ACME server and issuance would hang forever (P0). DNS-01
 /// deployments (`dns_challenge`) skip the implicit listener — they chose DNS
@@ -592,7 +630,7 @@ fn load_site_certificates(
 }
 
 /// Generate a self-signed certificate for `host` (the `tls internal` source).
-fn generate_internal_cert(host: &str) -> Result<pingora::utils::tls::CertKey, String> {
+pub(crate) fn generate_internal_cert(host: &str) -> Result<pingora::utils::tls::CertKey, String> {
     let cert = rcgen::generate_simple_self_signed(vec![host.to_string()])
         .map_err(|e| format!("failed to generate internal certificate for {host}: {e}"))?;
     crate::tls::cert_key_from_pem(&cert.cert.pem(), &cert.signing_key.serialize_pem())
@@ -627,7 +665,7 @@ fn global_access_log_format(global: &Option<AccessLogDirective>) -> AccessLogFor
 /// Install the rustls `CryptoProvider` that the ACME/DNS-01 HTTP clients need.
 ///
 /// rustls 0.23 panics on first TLS use when it cannot pick a single backend
-/// from the crate features. Feature unification across raddy's dependencies
+/// from the crate features. Feature unification across raddex's dependencies
 /// enables both `aws-lc-rs` (instant-acme's hyper-rustls) and `ring`
 /// (rustls-platform-verifier), so the provider is chosen and installed
 /// explicitly here — the aws-lc-rs backend, matching instant-acme. Idempotent;
@@ -642,9 +680,9 @@ fn install_rustls_crypto_provider() {
 }
 
 /// The renewal scan interval: hourly by default, overridable via
-/// `RADDY_RENEW_INTERVAL_SECS` (a test hook for Pebble's short-lived certs).
+/// `RADDEX_RENEW_INTERVAL_SECS` (a test hook for Pebble's short-lived certs).
 fn renew_interval() -> std::time::Duration {
-    std::env::var("RADDY_RENEW_INTERVAL_SECS")
+    std::env::var("RADDEX_RENEW_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(std::time::Duration::from_secs)
@@ -652,7 +690,7 @@ fn renew_interval() -> std::time::Duration {
 }
 
 /// The tracing filter level to use when `RUST_LOG` is unset: the configured
-/// global `log_level`, or `info` (the default) when the Raddyfile does not set
+/// global `log_level`, or `info` (the default) when the Raddexfile does not set
 /// one.
 fn default_log_filter(log_level: Option<LogLevel>) -> &'static str {
     match log_level {
@@ -691,11 +729,11 @@ mod tests {
         assert_eq!(default_log_filter(None), "info");
     }
 
-    /// Build a snapshot from an in-memory Raddyfile (temp file). `tag`
+    /// Build a snapshot from an in-memory Raddexfile (temp file). `tag`
     /// distinguishes parallel tests so they never share a temp filename.
     fn build_snapshot(tag: &str, config: &str) -> crate::config::ast::CompiledConfig {
         let path = std::env::temp_dir().join(format!(
-            "raddy_startup_{tag}_{}.Raddyfile",
+            "raddex_startup_{tag}_{}.Raddexfile",
             std::process::id()
         ));
         std::fs::write(&path, config).unwrap();

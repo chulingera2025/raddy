@@ -1,0 +1,24 @@
+# The router renders these rules with the runtime origin address and interface
+# names. Keeping the policy here documents the only traffic allowed by the NAT
+# reference: TCP/19000 and UDP/19001 on the origin network.
+table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        <client-interface> tcp dport 18000 dnat to <origin-ip>:19000
+        <client-interface> udp dport 18001 dnat to <origin-ip>:19001
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        <origin-interface> ip daddr <origin-ip> masquerade
+    }
+}
+
+table inet filter {
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state established,related accept
+        <client-interface> <origin-interface> ip daddr <origin-ip> tcp dport 19000 accept
+        <client-interface> <origin-interface> ip daddr <origin-ip> udp dport 19001 accept
+    }
+}

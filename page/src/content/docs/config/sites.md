@@ -3,7 +3,7 @@ title: Sites, ports, and HTTPS
 description: Understand site keys, listener selection, catch-alls, multi-domain blocks, wildcard matching, and automatic HTTPS.
 ---
 
-Raddy first selects a listener, then selects a site on that listener. Site keys
+Raddex first selects a listener, then selects a site on that listener. Site keys
 are not global routes: the same hostname can be configured differently on
 different ports.
 
@@ -40,7 +40,7 @@ binds are rejected before startup.
 
 ## Site selection
 
-On plain HTTP, Raddy normalizes the Host header by removing the port and
+On plain HTTP, Raddex normalizes the Host header by removing the port and
 trailing dot and lowercasing it. On TLS, the SNI name is used for certificate
 and site selection.
 
@@ -70,7 +70,7 @@ matching still consider each concrete hostname.
 
 ## Automatic HTTPS
 
-For a named site on port 443, Raddy can obtain and renew an ACME certificate:
+For a named site on port 443, Raddex can obtain and renew an ACME certificate:
 
 1. The configured challenge method proves domain control.
 2. The certificate is selected by SNI for the incoming TLS connection.
@@ -98,7 +98,7 @@ the host firewall and upstream address family on the target machine.
 
 ## Request routing after site selection
 
-Once a site is selected, its directives follow the Raddyfile execution model.
+Once a site is selected, its directives follow the Raddexfile execution model.
 Read [Concepts](../), [Routing and matchers](../../guides/routing/), and the
 [Directive reference](../directives/) for terminal, modifier, and guard
 semantics.

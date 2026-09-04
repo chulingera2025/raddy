@@ -6,7 +6,7 @@ description: Proxy raw TCP and UDP with explicit routing, limits, timeouts, TLS 
 Layer 4 listeners are top-level `tcp` and `udp` blocks. They are peers of HTTP
 site blocks and do not enter the HTTP routing pipeline.
 
-| Mode | Raddy does | Raddy does not do |
+| Mode | Raddex does | Raddex does not do |
 | --- | --- | --- |
 | Raw TCP | Connects and relays bytes | Parse HTTP or terminate TLS by default |
 | SNI passthrough | Inspects a bounded ClientHello prefix and routes it | Decrypt or modify the TLS stream |
@@ -34,8 +34,14 @@ tcp :3306 {
 - `lb_policy` supports `round_robin`, `random`, and `ip_hash`.
 - `connect_timeout` limits one upstream connection.
 - `idle_timeout` measures inactivity in either direction, not connection age.
-- `max_connections` bounds concurrent TCP connections.
-- `health_check` uses active TCP connects and skips unhealthy upstreams.
+- `max_connections` bounds concurrent TCP connections. The slot is taken when
+  the connection is accepted, so on a TLS-terminating listener it also bounds
+  connections still completing their handshake.
+- `health_check` uses active TCP connects and skips unhealthy upstreams. A
+  backend leaves the rotation only after `consecutive_failures` probes fail and
+  rejoins only after `consecutive_successes` succeed, so one blip does not flap
+  it. `ip_hash` uses consistent hashing, so adding or removing a backend does
+  not reshuffle unrelated clients.
 
 Changing upstreams, policies, limits, or timeouts applies to new connections;
 existing connections keep their selected upstream. A listener bind change is a
@@ -71,7 +77,7 @@ tcp :8443 {
 }
 ```
 
-Use `tls internal` or `tls <cert-file> <key-file>`. Raddy completes the TLS
+Use `tls internal` or `tls <cert-file> <key-file>`. Raddex completes the TLS
 handshake and passes the decrypted byte stream to the raw relay. This mode uses
 the ordinary `to` upstream set and cannot be combined with SNI passthrough or
 transparent mode.
@@ -94,7 +100,7 @@ client address on the outbound connection. Deployment also needs:
 - policy routing for marked packets;
 - a route to the selected upstream.
 
-Because this mode owns a custom listener, `raddy upgrade` is not available for
+Because this mode owns a custom listener, `raddex upgrade` is not available for
 transparent TCP. Use a normal restart after validating the new configuration.
 
 ## UDP flows
@@ -123,13 +129,24 @@ flow identity still includes the source port.
 - TCP and UDP may use the same address and port because they are different
   transports.
 
-On Linux, a zero-downtime upgrade transfers the UDP listener, connected
-upstream flow sockets, and bounded flow metadata. If handoff verification fails,
-the upgrade fails closed rather than claiming a lossless transition.
+On Linux, a zero-downtime upgrade transfers layer-4 listening sockets
+explicitly. Raw TCP listeners hand over their listening descriptors; UDP hands
+over the listener, its connected upstream flow sockets, and bounded flow
+metadata. `raddex upgrade` does not report success until every configured
+layer-4 listener has confirmed its transfer, so a failed handoff fails the
+upgrade rather than leaving a port silently unserved.
 
 ## QUIC boundary
 
 UDP forwarding can carry QUIC datagrams, but it is only passthrough. Pingora
-0.8.1 and Raddy do not terminate QUIC, route HTTP/3 requests, or manage QUIC
+0.8.1 and Raddex do not terminate QUIC, route HTTP/3 requests, or manage QUIC
 connection migration. Use a dedicated QUIC/HTTP/3 service when those functions
 are required.
+
+## Performance
+
+The layer-4 core is built directly on native Tokio rather than Pingora,
+providing high throughput (156%–177% of Nginx stream on bulk TCP) and low
+memory consumption. See the [Performance Comparison](../../performance/#layer-4-forwarding-benchmark)
+for the full benchmark matrix and normalized metrics.
+

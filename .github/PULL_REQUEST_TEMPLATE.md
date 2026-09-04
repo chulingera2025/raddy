@@ -12,10 +12,10 @@ Closes #
 <!-- What changed and why. Reference the ROADMAP milestone / acceptance criterion
      this satisfies where applicable. -->
 
-## Raddyfile spec
+## Raddexfile spec
 
-<!-- If this PR touches config grammar: the Raddyfile is a public interface —
-     the spec change in docs/RADDYFILE_SPEC.md MUST land in the same PR
+<!-- If this PR touches config grammar: the Raddexfile is a public interface —
+     the spec change in docs/RADDEXFILE_SPEC.md MUST land in the same PR
      (spec-first red line). Link the section. -->
 
 - [ ] No grammar change
@@ -23,7 +23,7 @@ Closes #
 
 ## Test coverage
 
-<!-- Unit + integration tests. Parser changes MUST include new Raddyfile cases
+<!-- Unit + integration tests. Parser changes MUST include new Raddexfile cases
      AND fuzz coverage (`cargo +nightly fuzz run parse_config`). -->
 
 - [ ] `cargo test --all-targets`

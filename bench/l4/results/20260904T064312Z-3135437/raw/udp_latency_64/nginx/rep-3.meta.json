@@ -1,0 +1,1 @@
+{"scenario_id":"udp_latency_64","title":"UDP p99 latency / 64 B datagrams","kind":"p99_latency","target":"nginx","transport":"udp","connections":1,"payload_bytes":64,"repetition":3,"exit_code":0,"connect_timeout_ms":5000}

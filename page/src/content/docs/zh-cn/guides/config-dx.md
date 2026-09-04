@@ -3,12 +3,12 @@ title: 配置复用
 description: 跨文件拆分配置、复用片段,并在解析时注入环境变量。
 ---
 
-随着 Raddyfile 增长,三个特性让配置保持可读、可部署:`import` 做多文件包含,
+随着 Raddexfile 增长,三个特性让配置保持可读、可部署:`import` 做多文件包含,
 `(name)` 片段在同一文件内复用,`{$ENV}` 在解析时注入环境变量。
 
 ## 用 `import` 包含其他文件
 
-`import <file>` 在该位置拼入另一个 Raddyfile 的内容。路径相对于导入文件,
+`import <file>` 在该位置拼入另一个 Raddexfile 的内容。路径相对于导入文件,
 导入可以嵌套(有深度限制):
 
 ```caddyfile
@@ -24,7 +24,7 @@ api.example.com {
 ```caddyfile
 # common/proxy-settings.conf
 rate_limit remote_ip 100r/s
-header_up X-Raddy true
+header_up X-Raddex true
 ```
 
 ```caddyfile
@@ -42,7 +42,7 @@ api.example.com {
 ```caddyfile
 (base) {
     rate_limit remote_ip 100r/s
-    header_up X-Raddy true
+    header_up X-Raddex true
 }
 
 api.example.com {
@@ -71,11 +71,11 @@ api.example.com {
 ```
 
 ```bash
-BACKEND_HOST=10.0.0.5 raddy run -c Raddyfile
+BACKEND_HOST=10.0.0.5 raddex run -c Raddexfile
 ```
 
 **缺失**的变量是校验错误,因此引用了写错或未设置变量的配置会让
-`raddy check` 失败,而不是带着错误值启动——部署时的失误在流量之前就被抓住。
+`raddex check` 失败,而不是带着错误值启动——部署时的失误在流量之前就被抓住。
 
 ## 组合使用
 
@@ -95,6 +95,6 @@ api.example.com {
 运行前先校验整体:
 
 ```bash
-API_BACKEND=10.0.0.1 raddy check -c Raddyfile
-API_BACKEND=10.0.0.1 raddy run -c Raddyfile
+API_BACKEND=10.0.0.1 raddex check -c Raddexfile
+API_BACKEND=10.0.0.1 raddex run -c Raddexfile
 ```

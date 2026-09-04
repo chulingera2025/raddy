@@ -1,0 +1,1 @@
+{"scenario_id":"tcp_throughput_64k_1","title":"TCP throughput / 64 KiB / 1 connection","kind":"tcp_throughput","target":"nginx","transport":"tcp","connections":1,"payload_bytes":65536,"repetition":2,"exit_code":0,"connect_timeout_ms":5000}

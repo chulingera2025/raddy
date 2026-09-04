@@ -30,13 +30,13 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
 
 # Directory server certificate for localhost/pebble, signed by the CA.
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-  -keyout certs/localhost.key -out /tmp/raddy_localhost.csr -nodes \
+  -keyout certs/localhost.key -out /tmp/raddex_localhost.csr -nodes \
   -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,DNS:pebble" 2>/dev/null
-openssl x509 -req -in /tmp/raddy_localhost.csr \
+openssl x509 -req -in /tmp/raddex_localhost.csr \
   -CA certs/pebble-ca.pem -CAkey certs/pebble-ca.key -CAcreateserial \
   -out certs/localhost.pem -days 3650 \
   -extfile <(echo "subjectAltName=DNS:localhost,DNS:pebble") 2>/dev/null
-rm -f /tmp/raddy_localhost.csr
+rm -f /tmp/raddex_localhost.csr
 
 # Pebble config (absolute paths; httpPort is where Pebble validates HTTP-01,
 # unused with PEBBLE_VA_ALWAYS_VALID). The "default" profile overrides Pebble's

@@ -20,9 +20,9 @@ assignees: chulingera2025
 
 ## Reproduction
 
-<!-- Minimal steps. Include the exact Raddyfile, the request (curl), and the versions. -->
+<!-- Minimal steps. Include the exact Raddexfile, the request (curl), and the versions. -->
 
-**Raddyfile**
+**Raddexfile**
 ```caddyfile
 
 ```
@@ -33,7 +33,7 @@ assignees: chulingera2025
 ```
 
 **Version / environment**
-- Raddy version or commit: <!-- e.g. dev@<sha> or v0.1.1 -->
+- Raddex version or commit: <!-- e.g. dev@<sha> or v0.1.1 -->
 - OS / arch:
 - Rust toolchain (if building from source):
 
@@ -43,5 +43,5 @@ assignees: chulingera2025
 
 ## Related
 
-<!-- Link the ROADMAP milestone acceptance criterion and/or RADDYFILE_SPEC section this
+<!-- Link the ROADMAP milestone acceptance criterion and/or RADDEXFILE_SPEC section this
      bug touches, if any. -->

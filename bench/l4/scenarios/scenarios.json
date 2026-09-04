@@ -1,0 +1,245 @@
+{
+  "schema_version": 1,
+  "notes": [
+    "The scale scenarios stop at 50K. 50K already separates the targets on",
+    "every axis these scenarios exist to measure — accept-queue drain rate,",
+    "flow-table cost, per-connection memory, and datagram loss under a",
+    "receive-buffer bound — so 100K only bought a longer run, not a different",
+    "verdict. It cost roughly half the wall clock of a full profile and put",
+    "the load generator, not the proxy, at the ephemeral-port and descriptor",
+    "ceiling, which measures the harness rather than the target.",
+    "Raise the ceiling in scripts/collect.py and scripts/preflight.sh before",
+    "reintroducing a larger size."
+  ],
+  "defaults": {
+    "warmup_seconds": 2,
+    "duration_seconds": 10,
+    "repetitions": 3,
+    "connect_timeout_ms": 5000,
+    "stable_error_rate": 0.001
+  },
+  "profiles": {
+    "quick": {
+      "scenario_ids": [
+        "tcp_throughput_64k_16",
+        "udp_throughput_512",
+        "udp_pps_64",
+        "tcp_latency_16",
+        "udp_latency_64",
+        "tcp_connect_rate_10k",
+        "tcp_long_lived_10k",
+        "udp_flows_10k"
+      ],
+      "warmup_seconds": 1,
+      "duration_seconds": 5,
+      "repetitions": 1
+    },
+    "full": {
+      "scenario_ids": "all"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "tcp_throughput_64k_1",
+      "title": "TCP throughput / 64 KiB / 1 connection",
+      "kind": "tcp_throughput",
+      "mode": "tcp-throughput",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 1,
+      "payload_bytes": 65536,
+      "window": 8
+    },
+    {
+      "id": "tcp_throughput_64k_16",
+      "title": "TCP throughput / 64 KiB / 16 connections",
+      "kind": "tcp_throughput",
+      "mode": "tcp-throughput",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 16,
+      "payload_bytes": 65536,
+      "window": 8
+    },
+    {
+      "id": "tcp_throughput_64k_64",
+      "title": "TCP throughput / 64 KiB / 64 connections",
+      "kind": "tcp_throughput",
+      "mode": "tcp-throughput",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 64,
+      "payload_bytes": 65536,
+      "window": 8
+    },
+    {
+      "id": "udp_throughput_64",
+      "title": "UDP throughput / 64 B datagrams",
+      "kind": "udp_throughput",
+      "mode": "udp-throughput",
+      "transport": "udp",
+      "port": 18001,
+      "connections": 1,
+      "payload_bytes": 64,
+      "window": 1,
+      "packets_per_second": 5000
+    },
+    {
+      "id": "udp_throughput_512",
+      "title": "UDP throughput / 512 B datagrams",
+      "kind": "udp_throughput",
+      "mode": "udp-throughput",
+      "transport": "udp",
+      "port": 18001,
+      "connections": 1,
+      "payload_bytes": 512,
+      "window": 1,
+      "packets_per_second": 5000
+    },
+    {
+      "id": "udp_throughput_1400",
+      "title": "UDP throughput / 1400 B datagrams",
+      "kind": "udp_throughput",
+      "mode": "udp-throughput",
+      "transport": "udp",
+      "port": 18001,
+      "connections": 1,
+      "payload_bytes": 1400,
+      "window": 1,
+      "packets_per_second": 5000
+    },
+    {
+      "id": "udp_pps_64",
+      "title": "UDP packets per second / 64 B datagrams",
+      "kind": "udp_pps",
+      "mode": "udp-throughput",
+      "transport": "udp",
+      "port": 18001,
+      "connections": 1,
+      "payload_bytes": 64,
+      "window": 1,
+      "packets_per_second": 10000
+    },
+    {
+      "id": "tcp_latency_1",
+      "title": "TCP p99 latency / 64 B / 1 connection",
+      "kind": "p99_latency",
+      "mode": "tcp-latency",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 1,
+      "payload_bytes": 64,
+      "window": 1
+    },
+    {
+      "id": "tcp_latency_16",
+      "title": "TCP p99 latency / 64 B / 16 connections",
+      "kind": "p99_latency",
+      "mode": "tcp-latency",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 16,
+      "payload_bytes": 64,
+      "window": 1
+    },
+    {
+      "id": "tcp_latency_64",
+      "title": "TCP p99 latency / 64 B / 64 connections",
+      "kind": "p99_latency",
+      "mode": "tcp-latency",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 64,
+      "payload_bytes": 64,
+      "window": 1
+    },
+    {
+      "id": "udp_latency_64",
+      "title": "UDP p99 latency / 64 B datagrams",
+      "kind": "p99_latency",
+      "mode": "udp-latency",
+      "transport": "udp",
+      "port": 18001,
+      "connections": 1,
+      "payload_bytes": 64,
+      "window": 1
+    },
+    {
+      "id": "tcp_connect_rate_10k",
+      "title": "TCP connection rate / 10K connections",
+      "kind": "tcp_connect_rate",
+      "mode": "tcp-connect-rate",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 10000,
+      "payload_bytes": 1,
+      "window": 1,
+      "connect_rate": 5000
+    },
+    {
+      "id": "tcp_connect_rate_50k",
+      "title": "TCP connection rate / 50K connections",
+      "kind": "tcp_connect_rate",
+      "mode": "tcp-connect-rate",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 50000,
+      "payload_bytes": 1,
+      "window": 1,
+      "connect_rate": 10000,
+      "duration_seconds": 15
+    },
+    {
+      "id": "tcp_long_lived_10k",
+      "title": "TCP long-lived connections / 10K",
+      "kind": "tcp_long_lived",
+      "mode": "tcp-connections",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 10000,
+      "payload_bytes": 1,
+      "window": 1,
+      "connect_rate": 5000,
+      "duration_seconds": 30
+    },
+    {
+      "id": "tcp_long_lived_50k",
+      "title": "TCP long-lived connections / 50K",
+      "kind": "tcp_long_lived",
+      "mode": "tcp-connections",
+      "transport": "tcp",
+      "port": 18000,
+      "connections": 50000,
+      "payload_bytes": 1,
+      "window": 1,
+      "connect_rate": 10000,
+      "duration_seconds": 30
+    },
+    {
+      "id": "udp_flows_10k",
+      "title": "UDP flows / 10K clients",
+      "kind": "udp_flows",
+      "mode": "udp-flows",
+      "transport": "udp",
+      "port": 18001,
+      "connections": 10000,
+      "payload_bytes": 64,
+      "window": 1,
+      "connect_rate": 5000,
+      "duration_seconds": 30
+    },
+    {
+      "id": "udp_flows_50k",
+      "title": "UDP flows / 50K clients",
+      "kind": "udp_flows",
+      "mode": "udp-flows",
+      "transport": "udp",
+      "port": 18001,
+      "connections": 50000,
+      "payload_bytes": 64,
+      "window": 1,
+      "connect_rate": 10000,
+      "duration_seconds": 30
+    }
+  ]
+}

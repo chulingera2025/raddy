@@ -53,8 +53,8 @@ What each piece does:
 ## Run it
 
 ```bash
-raddy check -c Raddyfile
-raddy run -c Raddyfile
+raddex check -c Raddexfile
+raddex run -c Raddexfile
 ```
 
 ## What you get
@@ -64,7 +64,7 @@ raddy run -c Raddyfile
 - **Failover** — stop one backend; after `consecutive_failures` probes it is
   removed and traffic goes to the healthy one. Restart it and it flows back
   after `consecutive_successes`.
-- **Total outage** — if *every* upstream is unhealthy, raddy returns
+- **Total outage** — if *every* upstream is unhealthy, raddex returns
   **`502 Bad Gateway`** instead of silently black-holing the request.
 - **Rate limiting** — a client over the rate gets `429`; health state and rate
   buckets survive SIGHUP reloads.
@@ -84,7 +84,7 @@ chat.example.com {
 }
 ```
 
-raddy tunnels the connection once the upstream answers `101 Switching
+raddex tunnels the connection once the upstream answers `101 Switching
 Protocols`; the backend must speak the upgraded protocol itself. `encode` never
 applies to an upgraded response. Protocol upgrades are covered in the
 [directive reference](../../config/directives/#websocket-and-protocol-upgrades).

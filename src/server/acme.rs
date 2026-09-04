@@ -32,7 +32,7 @@
 //! shared resolver pool), so even synchronous cleanup terminates.
 
 use crate::config::ast::DnsChallenge;
-use crate::server::dns::{self, DnsProvider, DnsRecord};
+use crate::server::dns::{DnsProvider, DnsRecord};
 use crate::server::issuance_queue::{AcmeQueue, EnqueueOutcome, RequestKind};
 use crate::tls::{CertStore, TlsAlpnChallengeStore};
 use instant_acme::{
@@ -328,7 +328,8 @@ impl AcmeManager {
         };
         let mut dns_guard = match &self.dns_challenge {
             Some(dns) => Some(Dns01Guard::new(
-                dns::build(dns.provider, &dns.api_token)
+                dns.provider
+                    .client(&dns.credentials)
                     .map_err(|e| format!("dns-01 provider init: {e}"))?,
             )),
             None => None,
@@ -865,7 +866,8 @@ mod tests {
     #[test]
     fn load_persisted_certs_reads_pem_pairs() {
         let store = Arc::new(CertStore::new());
-        let dir = std::env::temp_dir().join(format!("raddy_certstore_test_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("raddex_certstore_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
         // Write a `<host>.pem`/`<host>.key` pair plus a stray file that must be
@@ -886,7 +888,7 @@ mod tests {
 
     #[test]
     fn atomic_write_sets_mode_and_overwrites() {
-        let dir = std::env::temp_dir().join(format!("raddy_atomic_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("raddex_atomic_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("secret.txt");
@@ -922,7 +924,7 @@ mod tests {
         // be no half-written final file left behind that a later load could
         // mistake for a complete one.
         let missing_dir =
-            std::env::temp_dir().join(format!("raddy_missing_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("raddex_missing_test_{}", std::process::id()));
         let path = missing_dir.join("secret.txt");
         assert!(atomic_write(&path, "x", PRIVATE_FILE_MODE).is_err());
         assert!(!path.exists());
@@ -930,7 +932,7 @@ mod tests {
 
     #[test]
     fn ensure_cert_dir_tightens_existing_directory() {
-        let dir = std::env::temp_dir().join(format!("raddy_certdir_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("raddex_certdir_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
@@ -956,7 +958,7 @@ mod tests {
     #[test]
     fn publish_writes_private_key_public_cert_and_overwrites() {
         let store = Arc::new(CertStore::new());
-        let dir = std::env::temp_dir().join(format!("raddy_publish_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("raddex_publish_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let (cert_pem, key_pem) = rcgen_test_cert("example.test");
@@ -997,7 +999,7 @@ mod tests {
     #[test]
     fn load_persisted_certs_tightens_loose_key() {
         let store = Arc::new(CertStore::new());
-        let dir = std::env::temp_dir().join(format!("raddy_tighten_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("raddex_tighten_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (cert_pem, key_pem) = rcgen_test_cert("example.test");
@@ -1044,7 +1046,7 @@ mod tests {
     fn publish_failure_keeps_store_empty_and_retry_recovers() {
         let store = Arc::new(CertStore::new());
         let dir =
-            std::env::temp_dir().join(format!("raddy_publish_fail_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("raddex_publish_fail_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1098,7 +1100,7 @@ mod tests {
     #[test]
     fn load_persisted_certs_skips_mismatched_pair() {
         let store = Arc::new(CertStore::new());
-        let dir = std::env::temp_dir().join(format!("raddy_mismatch_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("raddex_mismatch_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

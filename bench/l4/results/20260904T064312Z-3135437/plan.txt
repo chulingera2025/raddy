@@ -1,0 +1,17 @@
+tcp_throughput_64k_1|TCP throughput / 64 KiB / 1 connection|tcp_throughput|tcp-throughput|tcp|18000|1|65536|8|0|0|2|10|3|5000
+tcp_throughput_64k_16|TCP throughput / 64 KiB / 16 connections|tcp_throughput|tcp-throughput|tcp|18000|16|65536|8|0|0|2|10|3|5000
+tcp_throughput_64k_64|TCP throughput / 64 KiB / 64 connections|tcp_throughput|tcp-throughput|tcp|18000|64|65536|8|0|0|2|10|3|5000
+udp_throughput_64|UDP throughput / 64 B datagrams|udp_throughput|udp-throughput|udp|18001|1|64|1|0|5000|2|10|3|5000
+udp_throughput_512|UDP throughput / 512 B datagrams|udp_throughput|udp-throughput|udp|18001|1|512|1|0|5000|2|10|3|5000
+udp_throughput_1400|UDP throughput / 1400 B datagrams|udp_throughput|udp-throughput|udp|18001|1|1400|1|0|5000|2|10|3|5000
+udp_pps_64|UDP packets per second / 64 B datagrams|udp_pps|udp-throughput|udp|18001|1|64|1|0|10000|2|10|3|5000
+tcp_latency_1|TCP p99 latency / 64 B / 1 connection|p99_latency|tcp-latency|tcp|18000|1|64|1|0|0|2|10|3|5000
+tcp_latency_16|TCP p99 latency / 64 B / 16 connections|p99_latency|tcp-latency|tcp|18000|16|64|1|0|0|2|10|3|5000
+tcp_latency_64|TCP p99 latency / 64 B / 64 connections|p99_latency|tcp-latency|tcp|18000|64|64|1|0|0|2|10|3|5000
+udp_latency_64|UDP p99 latency / 64 B datagrams|p99_latency|udp-latency|udp|18001|1|64|1|0|0|2|10|3|5000
+tcp_connect_rate_10k|TCP connection rate / 10K connections|tcp_connect_rate|tcp-connect-rate|tcp|18000|10000|1|1|5000|0|2|10|3|5000
+tcp_connect_rate_50k|TCP connection rate / 50K connections|tcp_connect_rate|tcp-connect-rate|tcp|18000|50000|1|1|10000|0|2|15|3|5000
+tcp_long_lived_10k|TCP long-lived connections / 10K|tcp_long_lived|tcp-connections|tcp|18000|10000|1|1|5000|0|2|30|3|5000
+tcp_long_lived_50k|TCP long-lived connections / 50K|tcp_long_lived|tcp-connections|tcp|18000|50000|1|1|10000|0|2|30|3|5000
+udp_flows_10k|UDP flows / 10K clients|udp_flows|udp-flows|udp|18001|10000|64|1|5000|0|2|30|3|5000
+udp_flows_50k|UDP flows / 50K clients|udp_flows|udp-flows|udp|18001|50000|64|1|10000|0|2|30|3|5000

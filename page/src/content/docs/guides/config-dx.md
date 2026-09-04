@@ -3,13 +3,13 @@ title: Configuration reuse
 description: Split your configuration across files, reuse snippets, and inject environment variables.
 ---
 
-As a Raddyfile grows, three features keep it readable and deployable:
+As a Raddexfile grows, three features keep it readable and deployable:
 `import` for multi-file includes, `(name)` snippets for reuse within a file, and
 `{$ENV}` for injecting environment variables at parse time.
 
 ## Including other files with `import`
 
-`import <file>` splices the contents of another Raddyfile at that point. Paths
+`import <file>` splices the contents of another Raddexfile at that point. Paths
 are relative to the importing file, and imports may nest (depth-limited):
 
 ```caddyfile
@@ -25,7 +25,7 @@ A site block may import a file whose directives belong to that site:
 ```caddyfile
 # common/proxy-settings.conf
 rate_limit remote_ip 100r/s
-header_up X-Raddy true
+header_up X-Raddex true
 ```
 
 ```caddyfile
@@ -43,7 +43,7 @@ splices it at that point. Snippets are local to the file that defines them:
 ```caddyfile
 (base) {
     rate_limit remote_ip 100r/s
-    header_up X-Raddy true
+    header_up X-Raddex true
 }
 
 api.example.com {
@@ -73,11 +73,11 @@ api.example.com {
 ```
 
 ```bash
-BACKEND_HOST=10.0.0.5 raddy run -c Raddyfile
+BACKEND_HOST=10.0.0.5 raddex run -c Raddexfile
 ```
 
 A **missing** variable is a validation error, so a config that references a
-typoed or unset variable fails `raddy check` instead of starting with a bogus
+typoed or unset variable fails `raddex check` instead of starting with a bogus
 value — deploy-time mistakes are caught before traffic.
 
 ## Combining them
@@ -99,6 +99,6 @@ api.example.com {
 Validate the whole thing before you run it:
 
 ```bash
-API_BACKEND=10.0.0.1 raddy check -c Raddyfile
-API_BACKEND=10.0.0.1 raddy run -c Raddyfile
+API_BACKEND=10.0.0.1 raddex check -c Raddexfile
+API_BACKEND=10.0.0.1 raddex run -c Raddexfile
 ```

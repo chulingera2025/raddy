@@ -1,0 +1,1 @@
+{"scenario_id":"tcp_connect_rate_50k","title":"TCP connection rate / 50K connections","kind":"tcp_connect_rate","target":"nat","transport":"tcp","connections":50000,"payload_bytes":1,"repetition":2,"exit_code":0,"connect_timeout_ms":5000}

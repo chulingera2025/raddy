@@ -14,7 +14,7 @@
 //! Response compression for the `encode` directive (M5).
 //!
 //! Implements gzip, zstd, and brotli compression honoring the `encode` parameter
-//! order (priority) and the client's `Accept-Encoding` (RADDYFILE_SPEC §5): the
+//! order (priority) and the client's `Accept-Encoding` (RADDEXFILE_SPEC §5): the
 //! first configured algorithm the client accepts is used.
 //!
 //! B3b1: the reverse-proxy path compresses incrementally through [`Encoder`] —

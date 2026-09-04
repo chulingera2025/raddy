@@ -1,0 +1,1 @@
+{"scenario_id":"tcp_long_lived_50k","title":"TCP long-lived connections / 50K","kind":"tcp_long_lived","target":"raddex-l4","transport":"tcp","connections":50000,"payload_bytes":1,"repetition":2,"exit_code":0,"connect_timeout_ms":5000}

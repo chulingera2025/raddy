@@ -12,15 +12,15 @@ ROOT="$(pwd)"
 PEBBLE_DIR="tests/pebble"
 PEBBLE_BIN="$ROOT/$PEBBLE_DIR/pebble-linux-amd64/linux/amd64/pebble"
 PEBBLE_CA="$ROOT/$PEBBLE_DIR/certs/pebble-ca.pem"
-BIN="$ROOT/target/debug/raddy"
+BIN="$ROOT/target/debug/raddex"
 CERT_DIR="$(mktemp -d)"
-CONFIG="$(mktemp --suffix=.Raddyfile)"
+CONFIG="$(mktemp --suffix=.Raddexfile)"
 UP_PID=""
 PEBBLE_PID=""
-RADDY_PID=""
+RADDEX_PID=""
 
 cleanup() {
-  [ -n "$RADDY_PID" ] && sudo kill "$RADDY_PID" 2>/dev/null || true
+  [ -n "$RADDEX_PID" ] && sudo kill "$RADDEX_PID" 2>/dev/null || true
   [ -n "$PEBBLE_PID" ] && kill "$PEBBLE_PID" 2>/dev/null || true
   [ -n "$UP_PID" ] && kill "$UP_PID" 2>/dev/null || true
   rm -rf "$CERT_DIR" "$CONFIG"
@@ -34,7 +34,7 @@ UP_PID=$!
 (
   cd "$ROOT/$PEBBLE_DIR"
   PEBBLE_VA_ALWAYS_VALID=1 "$PEBBLE_BIN" -config config/pebble-config.json \
-    >/tmp/raddy_tls_alpn_pebble.log 2>&1
+    >/tmp/raddex_tls_alpn_pebble.log 2>&1
 ) &
 PEBBLE_PID=$!
 sleep 2
@@ -53,8 +53,8 @@ sudo "$BIN" run -c "$CONFIG" \
   --cert-dir "$CERT_DIR" \
   --acme-directory "https://localhost:14000/dir" \
   --acme-root-pem "$PEBBLE_CA" \
-  >/tmp/raddy_tls_alpn.log 2>&1 &
-RADDY_PID=$!
+  >/tmp/raddex_tls_alpn.log 2>&1 &
+RADDEX_PID=$!
 
 for _ in $(seq 1 60); do
   [ -f "$CERT_DIR/alpn.test.pem" ] && break

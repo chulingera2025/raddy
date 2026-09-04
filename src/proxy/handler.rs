@@ -1756,7 +1756,7 @@ mod tests {
     fn client_ip_trusted_peer_uses_rightmost_untrusted() {
         let peer = ipv4(10, 0, 0, 1);
         let t = trusted(&["10.0.0.0/8"]);
-        // Chain: client -> proxy1(trusted) -> raddy. The rightmost untrusted is
+        // Chain: client -> proxy1(trusted) -> raddex. The rightmost untrusted is
         // the client; proxy1 is trusted and skipped.
         assert_eq!(
             resolve_client_ip(peer, Some("203.0.113.9, 10.0.0.2"), &t),

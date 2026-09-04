@@ -13,14 +13,24 @@
 
 //! Raw TCP proxy runtime (L4_PROXY_PLAN, P0).
 //!
-//! One [`TcpProxyApp`] is bound to one `tcp <address> { ... }` listener and
-//! registered as a Pingora `Service<ServerApp>`. `process_new` performs
-//! admission (per-listener semaphore) and upstream selection, then spawns a
-//! relay task that owns the connection — so the worker is free to accept the
-//! next connection. The relay connects under a hard wall-clock bound, then
-//! copies bytes bidirectionally with a *true* inactivity timeout (reset by
-//! traffic in either direction) and half-close propagation, and records typed
-//! metrics and an access record on close.
+//! The L4 data path is native Tokio: [`TcpListenerService`] owns the accept
+//! loop. Each accepted [`tokio::net::TcpStream`] is admitted against the
+//! per-listener semaphore ([`TcpProxyApp::admit`]) *before* any per-connection
+//! work — so `max_connections` bounds pending TLS handshakes as well as
+//! established relays — and then handed to
+//! [`TcpProxyApp::handle_connection`], which selects an upstream and spawns a
+//! relay task that owns the connection, leaving the acceptor free to take the
+//! next one. The relay
+//! connects under a hard wall-clock bound, then copies bytes bidirectionally
+//! with a *true* inactivity timeout (reset by traffic in either direction) and
+//! half-close propagation, and records typed metrics and an access record on
+//! close.
+//!
+//! Nothing here wraps the socket in a buffered transport: `write_all` reaches
+//! the kernel directly, which is where the measured advantage over the previous
+//! Pingora-`Stream` data path comes from. Pingora remains the *process* host —
+//! the listener runs as a `BackgroundService` and observes `ShutdownWatch` —
+//! but no byte of relayed traffic passes through it.
 
 use crate::config::ast::{
     wildcard_match_specificity, L4Upstream, Layer4Listener, ListenAddress, TcpHealthCheckSpec,
@@ -29,12 +39,6 @@ use crate::config::ast::{
 use crate::config::snapshot::ConfigStore;
 use crate::layer4::tls;
 use async_trait::async_trait;
-use pingora::apps::ServerApp;
-use pingora::lb::health_check;
-use pingora::lb::selection::{Consistent, Random, RoundRobin};
-use pingora::lb::LoadBalancer;
-use pingora::protocols::l4::stream::Stream as L4Stream;
-use pingora::protocols::{SocketDigest, Stream};
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -42,20 +46,46 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 
-/// Read chunk used by the relay pump. Bounded, so per-connection memory is two
-/// buffers plus codec state, independent of transfer size.
-const RELAY_CHUNK: usize = 16 * 1024;
+/// Initial relay buffer, per direction.
+///
+/// Relay buffers dominate this proxy's resident memory: two per connection,
+/// held for its whole life. A listener holding 10 000 mostly-idle connections
+/// pays for every byte of them, which is why the buffer starts small instead of
+/// being sized for peak throughput.
+const RELAY_CHUNK_MIN: usize = 8 * 1024;
+
+/// Largest relay buffer, per direction.
+///
+/// Matches Pingora's 64 KiB read buffer, which is the size that made its
+/// throughput competitive: a bulk transfer costs one `read` syscall per buffer,
+/// so a small buffer multiplies syscalls on exactly the workload that can least
+/// afford them. Buffers grow to this only when a connection proves it is
+/// carrying enough data to fill them (see [`pump`]), so the memory is spent on
+/// active transfers rather than reserved for idle connections.
+const RELAY_CHUNK_MAX: usize = 64 * 1024;
+
+/// Pending-connection backlog for an L4 listener.
+///
+/// Matches Pingora's `LISTENER_BACKLOG`, which is what this path used before it
+/// was native. The kernel silently caps this at `net.core.somaxconn`, so the
+/// large value is a request, not an allocation. It has to be large: a burst of
+/// connections that overflows the accept queue is answered by dropping SYNs,
+/// and the client then waits out a retransmission timeout — which collapses the
+/// connection rate far more than any per-connection work in this file.
+const LISTEN_BACKLOG: i32 = 65_535;
 
 /// How often hostname upstreams are re-resolved (L4 plan: refresh, keep
 /// last-known-good on a transient failure). Overridable via
-/// `RADDY_DNS_REFRESH_SECS` (a test hook). TTL-aware scheduling is a follow-up;
+/// `RADDEX_DNS_REFRESH_SECS` (a test hook). TTL-aware scheduling is a follow-up;
 /// this fixed period is a safe, simple refresh.
 const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -88,7 +118,7 @@ use std::sync::LazyLock;
 
 static ACCEPTED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_accepted_total",
+        "raddex_l4_tcp_accepted_total",
         "TCP connections accepted",
         &["listener"]
     )
@@ -96,7 +126,7 @@ static ACCEPTED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static REJECTED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_rejected_total",
+        "raddex_l4_tcp_rejected_total",
         "TCP connections rejected by the admission limit",
         &["listener"]
     )
@@ -104,7 +134,7 @@ static REJECTED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static NO_UPSTREAM: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_no_upstream_total",
+        "raddex_l4_tcp_no_upstream_total",
         "TCP connections closed because no upstream was available",
         &["listener"]
     )
@@ -112,7 +142,7 @@ static NO_UPSTREAM: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static CONNECT_FAILURES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_connect_failures_total",
+        "raddex_l4_tcp_connect_failures_total",
         "Upstream TCP connect failures",
         &["listener"]
     )
@@ -120,7 +150,7 @@ static CONNECT_FAILURES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| 
 });
 static C2U_BYTES: LazyLock<prometheus::CounterVec> = LazyLock::new(|| {
     prometheus::register_counter_vec!(
-        "raddy_l4_tcp_client_to_upstream_bytes_total",
+        "raddex_l4_tcp_client_to_upstream_bytes_total",
         "Bytes relayed client to upstream",
         &["listener"]
     )
@@ -128,7 +158,7 @@ static C2U_BYTES: LazyLock<prometheus::CounterVec> = LazyLock::new(|| {
 });
 static U2C_BYTES: LazyLock<prometheus::CounterVec> = LazyLock::new(|| {
     prometheus::register_counter_vec!(
-        "raddy_l4_tcp_upstream_to_client_bytes_total",
+        "raddex_l4_tcp_upstream_to_client_bytes_total",
         "Bytes relayed upstream to client",
         &["listener"]
     )
@@ -136,7 +166,7 @@ static U2C_BYTES: LazyLock<prometheus::CounterVec> = LazyLock::new(|| {
 });
 static IDLE_TIMEOUTS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_idle_timeouts_total",
+        "raddex_l4_tcp_idle_timeouts_total",
         "Connections closed by the inactivity timeout",
         &["listener"]
     )
@@ -144,7 +174,7 @@ static IDLE_TIMEOUTS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 });
 static SHUTDOWN_CANCELLATIONS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_shutdown_cancellations_total",
+        "raddex_l4_tcp_shutdown_cancellations_total",
         "Connections cancelled during shutdown",
         &["listener"]
     )
@@ -152,7 +182,7 @@ static SHUTDOWN_CANCELLATIONS: LazyLock<prometheus::IntCounterVec> = LazyLock::n
 });
 static DNS_REFRESH_FAILURES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
-        "raddy_l4_tcp_dns_refresh_failures_total",
+        "raddex_l4_tcp_dns_refresh_failures_total",
         "Background DNS refreshes that failed (last-known-good kept serving)",
         &["listener"]
     )
@@ -216,7 +246,19 @@ pub struct TcpProxyApp {
     config_store: Arc<ConfigStore>,
     /// The current runtime (balancer + admission + timeouts), rebuilt on reload
     /// when the spec changes. Shared with the health-check thread.
-    runtime: Arc<Mutex<AppRuntime>>,
+    /// The current runtime, read once per accepted connection.
+    ///
+    /// `ArcSwap`, not `Mutex`: this is on the accept path, and a mutex here is
+    /// taken per connection and contended between every accept loop plus the
+    /// health-check and DNS-refresh threads. Reads are lock-free; the rare
+    /// rebuild serialises on `rebuild_lock`.
+    runtime: Arc<arc_swap::ArcSwap<AppRuntime>>,
+    /// Serialises runtime rebuilds (reload and DNS refresh) without putting a
+    /// lock on the read path.
+    rebuild_lock: Arc<Mutex<()>>,
+    /// Last `ConfigStore` generation reconciled into `runtime`, so an unchanged
+    /// config costs one atomic load per connection instead of a spec rebuild.
+    applied_generation: AtomicU64,
     metrics: Arc<TcpMetrics>,
     /// Optional sink for typed access records.
     access_log: Option<Arc<AccessLogSink>>,
@@ -295,7 +337,7 @@ impl AppRuntime {
             )
         } else {
             let resolved = resolve_upstreams(tcp, listener)?;
-            let balancer = Arc::new(L4Balancer::build(tcp, &resolved)?);
+            let balancer = Arc::new(L4Balancer::new(&resolved, tcp.lb_policy, tcp.health_check));
             (L4Selector::Balancer(balancer), resolved)
         };
         Ok(Self {
@@ -396,7 +438,7 @@ fn resolved_set(tcp: &TcpProxyConfig, listener: &ListenAddress) -> Result<Vec<So
 }
 
 /// The live pieces a new connection needs, cloned out of the runtime.
-struct RuntimeHandle {
+pub(crate) struct RuntimeHandle {
     selector: Arc<L4Selector>,
     admission: Arc<Semaphore>,
     connect_timeout: Duration,
@@ -407,66 +449,9 @@ struct RuntimeHandle {
     transparent: bool,
 }
 
-/// A type-erased, health-checked backend selector for one L4 listener.
-enum L4Balancer {
-    RoundRobin(LoadBalancer<RoundRobin>),
-    Random(LoadBalancer<Random>),
-    Consistent(LoadBalancer<Consistent>),
-}
-
-impl L4Balancer {
-    /// Build the selector for the resolved `upstreams`, attaching the active
-    /// TCP-connect health check when configured.
-    fn build(tcp: &TcpProxyConfig, upstreams: &[SocketAddr]) -> Result<Self, String> {
-        let addrs: Vec<String> = upstreams.iter().map(|a| a.to_string()).collect();
-        let mut lb = match tcp.lb_policy {
-            crate::config::ast::LbPolicy::RoundRobin => L4Balancer::RoundRobin(
-                LoadBalancer::<RoundRobin>::try_from_iter(addrs)
-                    .map_err(|_| "failed to build round-robin balancer".to_string())?,
-            ),
-            crate::config::ast::LbPolicy::Random => L4Balancer::Random(
-                LoadBalancer::<Random>::try_from_iter(addrs)
-                    .map_err(|_| "failed to build random balancer".to_string())?,
-            ),
-            crate::config::ast::LbPolicy::IpHash => L4Balancer::Consistent(
-                LoadBalancer::<Consistent>::try_from_iter(addrs)
-                    .map_err(|_| "failed to build ip_hash balancer".to_string())?,
-            ),
-        };
-        if let Some(hc) = &tcp.health_check {
-            let mut check = health_check::TcpHealthCheck::new();
-            check.consecutive_failure = hc.consecutive_failures;
-            check.consecutive_success = hc.consecutive_successes;
-            check.peer_template.options.connection_timeout = Some(hc.timeout);
-            match &mut lb {
-                L4Balancer::RoundRobin(lb) => lb.set_health_check(check),
-                L4Balancer::Random(lb) => lb.set_health_check(check),
-                L4Balancer::Consistent(lb) => lb.set_health_check(check),
-            }
-        }
-        Ok(lb)
-    }
-
-    /// Select a healthy upstream for `key` (the client IP bytes for `ip_hash`;
-    /// ignored by the other policies). `None` when every upstream is unhealthy.
-    fn select(&self, key: &[u8]) -> Option<SocketAddr> {
-        let backend = match self {
-            L4Balancer::RoundRobin(lb) => lb.select(key, 256),
-            L4Balancer::Random(lb) => lb.select(key, 256),
-            L4Balancer::Consistent(lb) => lb.select(key, 256),
-        };
-        backend?.addr.as_inet().cloned()
-    }
-
-    /// Run one round of active health checks.
-    async fn probe(&self) {
-        match self {
-            L4Balancer::RoundRobin(lb) => lb.backends().run_health_check(true).await,
-            L4Balancer::Random(lb) => lb.backends().run_health_check(true).await,
-            L4Balancer::Consistent(lb) => lb.backends().run_health_check(true).await,
-        }
-    }
-}
+/// The health-checked backend selector for one L4 listener, provided by the
+/// native [`crate::layer4::balance`] module.
+type L4Balancer = crate::layer4::balance::Balancer;
 
 impl TcpProxyApp {
     /// Create an app for one compiled `tcp` listener against the live config
@@ -481,7 +466,10 @@ impl TcpProxyApp {
     ) -> Result<Self, String> {
         let listen = tcp.listen.clone();
         let listener = format!("tcp/{}", tcp.listen.display());
-        let runtime = Arc::new(Mutex::new(AppRuntime::build(tcp, &listen)?));
+        let runtime = Arc::new(arc_swap::ArcSwap::from_pointee(AppRuntime::build(
+            tcp, &listen,
+        )?));
+        let rebuild_lock = Arc::new(Mutex::new(()));
         let metrics = TcpMetrics::register(&listener);
         // Active health checks only apply to `to` mode; SNI routes are exact
         // single-upstream mappings (per-route health is a P1 follow-up).
@@ -498,11 +486,7 @@ impl TcpProxyApp {
                         loop {
                             tokio::time::sleep(interval).await;
                             // Probe the current balancer: a reload replaces it.
-                            let selector = runtime
-                                .lock()
-                                .expect("L4 runtime lock poisoned")
-                                .selector
-                                .clone();
+                            let selector = runtime.load().selector.clone();
                             if let L4Selector::Balancer(balancer) = &*selector {
                                 balancer.probe().await;
                             }
@@ -517,19 +501,29 @@ impl TcpProxyApp {
             let config_store = config_store.clone();
             let listen = listen.clone();
             let runtime = runtime.clone();
+            let rebuild = rebuild_lock.clone();
             let metrics = metrics.clone();
             let listener_c = listener.clone();
             let interval = dns_refresh_interval();
             std::thread::spawn(move || loop {
                 std::thread::sleep(interval);
-                refresh_dns(&config_store, &listen, &runtime, &metrics, &listener_c);
+                refresh_dns(
+                    &config_store,
+                    &listen,
+                    &runtime,
+                    &rebuild,
+                    &metrics,
+                    &listener_c,
+                );
             });
         }
         Ok(Self {
             listener,
             listen,
+            applied_generation: AtomicU64::new(config_store.generation()),
             config_store,
             runtime,
+            rebuild_lock,
             metrics,
             access_log,
         })
@@ -540,6 +534,16 @@ impl TcpProxyApp {
     /// from the snapshot (a reload that should have been rejected), the
     /// last-known runtime keeps serving.
     fn current_handle(&self) -> RuntimeHandle {
+        // Fast path: nothing has been reloaded since the last check, so the
+        // runtime is already current. This matters because it runs on the
+        // accept path for every connection, and the slow path below clones and
+        // compares the listener's whole spec — including its upstream and SNI
+        // vectors, each holding owned strings. Doing that per connection is
+        // pure allocation churn when reloads are rare, which they are.
+        let generation = self.config_store.generation();
+        if self.applied_generation.load(Ordering::Acquire) == generation {
+            return self.handle_from_runtime();
+        }
         let config = self.config_store.load();
         let new_spec = config.layer4.iter().find_map(|listener| match listener {
             Layer4Listener::Tcp(tcp) if tcp.listen == self.listen => {
@@ -547,9 +551,9 @@ impl TcpProxyApp {
             }
             _ => None,
         });
-        let mut guard = self.runtime.lock().expect("L4 runtime lock poisoned");
+        let _rebuild = self.rebuild_lock.lock().expect("L4 rebuild lock poisoned");
         if let Some(new_spec) = new_spec {
-            if guard.spec != new_spec {
+            if self.runtime.load().spec != new_spec {
                 if let Some(tcp) = config.layer4.iter().find_map(|listener| match listener {
                     Layer4Listener::Tcp(tcp) if tcp.listen == self.listen => Some(tcp),
                     _ => None,
@@ -557,7 +561,7 @@ impl TcpProxyApp {
                     match AppRuntime::build(tcp, &self.listen) {
                         Ok(runtime) => {
                             tracing::info!("tcp {}: upstream set changed on reload", self.listener);
-                            *guard = runtime;
+                            self.runtime.store(Arc::new(runtime));
                         }
                         Err(e) => tracing::error!(
                             "tcp {}: reload upstream rebuild failed, keeping previous: {e}",
@@ -567,6 +571,15 @@ impl TcpProxyApp {
                 }
             }
         }
+        // Record the generation only after reconciling it, so a reload racing
+        // with this check is picked up by the next connection rather than lost.
+        self.applied_generation.store(generation, Ordering::Release);
+        self.handle_from_runtime()
+    }
+
+    /// Snapshot the current runtime without consulting the config store.
+    fn handle_from_runtime(&self) -> RuntimeHandle {
+        let guard = self.runtime.load();
         RuntimeHandle {
             selector: guard.selector.clone(),
             admission: guard.admission.clone(),
@@ -578,16 +591,471 @@ impl TcpProxyApp {
     }
 }
 
-/// A Linux transparent-proxy acceptor. Pingora's ServerApp and relay logic are
-/// reused after this small listener shim attaches the socket digest that carries
-/// the original destination.
-pub struct TransparentTcpProxy {
+/// The native accept loop for one non-transparent `tcp` listener.
+///
+/// Owns the bound socket and hands every accepted connection to the shared
+/// [`TcpProxyApp`]. Registered as a Pingora `BackgroundService` purely for
+/// process lifecycle — no relayed byte passes through Pingora.
+pub struct TcpListenerService {
+    /// The listening sockets, one per accept loop.
+    ///
+    /// A single accept loop is a scalability ceiling: every connection is
+    /// accepted, admitted, and dispatched by one task, so connection-rate
+    /// workloads queue behind it while Nginx spreads the same work over its
+    /// workers. `SO_REUSEPORT` gives each loop its own socket and lets the
+    /// kernel distribute incoming connections between them.
+    ///
+    /// Bound at construction — which happens on the startup thread, before the
+    /// Pingora server builds its runtime — and converted to Tokio listeners
+    /// inside [`BackgroundService::start`], which does run on the runtime.
+    /// `tokio::net::TcpListener::from_std` panics without a reactor, so the
+    /// sockets cannot be registered any earlier. Empty until received when this
+    /// process is an upgrade replacement.
+    listeners: Mutex<Vec<std::net::TcpListener>>,
+    app: Arc<TcpProxyApp>,
+    /// Set when the listener terminates TLS before relaying (spec §5.7).
+    tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
+    /// The `tcp/<address>` label, for logs and handoff artifacts.
+    label: String,
+    /// How many accept loops (and therefore `SO_REUSEPORT` sockets) this
+    /// listener runs. Matches the configured worker-thread count.
+    accept_loops: usize,
+    /// True when this process must receive the listening socket from the
+    /// outgoing process instead of binding it.
+    upgrade: bool,
+    #[cfg(unix)]
+    upgrade_sock: String,
+    #[cfg(unix)]
+    handoff_id: String,
+    #[cfg(unix)]
+    phase_watch: Mutex<Option<tokio::sync::broadcast::Receiver<pingora::server::ExecutionPhase>>>,
+}
+
+impl TcpListenerService {
+    /// Bind `tcp.listen` (or prepare to inherit it) and build the proxy app.
+    ///
+    /// `tls` terminates TLS on this listener when set. `upgrade` marks this
+    /// process as the replacement side of a zero-downtime upgrade, in which
+    /// case no socket is bound here — the listening descriptor arrives from the
+    /// outgoing process in [`BackgroundService::start`]. Returns an error when
+    /// the socket cannot be bound or the proxy app cannot be built; both are
+    /// startup failures, reported before any listener serves traffic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tcp: &TcpProxyConfig,
+        config_store: Arc<ConfigStore>,
+        access_log: Option<Arc<AccessLogSink>>,
+        tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
+        upgrade: bool,
+        accept_loops: usize,
+        #[cfg(unix)] upgrade_sock: String,
+        #[cfg(unix)] phase_watch: Option<
+            tokio::sync::broadcast::Receiver<pingora::server::ExecutionPhase>,
+        >,
+    ) -> Result<Self, String> {
+        let ListenAddress::Socket(address) = &tcp.listen;
+        let label = format!("tcp/{}", tcp.listen.display());
+        let accept_loops = accept_loops.max(1);
+        let listeners = if upgrade {
+            Vec::new()
+        } else {
+            (0..accept_loops)
+                .map(|_| bind_listener(*address, accept_loops > 1))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(Self {
+            accept_loops,
+            listeners: Mutex::new(listeners),
+            app: Arc::new(TcpProxyApp::new(tcp, config_store, access_log)?),
+            tls,
+            #[cfg(unix)]
+            handoff_id: crate::layer4::handoff_key(&tcp.listen.display()),
+            label,
+            upgrade,
+            #[cfg(unix)]
+            upgrade_sock,
+            #[cfg(unix)]
+            phase_watch: Mutex::new(phase_watch),
+        })
+    }
+
+    /// The status path one TCP listener publishes its handoff outcome to, so
+    /// the upgrade driver can refuse to continue after a failed transfer.
+    #[cfg(unix)]
+    pub(crate) fn status_path_for(upgrade_sock: &str, listener: &str) -> String {
+        format!(
+            "{upgrade_sock}.tcp.{}.status",
+            crate::layer4::handoff_key(listener)
+        )
+    }
+
+    /// This listener's handoff status path.
+    #[cfg(unix)]
+    fn handoff_status_path(&self) -> String {
+        format!("{}.tcp.{}.status", self.upgrade_sock, self.handoff_id)
+    }
+
+    /// The socket path the listening descriptor is passed over.
+    #[cfg(unix)]
+    fn handoff_socket_path(&self) -> String {
+        format!("{}.tcp.{}.fd", self.upgrade_sock, self.handoff_id)
+    }
+
+    /// Send the listening descriptor to the replacement process, then publish
+    /// the outcome so the upgrade driver can verify it.
+    ///
+    /// Unlike the UDP handoff there is no per-connection state to carry: an
+    /// established TCP relay is owned by its own task in the outgoing process
+    /// and drains there, so only the *listening* socket moves.
+    #[cfg(unix)]
+    async fn send_handoff(&self) {
+        let result = self.send_handoff_inner().await;
+        if let Err(error) = &result {
+            tracing::error!("{}: upgrade handoff failed: {error}", self.label);
+        }
+        let status = match &result {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!("error: {error}"),
+        };
+        if let Err(error) = crate::layer4::write_handoff_file(
+            &self.handoff_status_path(),
+            status.as_bytes(),
+            "TCP handoff status",
+        ) {
+            tracing::error!("{}: failed to publish handoff status: {error}", self.label);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn send_handoff_inner(&self) -> Result<(), String> {
+        let fds: Vec<i32> = {
+            let guard = self
+                .listeners
+                .lock()
+                .expect("L4 TCP listener lock poisoned");
+            if guard.is_empty() {
+                return Err("TCP listening socket is unavailable".to_string());
+            }
+            guard.iter().map(|listener| listener.as_raw_fd()).collect()
+        };
+        let path = self.handoff_socket_path();
+        // `Fds::send_to_sock` blocks on the unix socket, so it runs off the
+        // reactor thread. Every `SO_REUSEPORT` socket is transferred, so the
+        // replacement inherits the same accept parallelism.
+        tokio::task::spawn_blocking(move || {
+            let mut transfer = pingora::server::Fds::new();
+            for (index, fd) in fds.iter().enumerate() {
+                transfer.add(format!("listener-{index}"), *fd);
+            }
+            transfer
+                .send_to_sock(path.as_str())
+                .map_err(|e| format!("send TCP listener descriptors: {e}"))?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("TCP handoff worker failed: {e}"))?
+    }
+
+    /// Receive the inherited listening descriptor from the outgoing process.
+    #[cfg(unix)]
+    async fn receive_handoff(&self) -> Result<Vec<std::net::TcpListener>, String> {
+        let path = self.handoff_socket_path();
+        let expected = self.accept_loops;
+        tokio::task::spawn_blocking(move || {
+            let mut transfer = pingora::server::Fds::new();
+            transfer
+                .get_from_sock(path.as_str())
+                .map_err(|e| format!("receive TCP listener descriptors: {e}"))?;
+            let mut listeners = Vec::with_capacity(expected);
+            for index in 0..expected {
+                let fd = *transfer
+                    .get(&format!("listener-{index}"))
+                    .ok_or_else(|| format!("TCP handoff is missing listener descriptor {index}"))?;
+                // SAFETY: the descriptor was transferred through SCM_RIGHTS and
+                // is now owned by this process.
+                let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|e| format!("set inherited TCP listener nonblocking: {e}"))?;
+                listeners.push(listener);
+            }
+            Ok(listeners)
+        })
+        .await
+        .map_err(|e| format!("TCP handoff receiver failed: {e}"))?
+    }
+}
+
+#[async_trait]
+impl BackgroundService for TcpListenerService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        // An upgrade replacement inherits the listening socket instead of
+        // binding it, so the port is never released and no connection is
+        // refused during the swap.
+        #[cfg(unix)]
+        if self.upgrade {
+            match self.receive_handoff().await {
+                Ok(listener) => {
+                    *self
+                        .listeners
+                        .lock()
+                        .expect("L4 TCP listener lock poisoned") = listener;
+                }
+                Err(error) => {
+                    tracing::error!("{}: failed to inherit listener: {error}", self.label);
+                    let status = format!("error: {error}");
+                    let _ = crate::layer4::write_handoff_file(
+                        &self.handoff_status_path(),
+                        status.as_bytes(),
+                        "TCP handoff status",
+                    );
+                    // Fail the whole replacement: continuing would leave this
+                    // listener silently unserved while the old process exits.
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // Register the pre-bound sockets with the reactor now that a runtime
+        // exists. The `std` listeners are retained (cloned, not consumed)
+        // because their descriptors are what a later upgrade hands over.
+        let std_listeners: Vec<std::net::TcpListener> = self
+            .listeners
+            .lock()
+            .expect("L4 TCP listener lock poisoned")
+            .iter()
+            .filter_map(|listener| listener.try_clone().ok())
+            .collect();
+        if std_listeners.is_empty() {
+            tracing::error!("{}: listening socket is unavailable", self.label);
+            if self.upgrade {
+                std::process::exit(1);
+            }
+            return;
+        }
+        let mut listeners = Vec::with_capacity(std_listeners.len());
+        for std_listener in std_listeners {
+            match TcpListener::from_std(std_listener) {
+                Ok(listener) => listeners.push(Arc::new(listener)),
+                Err(error) => {
+                    tracing::error!("{}: listener registration failed: {error}", self.label);
+                    if self.upgrade {
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Pingora signals the fd-transfer phase of a graceful upgrade on this
+        // broadcast channel; that is when the descriptors must be sent.
+        let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        #[cfg(unix)]
+        if let Some(mut phase) = self
+            .phase_watch
+            .lock()
+            .expect("L4 TCP phase watch lock poisoned")
+            .take()
+        {
+            tokio::spawn(async move {
+                while let Ok(value) = phase.recv().await {
+                    if matches!(
+                        value,
+                        pingora::server::ExecutionPhase::GracefulUpgradeTransferringFds
+                    ) {
+                        let _ = handoff_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        drop(handoff_tx);
+
+        // One accept task per `SO_REUSEPORT` socket. `stop` ends them all at
+        // once, so the handoff and the shutdown watch stay single-signal.
+        // A `watch` channel rather than a `Notify`: `notify_waiters()` wakes
+        // only waiters that are *already registered*, and a freshly spawned
+        // accept loop registers nothing until it is first polled. If shutdown
+        // is already signalled when this service starts, the parent below
+        // breaks without ever yielding, the wake reaches nobody, and
+        // `worker.await` hangs forever. A watch carries the value, so a
+        // receiver that registers later still observes it.
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        let mut workers = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let app = self.app.clone();
+            let tls = self.tls.clone();
+            let shutdown = shutdown.clone();
+            let stop = stop_tx.subscribe();
+            workers.push(tokio::spawn(async move {
+                accept_loop(listener, app, tls, shutdown, stop).await;
+            }));
+        }
+
+        // Wait for whichever ends the listener: shutdown, or the upgrade
+        // handoff. The accept tasks keep running until `stop` is notified.
+        tokio::select! {
+            signal = handoff_rx.recv() => {
+                if signal.is_some() {
+                    #[cfg(unix)]
+                    self.send_handoff().await;
+                }
+            }
+            _ = async {
+                loop {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    if shutdown.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+        // Stop accepting. In-flight relays keep running until they drain or the
+        // shutdown watch cancels them.
+        let _ = stop_tx.send(true);
+        for worker in workers {
+            let _ = worker.await;
+        }
+    }
+}
+
+/// Accept connections on one socket until `stop` is notified.
+///
+/// Each `SO_REUSEPORT` socket gets one of these, so accept work scales with the
+/// configured worker count instead of funnelling through a single task.
+async fn accept_loop(
     listener: Arc<TcpListener>,
+    app: Arc<TcpProxyApp>,
+    tls: Option<Arc<crate::layer4::tls_accept::TlsAcceptor>>,
+    shutdown: ShutdownWatch,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    if *stop.borrow_and_update() {
+        return;
+    }
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = stop.changed() => break,
+            result = listener.accept() => result,
+        };
+        let (stream, peer) = match accepted {
+            Ok(pair) => pair,
+            Err(error) => {
+                // A per-connection accept error (EMFILE, a client that went
+                // away between the SYN and accept) must not kill the listener;
+                // log and take the next one.
+                tracing::warn!("tcp accept failed: {error}");
+                continue;
+            }
+        };
+        // Relayed traffic is latency-sensitive and already chunked by the pump,
+        // so Nagle only adds delay.
+        let _ = stream.set_nodelay(true);
+        let peer = Some(normalize_socket_addr(peer));
+        let child_shutdown = shutdown.clone();
+        // Admit before the handshake so `max_connections` bounds pending
+        // handshakes too, not only established relays.
+        let Some((handle, permit)) = app.admit() else {
+            continue;
+        };
+        match &tls {
+            None => {
+                app.handle_connection(stream, peer, None, &child_shutdown, handle, permit)
+                    .await;
+            }
+            Some(acceptor) => {
+                // The handshake is remote-driven, so it runs inside the spawned
+                // task under its own timeout: a stalled client must never block
+                // the accept loop. The permit moves with it and is released if
+                // the handshake fails.
+                let acceptor = acceptor.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            app.handle_connection(
+                                tls_stream,
+                                peer,
+                                None,
+                                &child_shutdown,
+                                handle,
+                                permit,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            drop(permit);
+                            tracing::debug!("tcp TLS handshake failed: {error}");
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Bind a plain TCP listener for an L4 listener address.
+///
+/// An unspecified IPv6 address is left dual-stack (`IPV6_V6ONLY` off) so one
+/// listener serves both families, matching the HTTP listeners. Returns a
+/// blocking `std` listener: binding happens on the startup thread, before a
+/// Tokio runtime exists, so reactor registration is deferred to `start`.
+///
+/// `reuse_port` sets `SO_REUSEPORT`, which is what lets several sockets share
+/// the address so each accept loop has its own and the kernel distributes
+/// connections between them. It is only set when more than one loop is
+/// requested, so a single-loop listener keeps the stricter "one bind wins"
+/// behaviour and a genuine port conflict is still an error.
+fn bind_listener(address: SocketAddr, reuse_port: bool) -> Result<std::net::TcpListener, String> {
+    let domain = if address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|e| format!("create TCP socket: {e}"))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| format!("set TCP reuseaddr: {e}"))?;
+    if reuse_port {
+        socket
+            .set_reuse_port(true)
+            .map_err(|e| format!("set TCP reuseport: {e}"))?;
+    }
+    if let SocketAddr::V6(v6) = address {
+        if v6.ip().is_unspecified() {
+            socket
+                .set_only_v6(false)
+                .map_err(|e| format!("set TCP dual-stack: {e}"))?;
+        }
+    }
+    socket
+        .bind(&SockAddr::from(address))
+        .map_err(|e| format!("bind TCP listener {address}: {e}"))?;
+    socket
+        .listen(LISTEN_BACKLOG)
+        .map_err(|e| format!("listen on TCP {address}: {e}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("set TCP nonblocking: {e}"))?;
+    Ok(socket.into())
+}
+
+/// A Linux transparent-proxy acceptor: same relay path, but the socket carries
+/// `IP_TRANSPARENT` and the upstream is the original destination.
+pub struct TransparentTcpProxy {
+    /// Bound at construction, registered with the reactor in `start` — see
+    /// [`TcpListenerService::listener`] for why.
+    listener: Mutex<Option<std::net::TcpListener>>,
     app: Arc<TcpProxyApp>,
 }
 
 impl TransparentTcpProxy {
-    /// Bind a transparent TCP listener and build its Pingora-backed proxy app.
+    /// Bind a transparent TCP listener and build its proxy app.
     ///
     /// The tcp parameter supplies the listener and routing configuration;
     /// config_store supplies reloadable upstream state; access_log is the
@@ -601,7 +1069,7 @@ impl TransparentTcpProxy {
         let ListenAddress::Socket(address) = &tcp.listen;
         let listener = bind_transparent_listener(*address)?;
         Ok(Self {
-            listener: Arc::new(listener),
+            listener: Mutex::new(Some(listener)),
             app: Arc::new(TcpProxyApp::new(tcp, config_store, access_log)?),
         })
     }
@@ -610,9 +1078,25 @@ impl TransparentTcpProxy {
 #[async_trait]
 impl BackgroundService for TransparentTcpProxy {
     async fn start(&self, mut shutdown: ShutdownWatch) {
+        let Some(std_listener) = self
+            .listener
+            .lock()
+            .expect("transparent TCP listener lock poisoned")
+            .take()
+        else {
+            tracing::error!("transparent tcp listener started twice");
+            return;
+        };
+        let listener = match TcpListener::from_std(std_listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::error!("transparent tcp listener registration failed: {error}");
+                return;
+            }
+        };
         loop {
             let accepted = tokio::select! {
-                result = self.listener.accept() => result,
+                result = listener.accept() => result,
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         break;
@@ -627,21 +1111,32 @@ impl BackgroundService for TransparentTcpProxy {
                     continue;
                 }
             };
-            let raw_fd = stream.as_raw_fd();
-            let mut session: Stream = Box::new(L4Stream::from(stream));
-            session.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
+            let _ = stream.set_nodelay(true);
+            let original = original_dst(&stream);
             tracing::debug!("transparent TCP connection from {peer}");
             let app = self.app.clone();
             let child_shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                let _ = app.process_new(session, &child_shutdown).await;
-            });
+            let Some((handle, permit)) = app.admit() else {
+                continue;
+            };
+            app.handle_connection(
+                stream,
+                Some(normalize_socket_addr(peer)),
+                original,
+                &child_shutdown,
+                handle,
+                permit,
+            )
+            .await;
         }
     }
 }
 
 /// Bind a TCP socket with the Linux transparent-proxy option before bind.
-fn bind_transparent_listener(address: SocketAddr) -> Result<TcpListener, String> {
+///
+/// Returns a blocking `std` listener for the same reason as [`bind_listener`]:
+/// the bind happens before a Tokio runtime exists.
+fn bind_transparent_listener(address: SocketAddr) -> Result<std::net::TcpListener, String> {
     let domain = if address.is_ipv4() {
         Domain::IPV4
     } else {
@@ -662,9 +1157,7 @@ fn bind_transparent_listener(address: SocketAddr) -> Result<TcpListener, String>
     socket
         .set_nonblocking(true)
         .map_err(|e| format!("set transparent TCP nonblocking: {e}"))?;
-    let listener: std::net::TcpListener = socket.into();
-    TcpListener::from_std(listener)
-        .map_err(|e| format!("adopt transparent TCP listener {address}: {e}"))
+    Ok(socket.into())
 }
 
 /// Set IP_TRANSPARENT/IPV6_TRANSPARENT on a socket.
@@ -705,38 +1198,147 @@ fn set_transparent_fd(fd: std::os::fd::RawFd, ipv4: bool) -> Result<(), String> 
 }
 
 /// Read the destination selected by a Linux REDIRECT/TPROXY rule.
-fn original_dst(stream: &Stream) -> Option<SocketAddr> {
-    stream
-        .get_socket_digest()?
-        .original_dst()?
-        .as_inet()
-        .copied()
+///
+/// With TPROXY the socket is bound to the original destination already, so
+/// `local_addr` is the answer. With REDIRECT the kernel rewrote the destination
+/// and keeps the pre-NAT address in the conntrack entry, reachable only through
+/// `SO_ORIGINAL_DST`. Try the socket option first and fall back to `local_addr`.
+#[cfg(target_os = "linux")]
+fn original_dst(stream: &TcpStream) -> Option<SocketAddr> {
+    let fd = stream.as_raw_fd();
+    let ipv4 = matches!(stream.local_addr().ok()?, SocketAddr::V4(_));
+    // SAFETY: `storage` is sized for either address family and `len` is
+    // initialized to its capacity, as getsockopt requires. The fd is owned by
+    // `stream`, which outlives the call.
+    let decoded = unsafe {
+        let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let (level, name) = if ipv4 {
+            (libc::SOL_IP, libc::SO_ORIGINAL_DST)
+        } else {
+            (libc::SOL_IPV6, IP6T_SO_ORIGINAL_DST)
+        };
+        if libc::getsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::addr_of_mut!(storage).cast::<libc::c_void>(),
+            &mut len,
+        ) != 0
+        {
+            None
+        } else {
+            sockaddr_storage_to_socket_addr(&storage)
+        }
+    };
+    // TPROXY binds the socket to the original destination, so `local_addr` is
+    // already correct there and is the right fallback when the REDIRECT-only
+    // socket option is unavailable.
+    decoded
+        .or_else(|| stream.local_addr().ok())
+        .map(normalize_socket_addr)
 }
 
-#[async_trait]
-impl ServerApp for TcpProxyApp {
-    async fn process_new(
+/// `IP6T_SO_ORIGINAL_DST` from `linux/netfilter_ipv6/ip6_tables.h`; `libc` does
+/// not export it.
+#[cfg(target_os = "linux")]
+const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
+
+/// Decode a kernel-filled `sockaddr_storage` into a [`SocketAddr`].
+///
+/// Returns `None` for an address family this proxy does not handle, so a
+/// surprising value falls back to the local address rather than being
+/// misinterpreted.
+#[cfg(target_os = "linux")]
+fn sockaddr_storage_to_socket_addr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match i32::from(storage.ss_family) {
+        libc::AF_INET => {
+            // SAFETY: ss_family says this storage holds a sockaddr_in, and
+            // sockaddr_storage is defined to be large enough and aligned for it.
+            let addr = unsafe { *std::ptr::from_ref(storage).cast::<libc::sockaddr_in>() };
+            Some(SocketAddr::from((
+                u32::from_be(addr.sin_addr.s_addr).to_be_bytes(),
+                u16::from_be(addr.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: as above, for a sockaddr_in6.
+            let addr = unsafe { *std::ptr::from_ref(storage).cast::<libc::sockaddr_in6>() };
+            Some(SocketAddr::from((
+                addr.sin6_addr.s6_addr,
+                u16::from_be(addr.sin6_port),
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Non-Linux builds never reach transparent mode (the config validator rejects
+/// it), so the original destination is simply the local address.
+#[cfg(not(target_os = "linux"))]
+fn original_dst(stream: &TcpStream) -> Option<SocketAddr> {
+    stream.local_addr().ok().map(normalize_socket_addr)
+}
+
+impl TcpProxyApp {
+    /// Admit, select an upstream for, and relay one accepted connection.
+    ///
+    /// `client` is the accepted transport — a plain [`TcpStream`], or a
+    /// TLS-terminated stream once the listener terminates TLS. `peer` is the
+    /// client address and `original_destination` the Linux REDIRECT/TPROXY
+    /// destination in transparent mode (`None` otherwise).
+    ///
+    /// Returns as soon as the connection has been handed to its relay task, so
+    /// the caller can accept the next connection. A connection refused by
+    /// admission or by an all-unhealthy backend set is dropped here.
+    /// Reserve one admission slot, or report the listener as full.
+    ///
+    /// Taken by the acceptor *before* any per-connection work — including the
+    /// TLS handshake — so `max_connections` bounds everything the listener is
+    /// holding open, not just established relays. A client that connects and
+    /// never completes a handshake would otherwise occupy an unbounded number
+    /// of tasks and descriptors.
+    pub(crate) fn admit(
         self: &Arc<Self>,
-        mut session: Stream,
-        shutdown: &ShutdownWatch,
-    ) -> Option<Stream> {
-        tracing::debug!("tcp {}: new connection", self.listener);
+    ) -> Option<(RuntimeHandle, tokio::sync::OwnedSemaphorePermit)> {
         // Load the current runtime (rebuilt on reload when the spec changed);
         // new connections always use the latest upstream set and limits.
         let handle = self.current_handle();
-        let client_addr = peer_addr(&mut session);
-        let transparent = handle.transparent;
-        let original_destination = transparent.then(|| original_dst(&session)).flatten();
-        // Admission first: reject before spending a worker on connect/relay
-        // when the listener is at capacity.
-        let permit = match handle.admission.clone().try_acquire_owned() {
-            Ok(permit) => permit,
+        match handle.admission.clone().try_acquire_owned() {
+            Ok(permit) => Some((handle, permit)),
             Err(_) => {
                 self.metrics.rejected.inc();
                 tracing::debug!("tcp {}: admission limit reached; rejecting", self.listener);
-                return None;
+                None
             }
-        };
+        }
+    }
+
+    /// Select an upstream for an admitted connection and relay it.
+    ///
+    /// `client` is the accepted transport — a plain [`TcpStream`], or a
+    /// TLS-terminated stream once the listener terminates TLS. `peer` is the
+    /// client address and `original_destination` the Linux REDIRECT/TPROXY
+    /// destination in transparent mode (`None` otherwise). `handle` and
+    /// `permit` come from [`Self::admit`].
+    ///
+    /// Returns as soon as the connection has been handed to its relay task, so
+    /// the caller can accept the next connection. A connection refused by an
+    /// all-unhealthy backend set is dropped here, releasing the permit.
+    pub(crate) async fn handle_connection<S>(
+        self: &Arc<Self>,
+        client: S,
+        peer: Option<SocketAddr>,
+        original_destination: Option<SocketAddr>,
+        shutdown: &ShutdownWatch,
+        handle: RuntimeHandle,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        tracing::debug!("tcp {}: new connection", self.listener);
+        let client_addr = peer;
+        let transparent = handle.transparent;
         let key = match handle.policy {
             crate::config::ast::LbPolicy::IpHash => client_addr
                 .map(|a| a.ip().to_string().into_bytes())
@@ -753,7 +1355,7 @@ impl ServerApp for TcpProxyApp {
                     Some(addr) => Some(addr),
                     None => {
                         self.metrics.no_upstream.inc();
-                        return None;
+                        return;
                     }
                 },
                 L4Selector::Sni { .. } => None,
@@ -761,9 +1363,8 @@ impl ServerApp for TcpProxyApp {
         };
         self.metrics.accepted.inc();
 
-        // The relay owns the connection: spawn it so the worker accepts the
-        // next connection immediately. `None` tells pingora the session is not
-        // reusable (every TCP connection is terminal).
+        // The relay owns the connection: spawn it so the acceptor takes the
+        // next connection immediately.
         let metrics = self.metrics.clone();
         let connect_timeout = handle.connect_timeout;
         let idle_timeout = handle.idle_timeout;
@@ -778,7 +1379,7 @@ impl ServerApp for TcpProxyApp {
                 L4Selector::Balancer(_) => {
                     let upstream = pre_selected.expect("balancer mode pre-selects");
                     relay_tcp(
-                        session,
+                        client,
                         upstream,
                         transparent.then_some(client_addr).flatten(),
                         connect_timeout,
@@ -790,7 +1391,7 @@ impl ServerApp for TcpProxyApp {
                 }
                 L4Selector::Sni { routes, fallback } => {
                     relay_tcp_sni(
-                        session,
+                        client,
                         routes.clone(),
                         *fallback,
                         connect_timeout,
@@ -816,7 +1417,6 @@ impl ServerApp for TcpProxyApp {
                 });
             }
         });
-        None
     }
 }
 
@@ -855,15 +1455,18 @@ async fn connect_upstream(
 }
 
 /// Connect to the upstream under a hard wall-clock bound, then relay.
-async fn relay_tcp(
-    client: Stream,
+async fn relay_tcp<S>(
+    client: S,
     upstream_addr: SocketAddr,
     source_addr: Option<SocketAddr>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     shutdown: &ShutdownWatch,
     metrics: &TcpMetrics,
-) -> RelayOutcome {
+) -> RelayOutcome
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let upstream = match tokio::time::timeout(
         connect_timeout,
         connect_upstream(upstream_addr, source_addr),
@@ -929,15 +1532,18 @@ fn select_sni_route(routes: &HashMap<String, SocketAddr>, name: &str) -> Option<
 /// inspected bytes, then relay the rest. Unknown SNI / absent SNI / malformed
 /// ClientHello all use the fallback when set, otherwise the connection is
 /// closed.
-async fn relay_tcp_sni(
-    mut client: Stream,
+async fn relay_tcp_sni<S>(
+    mut client: S,
     routes: Arc<HashMap<String, SocketAddr>>,
     fallback: Option<SocketAddr>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     shutdown: &ShutdownWatch,
     metrics: &TcpMetrics,
-) -> RelayOutcome {
+) -> RelayOutcome
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // 1. Bounded inspection: read until a complete ClientHello is available.
     let inspected = tls::read_client_hello(&mut client, tls::MAX_CLIENT_HELLO_BYTES).await;
     // 2. Select the upstream: exact SNI -> its route; else the fallback; else
@@ -1067,89 +1673,127 @@ impl EndReason {
 /// connection lifetime. Half-close is propagated (EOF on one side shuts the
 /// write half of the other), so the remaining direction drains. When the
 /// server begins shutting down the relay is cancelled promptly.
-async fn bidirectional(
-    mut client: Stream,
+async fn bidirectional<S>(
+    mut client: S,
     mut upstream: TcpStream,
     idle: Duration,
     shutdown: &ShutdownWatch,
-) -> (u64, u64, EndReason) {
-    let last = Arc::new(tokio::sync::Mutex::new(Instant::now()));
+) -> (u64, u64, EndReason)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // The activity clock is an atomic, not a mutex: both pumps touch it on
+    // every chunk, and an async lock there serialises the two directions
+    // against each other on the hot path. Time is stored as milliseconds since
+    // `base`, which is ample resolution for an idle timeout.
+    let base = Instant::now();
+    let last = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    // Byte counters live outside the pumps so the shutdown path can report what
+    // was transferred without waiting for them to finish.
+    let c2u = Arc::new(AtomicU64::new(0));
+    let u2c = Arc::new(AtomicU64::new(0));
 
-    // Watchdog: once the connection has been idle for `idle`, or the server
-    // begins shutting down, set `stop`. The loop recomputes the deadline from
-    // the shared activity clock each iteration, so traffic in either direction
-    // extends it; only a genuinely idle connection trips the `now >= deadline`
-    // check. `shutdown.changed()` (re-armed every iteration) plus the
-    // borrow-check at the top make shutdown prompt.
-    {
-        let last = last.clone();
-        let stop = stop.clone();
-        let mut shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            loop {
-                if *shutdown.borrow() {
-                    stop.store(true, Ordering::Relaxed);
-                    return;
-                }
-                let deadline = *last.lock().await + idle;
-                let now = Instant::now();
-                if now >= deadline {
-                    stop.store(true, Ordering::Relaxed);
-                    return;
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(deadline - now) => {
-                        // Loop to recompute the deadline: activity during the
-                        // sleep extended `last`, so the connection is not idle.
-                    }
-                    _ = shutdown.changed() => {}
-                }
-            }
-        });
-    }
-
-    // Split each side into read/write halves so both directions run
-    // concurrently on owned halves (`Stream` is `Unpin`).
     let (client_r, client_w) = tokio::io::split(&mut client);
     let (upstream_r, upstream_w) = tokio::io::split(&mut upstream);
 
-    let (c2u, u2c) = tokio::join!(
-        pump(client_r, upstream_w, &last, &stop),
-        pump(upstream_r, client_w, &last, &stop),
-    );
-
-    let end = if *shutdown.borrow() {
-        EndReason::Shutdown
-    } else if stop.load(Ordering::Relaxed) {
-        // `stop` was set by the idle watchdog (shutdown already handled above).
-        EndReason::Idle
-    } else {
-        EndReason::Closed
+    let pumps = async {
+        tokio::join!(
+            pump(client_r, upstream_w, base, idle, &last, &stop, &c2u),
+            pump(upstream_r, client_w, base, idle, &last, &stop, &u2c),
+        )
     };
-    (c2u, u2c, end)
+    tokio::pin!(pumps);
+    let mut shutdown_watch = shutdown.clone();
+    // Sync this receiver's seen-version before selecting on it. A cloned
+    // `watch::Receiver` inherits the seen state of the receiver it came from, so
+    // if that one never observed the current value, `changed()` would resolve
+    // immediately and kill the connection before it relayed anything.
+    if *shutdown_watch.borrow_and_update() {
+        return (0, 0, EndReason::Shutdown);
+    }
+
+    // One shutdown future per connection, not one per read and not a spawned
+    // watchdog task: at ten thousand concurrent connections the spawn itself is
+    // the cost, and it lands entirely inside the connection-establishment burst.
+    let end = tokio::select! {
+        (a, b) = &mut pumps => {
+            let idle_stop = stop.load(Ordering::Relaxed);
+            return (
+                a,
+                b,
+                if *shutdown_watch.borrow() {
+                    EndReason::Shutdown
+                } else if idle_stop {
+                    EndReason::Idle
+                } else {
+                    EndReason::Closed
+                },
+            );
+        }
+        _ = shutdown_watch.changed() => EndReason::Shutdown,
+    };
+    // Shutting down: tell the pumps to stop and report what they moved. They
+    // observe `stop` on their next read boundary and drop their halves.
+    stop.store(true, Ordering::Relaxed);
+    (
+        c2u.load(Ordering::Relaxed),
+        u2c.load(Ordering::Relaxed),
+        end,
+    )
 }
 
 /// Copy bytes from `src` to `dst`, resetting the shared activity clock on each
 /// read and stopping when `stop` is set. On `src` EOF, half-closes `dst`'s
 /// write side so the far end sees EOF while the other direction keeps flowing.
+///
+/// The inactivity timeout is enforced here rather than by a watchdog task. A
+/// read that does not complete within `idle` is not itself proof the connection
+/// is idle — the *other* direction may be busy — so the shared clock is
+/// consulted before giving up. This keeps the documented "reset by traffic in
+/// either direction" semantics while costing no task and no extra timer per
+/// connection.
+#[allow(clippy::too_many_arguments)]
 async fn pump<R, W>(
     mut src: R,
     mut dst: W,
-    last: &Arc<tokio::sync::Mutex<Instant>>,
+    base: Instant,
+    idle: Duration,
+    last: &Arc<AtomicU64>,
     stop: &Arc<AtomicBool>,
+    total_out: &Arc<AtomicU64>,
 ) -> u64
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; RELAY_CHUNK];
+    // Grows on demand: see `RELAY_CHUNK_MIN` / `RELAY_CHUNK_MAX`. An idle
+    // connection keeps the small buffer forever; a bulk transfer reaches the
+    // large one within a few reads.
+    let mut buf = vec![0u8; RELAY_CHUNK_MIN];
     let mut total = 0u64;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match src.read(&mut buf).await {
+        let read = match tokio::time::timeout(idle, src.read(&mut buf)).await {
+            Err(_) => {
+                // This direction was quiet for the whole window. Only close if
+                // the connection as a whole was idle; otherwise the other
+                // direction is carrying traffic and this one keeps waiting.
+                let idle_ms = base
+                    .elapsed()
+                    .as_millis()
+                    .saturating_sub(u128::from(last.load(Ordering::Relaxed)));
+                if idle_ms >= idle.as_millis() {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                continue;
+            }
+            Ok(result) => result,
+        };
+        match read {
             Ok(0) => {
                 // EOF: propagate half-close, then let the other direction end.
                 let _ = dst.shutdown().await;
@@ -1159,31 +1803,27 @@ where
                 if dst.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
-                // Pingora's transport `Stream` wraps the socket in a buffered
-                // writer; flush so relayed bytes reach the peer promptly rather
-                // than sitting in the write buffer until it fills.
+                // A full buffer means the socket had at least this much queued,
+                // so the next read can likely be larger. Doubling costs one
+                // reallocation per step and stops at `RELAY_CHUNK_MAX`.
+                if n == buf.len() && buf.len() < RELAY_CHUNK_MAX {
+                    buf.resize((buf.len() * 2).min(RELAY_CHUNK_MAX), 0);
+                }
+                // A plain `TcpStream` has no user-space write buffer, so this
+                // flush is a no-op and `write_all` above already reached the
+                // kernel. It is kept because a TLS-terminated listener hands
+                // this pump an `SslStream`, whose write BIO *does* buffer.
                 if dst.flush().await.is_err() {
                     break;
                 }
                 total += n as u64;
-                *last.lock().await = Instant::now();
+                total_out.store(total, Ordering::Relaxed);
+                last.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
             }
             Err(_) => break,
         }
     }
     total
-}
-
-/// The peer address of a stream, if the transport can report it.
-fn peer_addr(session: &mut Stream) -> Option<SocketAddr> {
-    let digest = session.get_socket_digest()?;
-    digest
-        .peer_addr
-        .get()?
-        .as_ref()
-        .and_then(|addr| addr.as_inet())
-        .copied()
-        .map(normalize_socket_addr)
 }
 
 /// Collapse an IPv4-mapped IPv6 peer address from a dual-stack listener.
@@ -1223,10 +1863,10 @@ fn has_hostname_upstreams(tcp: &TcpProxyConfig) -> bool {
         .any(|u| u.host.parse::<std::net::IpAddr>().is_err())
 }
 
-/// The DNS refresh period, overridable via `RADDY_DNS_REFRESH_SECS` (a test
+/// The DNS refresh period, overridable via `RADDEX_DNS_REFRESH_SECS` (a test
 /// hook so a short-lived CI run can observe a refresh).
 fn dns_refresh_interval() -> Duration {
-    std::env::var("RADDY_DNS_REFRESH_SECS")
+    std::env::var("RADDEX_DNS_REFRESH_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_secs)
@@ -1240,7 +1880,8 @@ fn dns_refresh_interval() -> Duration {
 fn refresh_dns(
     config_store: &ConfigStore,
     listen: &ListenAddress,
-    runtime: &Mutex<AppRuntime>,
+    runtime: &arc_swap::ArcSwap<AppRuntime>,
+    rebuild_lock: &Mutex<()>,
     metrics: &TcpMetrics,
     listener: &str,
 ) {
@@ -1255,11 +1896,11 @@ fn refresh_dns(
     };
     match resolved_set(tcp, listen) {
         Ok(new_resolved) => {
-            let mut guard = runtime.lock().expect("L4 runtime lock poisoned");
+            let _rebuild = rebuild_lock.lock().expect("L4 rebuild lock poisoned");
             // Compare the *sets* of addresses (order can rotate between
             // resolutions without meaning the backend changed) so a benign
             // reorder does not rebuild the balancer and reset health state.
-            let mut current: Vec<SocketAddr> = guard.resolved.clone();
+            let mut current: Vec<SocketAddr> = runtime.load().resolved.clone();
             current.sort_unstable();
             let mut next: Vec<SocketAddr> = new_resolved.clone();
             next.sort_unstable();
@@ -1269,7 +1910,7 @@ fn refresh_dns(
                         tracing::info!(
                             "tcp {listener}: upstream addresses changed via DNS refresh"
                         );
-                        *guard = new_runtime;
+                        runtime.store(Arc::new(new_runtime));
                     }
                     Err(e) => {
                         metrics.dns_refresh_failures.inc();
@@ -1298,6 +1939,35 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loopback address on a free port, for the bind tests.
+    fn free_addr() -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        probe.local_addr().expect("probe address")
+    }
+
+    #[test]
+    fn reuse_port_lets_every_accept_loop_own_a_socket() {
+        // The scalability fix depends on this: N accept loops each need their
+        // own listening socket on the same address.
+        let addr = free_addr();
+        let first = bind_listener(addr, true).expect("first reuseport bind");
+        let second = bind_listener(addr, true).expect("second reuseport bind");
+        assert_eq!(
+            first.local_addr().expect("addr"),
+            second.local_addr().expect("addr")
+        );
+    }
+
+    #[test]
+    fn a_single_loop_listener_still_rejects_a_port_conflict() {
+        // Without SO_REUSEPORT a second bind must fail, so a genuine port
+        // conflict is still reported instead of being silently shared.
+        let addr = free_addr();
+        let _held = bind_listener(addr, false).expect("first bind");
+        let error = bind_listener(addr, false).expect_err("a conflicting bind must fail");
+        assert!(error.contains("bind TCP listener"), "got: {error}");
+    }
 
     #[test]
     fn resolve_upstream_accepts_ip_literals() {
@@ -1426,7 +2096,9 @@ mod tests {
         // A transient DNS refresh failure must keep the working backend set and
         // count the failure (L4 plan), never discard it.
         let good = tcp_config(&["127.0.0.1:1"]);
-        let runtime = Arc::new(Mutex::new(AppRuntime::build(&good, &good.listen).unwrap()));
+        let runtime =
+            arc_swap::ArcSwap::from_pointee(AppRuntime::build(&good, &good.listen).unwrap());
+        let rebuild_lock = Mutex::new(());
         let metrics = TcpMetrics::register("tcp/127.0.0.1:3306");
 
         // The live snapshot's upstream now fails to resolve.
@@ -1438,16 +2110,17 @@ mod tests {
         };
         let store = ConfigStore::new(compiled);
 
-        let before = runtime.lock().unwrap().resolved.clone();
+        let before = runtime.load().resolved.clone();
         refresh_dns(
             &store,
             &good.listen,
             &runtime,
+            &rebuild_lock,
             &metrics,
             "tcp/127.0.0.1:3306",
         );
         assert_eq!(
-            runtime.lock().unwrap().resolved,
+            runtime.load().resolved,
             before,
             "last-known-good addresses must be kept on a refresh failure"
         );

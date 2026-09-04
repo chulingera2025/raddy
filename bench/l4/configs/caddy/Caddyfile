@@ -1,0 +1,17 @@
+{
+    layer4 {
+        tcp/:18000 {
+            matching_timeout 5s
+            route {
+                proxy tcp/origin:19000
+            }
+        }
+
+        udp/:18001 {
+            matching_timeout 5s
+            route {
+                proxy udp/origin:19001
+            }
+        }
+    }
+}

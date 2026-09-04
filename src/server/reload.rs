@@ -14,7 +14,7 @@
 //! SIGHUP-triggered config hot reload (ADR-010).
 //!
 //! Pingora's Server handles only SIGINT/SIGTERM/SIGQUIT, so SIGHUP is free for
-//! Raddy. A dedicated thread re-reads and re-validates the Raddyfile on every
+//! Raddex. A dedicated thread re-reads and re-validates the Raddexfile on every
 //! SIGHUP, atomically swapping the snapshot on success and keeping the old one
 //! on failure. Listeners are never touched (ADR-010).
 

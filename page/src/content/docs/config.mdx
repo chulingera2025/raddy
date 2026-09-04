@@ -1,17 +1,17 @@
 ---
 title: Concepts
-description: The mental model behind the Raddyfile — how directives execute and how a request flows through your configuration.
+description: The mental model behind the Raddexfile — how directives execute and how a request flows through your configuration.
 ---
 
-The Raddyfile is the heart of raddy: a plain-text configuration in a
-Caddyfile-style syntax, validated with `raddy check` and served with
-`raddy run`. This page gives you the mental model. The [directive
+The Raddexfile is the heart of raddex: a plain-text configuration in a
+Caddyfile-style syntax, validated with `raddex check` and served with
+`raddex run`. This page gives you the mental model. The [directive
 reference](directives/) has the complete syntax, and [Sites, ports &
 HTTPS](sites/) covers how a request is matched to a site.
 
 ## A configuration at a glance
 
-A Raddyfile is an optional **global block** followed by one or more **site
+A Raddexfile is an optional **global block** followed by one or more **site
 blocks**:
 
 ```caddyfile
@@ -35,7 +35,7 @@ static.example.com {
 
 ## Two kinds of directive
 
-Once a request is matched to a site, raddy executes the site's lines **strictly
+Once a request is matched to a site, raddex executes the site's lines **strictly
 in write order**. Every line is one of three kinds:
 
 - **Terminal directives** decide *who serves* the request: `reverse_proxy`,
@@ -50,7 +50,7 @@ in write order**. Every line is one of three kinds:
   `forward_auth`. They act like modifiers — applying to whichever terminal serves
   the block — and reject the request (`429`, `401`) when the guard fails.
 
-> **Caddy users:** Caddy reorders directives behind the scenes; raddy does not.
+> **Caddy users:** Caddy reorders directives behind the scenes; raddex does not.
 > You control the order, and the first match wins.
 
 ### Matchers select which requests a directive serves

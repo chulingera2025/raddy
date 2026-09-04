@@ -1,9 +1,9 @@
 ---
 title: Directive reference
-description: Every Raddyfile directive with its syntax, arguments, and a runnable example.
+description: Every Raddexfile directive with its syntax, arguments, and a runnable example.
 ---
 
-This is the complete reference for the Raddyfile. Each directive follows the same
+This is the complete reference for the Raddexfile. Each directive follows the same
 shape: what it does, its syntax, its arguments, and an example. If you are new to
 the language, read [Concepts](../) first for the mental model, and
 [Routing & matchers](../../guides/routing/) for how matchers and routing directives
@@ -233,7 +233,7 @@ api.example.com {
 
 ## `error`
 
-**Purpose.** Trigger raddy's internal error response with a chosen status and an
+**Purpose.** Trigger raddex's internal error response with a chosen status and an
 optional message.
 
 **Syntax.**
@@ -373,7 +373,7 @@ api.example.com {
 
 ## `encode`
 
-**Purpose.** Compress responses. The **argument order is the priority** — raddy
+**Purpose.** Compress responses. The **argument order is the priority** — raddex
 uses the first algorithm the client also supports.
 
 **Syntax.**
@@ -499,7 +499,7 @@ forward_auth <host:port>
 
 **Arguments.** `<host:port>` — the auth upstream, e.g. `auth.example.com:4181`.
 
-**Behavior.** A guard: raddy forwards a request to the auth upstream, carrying
+**Behavior.** A guard: raddex forwards a request to the auth upstream, carrying
 the original `Authorization` and `X-Forwarded-For` headers, and grants access
 only on a **2xx** response. A **403** from the auth upstream is passed through to
 the client; anything else yields **401**. Response headers from the auth
@@ -600,7 +600,7 @@ secure.example.com {
 
 ## `access_log`
 
-**Purpose.** Configure access logging in the Raddyfile instead of (or in
+**Purpose.** Configure access logging in the Raddexfile instead of (or in
 addition to) the `--access-log` CLI flag.
 
 **Syntax.**
@@ -624,14 +624,14 @@ access_log off
 **Behavior.** In the global block, `access_log <path>` sets the instance log file
 and format; `access_log off` disables access logging for the whole instance. In
 a site block, `access_log off` disables access logging for that site only. When
-both the Raddyfile and the `--access-log` flag are set, the flag wins. See
+both the Raddexfile and the `--access-log` flag are set, the flag wins. See
 [Access log](../../operations/access-log/) for the JSON fields.
 
 **Example.**
 
 ```caddyfile
 {
-    access_log /var/log/raddy/access.log format=common
+    access_log /var/log/raddex/access.log format=common
 }
 
 api.example.com {
@@ -642,7 +642,7 @@ api.example.com {
 
 ## `trusted_proxies`
 
-**Purpose.** Declare which networks are trusted proxies, so raddy can derive the
+**Purpose.** Declare which networks are trusted proxies, so raddex can derive the
 real client IP from `X-Forwarded-For`. See [Trusted proxies](../trusted-proxies/).
 
 **Syntax.**
@@ -664,33 +664,58 @@ port 80 is unreachable. See [Sites, ports & HTTPS](../sites/).
 **Syntax.**
 
 ```caddyfile
-dns_challenge cloudflare <api_token>
+dns_challenge <provider> <value>        # shorthand: one credential
+dns_challenge <provider> { ... }        # block: any number of credentials
 ```
 
-**Arguments.** The provider (`cloudflare` — the only one today) and the
-provider's API token, which must have **Zone: DNS: Edit** permission. Lives in
-the [global block](../sites/#the-global-block).
+**Arguments.** The provider keyword, plus its credentials. The shorthand is
+available only for a provider that needs exactly one credential; the block form
+takes one `<field> <value>` line per credential and works for every provider.
+Lives in the [global block](../sites/#the-global-block).
+
+| Provider | Credential | Required | Notes |
+|---|---|---|---|
+| `cloudflare` | `api_token` | yes | Must have **Zone: DNS: Edit** on the zone. |
 
 **Behavior.** When set, every certificate on the instance is issued via DNS-01:
-raddy publishes `_acme-challenge.<host>` TXT records while the order is being
+raddex publishes `_acme-challenge.<host>` TXT records while the order is being
 validated and removes them afterwards. Without `dns_challenge`, HTTP-01 is used
-as before.
+as before. `raddex check` validates the provider keyword and its credential
+fields — a missing or empty required credential, an unknown field name, and a
+duplicated field are all configuration errors.
 
-> **Security:** the API token is a secret — keep the Raddyfile out of version
-> control or protect it accordingly.
+> **Security:** every credential value is a secret. Raddex redacts them from its
+> diagnostic output, but the Raddexfile holds them in cleartext — keep it out of
+> version control, or inject the values with `{$ENV}` placeholders.
 
 **Example.**
 
 ```caddyfile
 {
     acme_email ops@example.com
-    dns_challenge cloudflare <api_token>
+    dns_challenge cloudflare {$CLOUDFLARE_API_TOKEN}
 }
 
 api.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
+
+The block form is equivalent, and is the shape a multi-credential provider
+uses:
+
+```caddyfile
+{
+    acme_email ops@example.com
+    dns_challenge cloudflare {
+        api_token {$CLOUDFLARE_API_TOKEN}
+    }
+}
+```
+
+Providers are registry entries in `src/server/dns/`; adding one does not change
+this grammar. See
+[CONTRIBUTING.md](https://github.com/chulingera2025/raddex/blob/main/CONTRIBUTING.md).
 
 ## `tls_alpn_challenge`
 
@@ -752,7 +777,7 @@ import <file|name>
 
 **Behavior.**
 
-- `import <file>` splices the contents of another Raddyfile at that point. Paths
+- `import <file>` splices the contents of another Raddexfile at that point. Paths
   are relative to the importing file. Imports may nest (depth-limited). A site
   block may import a file whose directives belong to that site.
 - A top-level block named `(name) { ... }` defines a reusable **snippet**;
@@ -764,7 +789,7 @@ import <file|name>
 ```caddyfile
 (base) {
     rate_limit remote_ip 100r/s
-    header_up X-Raddy true
+    header_up X-Raddex true
 }
 
 api.example.com {
@@ -781,11 +806,11 @@ admin.example.com {
 
 ## Environment variables
 
-**Purpose.** Inject values from the environment into a Raddyfile at parse time.
+**Purpose.** Inject values from the environment into a Raddexfile at parse time.
 
 **Syntax.** A directive argument of the form `{$ENV_VAR}` is replaced by the
 value of `ENV_VAR`. A missing variable is a validation error, so a config with a
-typoed variable fails `raddy check` instead of starting with a bogus value.
+typoed variable fails `raddex check` instead of starting with a bogus value.
 
 **Behavior.** Works anywhere an argument appears — upstream targets, `root`
 paths, `tls` certificate paths, and so on.
@@ -822,7 +847,7 @@ Durations are a number plus a unit (`ms` / `s` / `m` / `h`), or a bare number
 meaning seconds.
 
 **Behavior.** An unhealthy upstream is never selected and flows back automatically
-once restored. If **every** upstream is unhealthy, raddy returns `502`. Health
+once restored. If **every** upstream is unhealthy, raddex returns `502`. Health
 state survives SIGHUP reloads and is rebuilt only when the upstream list, policy,
 or health-check parameters change.
 
@@ -853,7 +878,7 @@ rejected as meaningless.
 reverse_proxy {
     to https://10.0.0.1:8443 https://10.0.0.2:8443
     tls_servername api.internal
-    tls_ca /etc/raddy/root-ca.pem
+    tls_ca /etc/raddex/root-ca.pem
 }
 ```
 
@@ -875,7 +900,7 @@ api.example.com {
     reverse_proxy {
         to https://10.0.0.1:8443
         tls_servername api.internal
-        tls_ca /etc/raddy/root-ca.pem
+        tls_ca /etc/raddex/root-ca.pem
     }
 }
 ```
@@ -886,11 +911,11 @@ api.example.com {
 similar `Connection: upgrade` protocols) transparently.
 
 **Behavior.** The client's upgrade request goes upstream; once the upstream
-answers `101 Switching Protocols`, raddy tunnels the connection
+answers `101 Switching Protocols`, raddex tunnels the connection
 bidirectionally. No directive is needed — this is the default behavior of
 `reverse_proxy` for HTTP/1.1 upgrade requests.
 
-- Upgrades are **end-to-end**: raddy does not terminate the upgraded protocol;
+- Upgrades are **end-to-end**: raddex does not terminate the upgraded protocol;
   the backend must speak it.
 - `header_up` / `header_down` still apply to the upgrade request/response
   headers; `encode` never applies to a `101` (upgraded) response.
@@ -903,7 +928,7 @@ chat.example.com {
 }
 ```
 
-The same site serves both WebSocket and regular HTTP traffic; raddy upgrades
+The same site serves both WebSocket and regular HTTP traffic; raddex upgrades
 only requests that carry an `Upgrade` header.
 
 ## A complete example
@@ -913,12 +938,12 @@ only requests that carry an `Upgrade` header.
     acme_email ops@example.com
     log_level info
     trusted_proxies 127.0.0.1
-    access_log /var/log/raddy/access.jsonl format=json
+    access_log /var/log/raddex/access.jsonl format=json
 }
 
 (base) {
     rate_limit remote_ip 50r/s burst=100
-    header_up X-Raddy true
+    header_up X-Raddex true
 }
 
 # HTTP → HTTPS redirect

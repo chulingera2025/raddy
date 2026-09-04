@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Install a verified Linux release, build Raddy from source, or run it in Docker.
+description: Install a verified Linux release, build Raddex from source, or run it in Docker.
 ---
 
 The release page provides checksum-verified Linux binaries for `x86_64` and
@@ -12,19 +12,19 @@ matching archive and verifies its checksum before it writes the binary.
 Download the installer and its checksum file, inspect the script, then run it:
 
 ```bash
-curl -fsSLO https://github.com/chulingera2025/raddy/releases/latest/download/install.sh
-curl -fsSLO https://github.com/chulingera2025/raddy/releases/latest/download/SHA256SUMS
+curl -fsSLO https://github.com/chulingera2025/raddex/releases/latest/download/install.sh
+curl -fsSLO https://github.com/chulingera2025/raddex/releases/latest/download/SHA256SUMS
 grep '  install.sh$' SHA256SUMS | shasum -a 256 -c -
 less install.sh
 ./install.sh
-raddy --version
+raddex --version
 ```
 
 The default prefix is `/usr/local`. A specific release and prefix can be
 selected explicitly:
 
 ```bash
-./install.sh v0.3.5 "$HOME/.local"
+./install.sh v0.3.6 "$HOME/.local"
 ```
 
 If the prefix is not on `PATH`, invoke the binary by its full path or update
@@ -32,8 +32,8 @@ your shell configuration.
 
 ## Install manually
 
-1. Download `raddy-<arch>-unknown-linux-gnu.tar.gz` and `SHA256SUMS` from the
-   [release page](https://github.com/chulingera2025/raddy/releases).
+1. Download `raddex-<arch>-unknown-linux-gnu.tar.gz` and `SHA256SUMS` from the
+   [release page](https://github.com/chulingera2025/raddex/releases).
 2. Verify the archive:
 
    ```bash
@@ -43,9 +43,9 @@ your shell configuration.
 3. Extract the matching archive and install the binary:
 
    ```bash
-   tar -xzf raddy-<arch>-unknown-linux-gnu.tar.gz
-   sudo install -Dm755 raddy /usr/local/bin/raddy
-   raddy --version
+   tar -xzf raddex-<arch>-unknown-linux-gnu.tar.gz
+   sudo install -Dm755 raddex /usr/local/bin/raddex
+   raddex --version
    ```
 
 ## Build from source
@@ -60,7 +60,7 @@ Build and verify the release binary:
 
 ```bash
 cargo build --release --locked
-./target/release/raddy --version
+./target/release/raddex --version
 ```
 
 ## Run in Docker
@@ -69,25 +69,25 @@ Build the included image, mount the configuration read-only, and expose only
 the listener ports you use:
 
 ```bash
-docker build -t raddy .
+docker build -t raddex .
 docker run --rm -p 8080:8080 \
-  -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
-  raddy run -c /etc/raddy/Raddyfile
+  -v "$PWD/Raddexfile:/etc/raddex/Raddexfile:ro" \
+  raddex run -c /etc/raddex/Raddexfile
 ```
 
 For ACME, persist the certificate directory and publish ports 80 and 443:
 
 ```bash
 docker run --rm -p 80:80 -p 443:443 \
-  -v "$PWD/Raddyfile:/etc/raddy/Raddyfile:ro" \
-  -v raddy_certs:/etc/raddy/certs \
-  raddy run -c /etc/raddy/Raddyfile --cert-dir /etc/raddy/certs
+  -v "$PWD/Raddexfile:/etc/raddex/Raddexfile:ro" \
+  -v raddex_certs:/etc/raddex/certs \
+  raddex run -c /etc/raddex/Raddexfile --cert-dir /etc/raddex/certs
 ```
 
 ## Verify before deployment
 
 ```bash
-raddy check -c /etc/raddy/Raddyfile
+raddex check -c /etc/raddex/Raddexfile
 ```
 
 For systemd, service hardening, certificate permissions, reload, and upgrade

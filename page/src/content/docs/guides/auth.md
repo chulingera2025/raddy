@@ -61,7 +61,7 @@ How it decides:
 
 The request sent to the auth upstream carries the original `Authorization` and
 `X-Forwarded-For` headers, so the auth service sees the same credentials and
-client as raddy does. **Response headers** from the auth upstream — for example
+client as raddex does. **Response headers** from the auth upstream — for example
 an identity header such as `X-Auth-User` — are copied onto the request before
 the real upstream sees it, so your backend can trust them.
 

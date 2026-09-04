@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Raddyfile lexer (M2/M3 subset).
+//! Raddexfile lexer (M2/M3 subset).
 //!
 //! Line-oriented tokenizer that produces positioned [`Token`]s. Braces that
 //! open/close blocks (`{` / `}`) are separate tokens, but a `{name}`
@@ -43,7 +43,7 @@ pub enum TokenKind {
     Newline,
 }
 
-/// Tokenize a Raddyfile.
+/// Tokenize a Raddexfile.
 ///
 /// The lexer is lenient: structural errors (unbalanced braces, unknown
 /// directives) are left for the parser to report with a position.

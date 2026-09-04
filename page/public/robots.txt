@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://chulingera2025.github.io/raddy/sitemap-index.xml
+Sitemap: https://chulingera2025.github.io/raddex/sitemap-index.xml

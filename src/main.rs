@@ -11,11 +11,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Raddy — a minimal high-performance reverse proxy gateway built on Pingora.
+//! Raddex — a minimal high-performance reverse proxy gateway built on Pingora.
 //!
-//! Entry point for the `raddy` binary. All logic lives in the library crate
-//! (see `src/lib.rs`); this file only dispatches to [`raddy::server::cli`].
+//! Entry point for the `raddex` binary. All logic lives in the library crate
+//! (see `src/lib.rs`); this file only dispatches to [`raddex::server::cli`].
 
 fn main() {
-    raddy::server::cli::main();
+    raddex::server::cli::main();
 }
