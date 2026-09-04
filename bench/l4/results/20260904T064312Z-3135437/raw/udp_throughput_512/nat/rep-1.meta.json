@@ -1,0 +1,1 @@
+{"scenario_id":"udp_throughput_512","title":"UDP throughput / 512 B datagrams","kind":"udp_throughput","target":"nat","transport":"udp","connections":1,"payload_bytes":512,"repetition":1,"exit_code":0,"connect_timeout_ms":5000}

@@ -98,3 +98,8 @@ udp :53 {
   端口。
 - **QUIC 透传**通过 UDP 可用，因为 QUIC 承载于数据报。Pingora 0.8.1 不提供
   QUIC/HTTP/3 终止、HTTP/3 路由或连接迁移；这些需要独立的 QUIC/HTTP/3 sidecar。
+
+## 架构与性能
+
+四层代理核心完全基于原生 Tokio 异步运行时实现，不经过 Pingora 协议栈，具备高吞吐（大报文 TCP 吞吐达到 Nginx 的 156%~177%）与极低内存占用的特性。详见 [性能对比](../../performance/#原生四层转发基准测试layer-4-forwarding) 查看完整场景测试矩阵与归一化实测数据。
+

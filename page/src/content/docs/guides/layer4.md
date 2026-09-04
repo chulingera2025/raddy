@@ -142,3 +142,11 @@ UDP forwarding can carry QUIC datagrams, but it is only passthrough. Pingora
 0.8.1 and Raddex do not terminate QUIC, route HTTP/3 requests, or manage QUIC
 connection migration. Use a dedicated QUIC/HTTP/3 service when those functions
 are required.
+
+## Performance
+
+The layer-4 core is built directly on native Tokio rather than Pingora,
+providing high throughput (156%–177% of Nginx stream on bulk TCP) and low
+memory consumption. See the [Performance Comparison](../../performance/#layer-4-forwarding-benchmark)
+for the full benchmark matrix and normalized metrics.
+

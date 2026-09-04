@@ -1,8 +1,8 @@
 # Raddex v0.3.0 Release Checklist
 
 This is a historical record of the `v0.3.0` release. Its follow-up items and
-known limitations describe that release, not the current `v0.3.5` tree. See
-[`RELEASE_CHECKLIST_v0.3.5.md`](RELEASE_CHECKLIST_v0.3.5.md) and the current
+known limitations describe that release, not the current `v0.3.6` tree. See
+[`RELEASE_CHECKLIST_v0.3.6.md`](RELEASE_CHECKLIST_v0.3.6.md) and the current
 [capability boundaries](PINGORA_CAPABILITY_RESEARCH.md) for present behavior.
 
 Status: released on 2026-08-26.

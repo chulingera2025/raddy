@@ -135,3 +135,7 @@ runs on a busy machine are still interesting for spotting a large discrepancy,
 but say so — they are not directly comparable with the numbers above.
 
 Results that contradict these are the most useful ones to receive.
+
+## License
+
+This benchmark suite and its tools are licensed under the [MIT License](LICENSE).

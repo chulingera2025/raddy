@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/chulingera2025/raddex/actions/workflows/ci.yml/badge.svg)](https://github.com/chulingera2025/raddex/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/chulingera2025/raddex)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v0.3.5-blue)]()
+[![Version](https://img.shields.io/badge/version-v0.3.6-blue)]()
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)]()
 [English](README.md)
 
@@ -105,6 +105,43 @@ Nginx 的 361%，比 Caddy 还差。
 ```bash
 ./bench/scripts/run.sh full
 ```
+
+### 原生四层转发性能（L4 Forwarding）
+
+四层代理运行在 **Tokio 原生** 数据面上（`Raddex -> L4 Core -> Tokio -> TCP/UDP`），数据包完全不经过 Pingora。[`bench/l4/`](bench/l4/) 提供了独立的 Linux 四层基准测试，对比 Nginx stream、Caddy layer4（`mholt/caddy-l4`）、Raddex L4 以及 Linux NAT / nftables。以下数据来自同一台测试机的 `full` 档位（3 次独立重复取中位数，以 Nginx stream = 100% 为基线）：
+
+| 场景 | 评估指标 | Caddy | Raddex | Linux NAT (内核参考) |
+| --- | --- | ---: | ---: | ---: |
+| TCP 吞吐 (64 KiB / 16 并发) | 吞吐量 | 76.6% | **156.5%** | 173.4% |
+| TCP 吞吐 (64 KiB / 16 并发) | CPU / 内存 | 129.8% / 12.6% | **64.4% / 9.3%** | — / — |
+| TCP 吞吐 (64 KiB / 64 并发) | 吞吐量 | 89.2% | **176.6%** | 225.5% |
+| TCP 吞吐 (64 KiB / 64 并发) | CPU / 内存 | 112.4% / 25.4% | **57.6% / 25.1%** | — / — |
+| TCP 连接速率 (10K 并发建连) | 建连速率 | 73.3% | **84.6%** | 117.2% |
+| TCP 连接速率 (50K 并发建连) | 建连速率 | 86.1% | **114.5%** | 456.8% |
+| TCP 连接速率 (50K 并发建连) | CPU / 内存 | 131.8% / 118.1% | **83.2% / 84.0%** | — / — |
+| UDP 流容量 (10K 客户端) | 建立容量 | 98.5% (1.51% 丢包) | **100.0% (0.00% 丢包)** | 100.0% |
+| UDP 流容量 (10K 客户端) | 内存开销 | 183.4% | **52.2%** | — |
+| TCP / UDP p99 延迟 | 延迟 | 100% – 200% | **100.0%** | 40% – 50% |
+
+**核心表现：**
+- **TCP 大数据量吞吐：** 剔除 Pingora 缓冲写和逐 chunk `flush().await` 后，原生 Tokio 中继达到 **Nginx 的 1.56 倍 ~ 1.77 倍吞吐**，同时 **CPU 仅消耗 Nginx 的约 60%**，内存开销降至几分之一。
+- **并发连接建立速率：** 基于多套接字 `SO_REUSEPORT` 原生 accept 循环，10K 速率达到 **Nginx 的 84.6%**（显著高于 Caddy 的 73.3%）；在 50K 极高并发建连下达到 **Nginx 的 114.5%**（反超 Nginx 14.5%），且重试错误率在三家代理中最低。
+- **UDP 流容量与丢包：** 每 worker 线程独占独立 `SO_REUSEPORT` 描述符后，消除了内核接收队列溢出，在 10K 流压测下做到 **100.0% 成功率与 0.000% 丢包**，完全打平 Nginx。
+- **内存占用：** Raddex 在全部场景中保持所有用户态代理中的最低内存水平（通常为 Nginx 的 3%~70%，远低于 Caddy）。
+
+**测试机规格与环境：**
+- **主机硬件：** 10 核 Intel Xeon CPU E5-2650 v2 @ 2.60GHz，8 GiB 内存，Debian 12（Linux 6.1.0-31-amd64），Docker 29.7.2。
+- **资源限制：** 容器 cgroup 限制 2.0 CPUs，1 GiB 内存；Nginx 2 worker processes，Raddex 2 worker threads。
+- **评测流程：** 3 次独立重复取中位数，预热与正式测量之间自动重启容器隔离内核状态。
+
+复现方式：
+
+```bash
+./bench/l4/scripts/run.sh full
+```
+
+![四层转发基准测试概览](page/public/benchmarks/l4-forwarding.svg)
+
 
 ## 配置
 

@@ -21,8 +21,8 @@ The installer downloads the matching archive, verifies its checksum, and only
 then installs `/usr/local/bin/raddex`. Pass a release tag and prefix when needed:
 
 ```bash
-./install.sh v0.3.5 /usr/local
-./install.sh v0.3.5 "$HOME/.local"
+./install.sh v0.3.6 /usr/local
+./install.sh v0.3.6 "$HOME/.local"
 ```
 
 For a manual installation, download the matching archive and `SHA256SUMS`, run

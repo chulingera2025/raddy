@@ -24,7 +24,7 @@ The default prefix is `/usr/local`. A specific release and prefix can be
 selected explicitly:
 
 ```bash
-./install.sh v0.3.5 "$HOME/.local"
+./install.sh v0.3.6 "$HOME/.local"
 ```
 
 If the prefix is not on `PATH`, invoke the binary by its full path or update

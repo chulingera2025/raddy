@@ -1,0 +1,1 @@
+{"scenario_id":"tcp_latency_64","title":"TCP p99 latency / 64 B / 64 connections","kind":"p99_latency","target":"nginx","transport":"tcp","connections":64,"payload_bytes":64,"repetition":3,"exit_code":0,"connect_timeout_ms":5000}

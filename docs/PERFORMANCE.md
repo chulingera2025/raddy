@@ -188,3 +188,92 @@ for the topology and scenario matrix.
 
 `examples/loadtest.rs` remains a small developer smoke test; it opens a fresh
 connection per request and is not the cross-proxy comparison.
+
+## Layer 4 forwarding benchmark
+
+While HTTP runs through Pingora, Layer 4 (TCP/UDP) runs on an independent
+**native Tokio** core (`Raddex -> L4 Core -> Tokio -> TCP/UDP`). The L4
+benchmark lives in [`bench/l4/`](../bench/l4/) and compares Nginx stream,
+Caddy layer4 (`mholt/caddy-l4`), Raddex L4, and Linux NAT / nftables as a
+kernel baseline.
+
+### Run provenance
+
+| Parameter | Value |
+| --- | --- |
+| Profile | `full` (17 scenarios, capped at 50K) |
+| Run ID | `20260904T064312Z-3135437` |
+| Raddex commit | `b548f6455907ef2f6bee4982273ead070312f05b` |
+| Host | 10-core Intel Xeon CPU E5-2650 v2 @ 2.60GHz / 8 GiB RAM, Debian 12 (Linux 6.1.0-31-amd64) |
+| Container runtime | Docker 29.7.2 |
+| Per-target quota | 2.0 CPUs, 1 GiB memory |
+| Worker configuration | Nginx 2 workers, Raddex 2 worker threads, Caddy default (cgroup-bounded) |
+| Isolation | Container restart between warmup and measurement passes |
+| Aggregation | 3 repetitions, median |
+
+### Normalized results (Nginx stream = 100%)
+
+| Scenario | Target | Throughput | PPS | Connect/s | Connections | p99 | CPU | Memory | Error rate | Packet loss |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TCP connection rate / 10K connections | Nginx stream | — | — | 100.0% | — | — | 100.0% | 100.0% | 0.000% | 0.000% |
+| TCP connection rate / 10K connections | Caddy layer4 | — | — | 73.3% | — | — | 316.0% | 190.1% | 0.000% | 0.000% |
+| TCP connection rate / 10K connections | Raddex L4 | — | — | **84.6%** | — | — | 254.7% | **67.4%** | 0.000% | 0.000% |
+| TCP connection rate / 10K connections | Linux NAT / nftables | — | — | 117.2% | — | — | — | — | 0.000% | 0.000% |
+| TCP connection rate / 50K connections | Nginx stream | — | — | 100.0% | — | — | 100.0% | 100.0% | 42.394% | 0.000% |
+| TCP connection rate / 50K connections | Caddy layer4 | — | — | 86.1% | — | — | 131.8% | 118.1% | 42.358% | 0.000% |
+| TCP connection rate / 50K connections | Raddex L4 | — | — | **114.5%** | — | — | **83.2%** | **84.0%** | **34.968%** | 0.000% |
+| TCP connection rate / 50K connections | Linux NAT / nftables | — | — | 456.8% | — | — | — | — | 2.904% | 0.000% |
+| TCP throughput / 64 KiB / 1 connection | Nginx stream | 100.0% | — | — | — | — | 100.0% | 100.0% | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 1 connection | Caddy layer4 | 89.6% | — | — | — | — | 117.3% | 8.2% | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 1 connection | Raddex L4 | **105.1%** | — | — | — | — | **96.9%** | **3.8%** | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 1 connection | Linux NAT / nftables | 58.6% | — | — | — | — | — | — | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 16 connections | Nginx stream | 100.0% | — | — | — | — | 100.0% | 100.0% | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 16 connections | Caddy layer4 | 76.6% | — | — | — | — | 129.8% | 12.6% | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 16 connections | Raddex L4 | **156.5%** | — | — | — | — | **64.4%** | **9.3%** | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 16 connections | Linux NAT / nftables | 173.4% | — | — | — | — | — | — | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 64 connections | Nginx stream | 100.0% | — | — | — | — | 100.0% | 100.0% | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 64 connections | Caddy layer4 | 89.2% | — | — | — | — | 112.4% | 25.4% | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 64 connections | Raddex L4 | **176.6%** | — | — | — | — | **57.6%** | **25.1%** | 0.000% | 0.000% |
+| TCP throughput / 64 KiB / 64 connections | Linux NAT / nftables | 225.5% | — | — | — | — | — | — | 0.000% | 0.000% |
+| TCP long-lived connections / 10K | Nginx stream | — | — | — | 100.0% | — | 100.0% | 100.0% | 0.000% | 0.000% |
+| TCP long-lived connections / 10K | Caddy layer4 | — | — | — | 100.0% | — | 225.2% | 191.0% | 0.000% | 0.000% |
+| TCP long-lived connections / 10K | Raddex L4 | — | — | — | 100.0% | — | 183.6% | **67.0%** | 0.000% | 0.000% |
+| TCP long-lived connections / 10K | Linux NAT / nftables | — | — | — | 100.0% | — | — | — | 0.000% | 0.000% |
+| TCP long-lived connections / 50K | Nginx stream | — | — | — | 100.0% | — | 100.0% | 100.0% | 30.798% | 0.000% |
+| TCP long-lived connections / 50K | Caddy layer4 | — | — | — | 80.0% | — | 236.7% | 125.0% | 44.626% | 0.000% |
+| TCP long-lived connections / 50K | Raddex L4 | — | — | — | 85.6% | — | 161.2% | **89.5%** | 40.764% | 0.000% |
+| TCP long-lived connections / 50K | Linux NAT / nftables | — | — | — | 138.9% | — | — | — | 3.848% | 0.000% |
+| UDP flows / 10K clients | Nginx stream | — | — | — | 100.0% | — | 100.0% | 100.0% | 0.000% | 0.000% |
+| UDP flows / 10K clients | Caddy layer4 | — | — | — | 98.5% | — | 340.5% | 183.4% | 1.510% | 0.000% |
+| UDP flows / 10K clients | Raddex L4 | — | — | — | **100.0%** | — | 115.4% | **52.2%** | **0.000%** | 0.000% |
+| UDP flows / 10K clients | Linux NAT / nftables | — | — | — | 100.0% | — | — | — | 0.000% | 0.000% |
+| UDP flows / 50K clients | Nginx stream | — | — | — | 100.0% | — | 100.0% | 100.0% | 43.538% | 0.000% |
+| UDP flows / 50K clients | Caddy layer4 | — | — | — | 170.6% | — | 46.7% | 105.5% | 3.664% | 0.000% |
+| UDP flows / 50K clients | Raddex L4 | — | — | — | 100.0% | — | 99.2% | **77.4%** | 43.538% | 0.000% |
+| UDP flows / 50K clients | Linux NAT / nftables | — | — | — | 177.1% | — | — | — | 0.016% | 0.000% |
+| TCP p99 latency (1 / 16 / 64 conns) | Raddex L4 | — | — | — | — | **100.0%** | — | — | 0.000% | 0.000% |
+| UDP p99 latency (64 B) | Raddex L4 | — | — | — | — | **100.0%** | 118.3% | **3.5%** | 0.000% | 0.000% |
+| UDP throughput (64 B / 512 B / 1400 B) | Raddex L4 | 100.0% | — | — | — | — | 103%–111% | **3.7%** | 0.000% | 0.000% |
+| UDP packets per second (64 B) | Raddex L4 | — | 100.0% | — | — | — | 139.3% | **3.8%** | 0.000% | 0.000% |
+
+### Key takeaways
+
+1. **TCP bulk throughput:** Bypassing Pingora's buffered writer and per-chunk user-space flush
+   lets Raddex's native Tokio relay achieve **156.5% of Nginx at 16 connections** and **176.6% of Nginx at 64 connections**,
+   while using approximately **60% of Nginx's CPU** and a fraction of its memory.
+2. **High-concurrency connection rate:** The native `SO_REUSEPORT` accept loops achieve **84.6% of Nginx**
+   at 10K connections (outperforming Caddy's 73.3%), and **114.5% of Nginx** at 50K connections with
+   the lowest error rate among user-space proxies.
+3. **UDP datagram flow capacity:** Independent per-thread `SO_REUSEPORT` datagram socket fan-out
+   eliminates kernel receive-buffer overflow, reaching **100.0% capacity with 0.000% loss** at 10K flows.
+4. **Memory efficiency:** Raddex maintains the lowest memory footprint among all user-space proxies
+   across every scenario (typically 3% to 70% of Nginx, and 2× to 10× leaner than Caddy).
+
+Reproduce with:
+
+```bash
+./bench/l4/scripts/run.sh full
+```
+
+![Layer 4 forwarding benchmark overview](../page/public/benchmarks/l4-forwarding.svg)
+

@@ -497,7 +497,7 @@ api.example.com {
 ## 8. 四层监听器（TCP、SNI 透传与 UDP）
 
 **状态：可用（TCP/SNI/UDP/TLS 终止/透明 TCP），包含在
-`v0.3.5`。**
+`v0.3.6`。**
 
 `tcp` 块是**顶级监听器**，与 HTTP 站点块平级。它将裸 TCP 连接（不做 HTTP
 解析）转发到一个或多个上游。默认透传 TLS；配置可选的 `tls` 指令后会在中继前终止 TLS：
@@ -538,10 +538,10 @@ tcp :8443 {
   fallback，否则关闭连接。`sni` 与 `to` 互斥，`health_check` 不适用于
   SNI 模式。
 - **L4 TLS 终止**：在 `tcp` 块内加入 `tls internal` 或
-  `tls <cert-file> <key-file>`。Pingora 完成 TLS 握手，应用收到解密后的裸字节流；
+  `tls <cert-file> <key-file>`。Raddex 原生基于 OpenSSL 完成 TLS 握手，将解密后的裸字节流送入原生中继；
   该模式使用共享的 `to` 上游，不能与 SNI 透传或 `transparent` 同时使用。
 - **透明 TCP**：在 `tcp` 块内加入 `transparent` 并保留 `to` 兜底。
-  Linux 下监听 socket 设置 `IP_TRANSPARENT`，从 Pingora socket digest 读取原始目的地址，
+  Linux 下监听 socket 设置 `IP_TRANSPARENT`，通过 `SO_ORIGINAL_DST` 读取原始目的地址，
   并用原始客户端地址建立出站连接。需要 `CAP_NET_ADMIN`、TPROXY 规则和策略路由，
   Windows 不支持。由于监听器由自定义服务持有，透明 TCP 配置必须使用普通重启，
   不能使用 `raddex upgrade`。

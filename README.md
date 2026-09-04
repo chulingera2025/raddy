@@ -25,7 +25,7 @@ than dependent on a hidden ordering table.
 
 ## Release surface
 
-Raddex `v0.3.5` is a pre-1.0 release. The following table describes what is
+Raddex `v0.3.6` is a pre-1.0 release. The following table describes what is
 implemented and tested in this release; it is not a promise that every public
 API is already frozen.
 
@@ -148,6 +148,54 @@ per-scenario tables, and [`bench/`](bench/) for the scenario definitions.
 
 ![Relative maximum stable throughput](page/public/benchmarks/throughput.svg)
 
+### Layer 4 forwarding performance
+
+Layer 4 proxying runs on a **native Tokio** data path (`Raddex -> L4 Core -> Tokio -> TCP/UDP`),
+bypassing Pingora entirely. The repository includes a Linux-only L4 benchmark
+in [`bench/l4/`](bench/l4/) comparing Nginx stream, Caddy layer4 (`mholt/caddy-l4`),
+Raddex L4, and Linux NAT / nftables. Every figure below comes from a 3-repetition
+`full` run on the same test machine (Nginx stream = 100%):
+
+| Scenario | Metric | Caddy | Raddex | Linux NAT |
+| --- | --- | ---: | ---: | ---: |
+| TCP throughput (64 KiB / 16 conns) | Throughput | 76.6% | **156.5%** | 173.4% |
+| TCP throughput (64 KiB / 16 conns) | CPU / Memory | 129.8% / 12.6% | **64.4% / 9.3%** | — / — |
+| TCP throughput (64 KiB / 64 conns) | Throughput | 89.2% | **176.6%** | 225.5% |
+| TCP throughput (64 KiB / 64 conns) | CPU / Memory | 112.4% / 25.4% | **57.6% / 25.1%** | — / — |
+| TCP connection rate (10K conns) | Connects/sec | 73.3% | **84.6%** | 117.2% |
+| TCP connection rate (50K conns) | Connects/sec | 86.1% | **114.5%** | 456.8% |
+| TCP connection rate (50K conns) | CPU / Memory | 131.8% / 118.1% | **83.2% / 84.0%** | — / — |
+| UDP flows (10K clients) | Flow capacity | 98.5% (1.51% err) | **100.0% (0.00% err)** | 100.0% |
+| UDP flows (10K clients) | Memory | 183.4% | **52.2%** | — |
+| TCP / UDP p99 latency | p99 | 100% – 200% | **100.0%** | 40% – 50% |
+
+**Key findings:**
+
+- **TCP bulk throughput:** Removing Pingora's buffered writer and per-chunk user-space flush
+  allows Raddex to deliver **1.56× to 1.77× Nginx's throughput** at **~60% of its CPU** and a fraction
+  of its memory.
+- **Connection establishment rate:** Native `SO_REUSEPORT` accept loops achieve **84.6% of Nginx** at
+  10K connections (outperforming Caddy's 73.3%), and **114.5% of Nginx** at 50K connections with
+  the lowest error rate among user-space proxies.
+- **UDP flow capacity:** Per-thread `SO_REUSEPORT` datagram socket fan-out eliminates kernel
+  receive-buffer overflow, reaching **100.0% capacity with 0.000% error rate**, matching Nginx.
+- **Memory footprint:** Raddex maintains the lowest memory footprint among all user-space targets
+  across every scenario (typically 3% to 70% of Nginx, and 2× to 10× leaner than Caddy).
+
+**Test environment:**
+- **Machine:** 10-core Intel Xeon CPU E5-2650 v2 @ 2.60 GHz, 8 GiB RAM, Debian 12 (Linux 6.1.0-31-amd64), Docker 29.7.2.
+- **Limits:** 2.0 CPUs, 1 GiB memory per container; Nginx 2 workers, Raddex 2 worker threads.
+- **Methodology:** 3 repetitions, container restart between warmup and measurement, median aggregation.
+
+Reproduce with:
+
+```bash
+./bench/l4/scripts/run.sh full
+```
+
+![Layer 4 forwarding benchmark overview](page/public/benchmarks/l4-forwarding.svg)
+
+
 ## A production-shaped site
 
 ```caddyfile
@@ -196,7 +244,7 @@ If either backend uses a private CA, add `tls_ca <path>` to the
 - [Layer 4 architecture](docs/L4_PROXY_PLAN.md) — TCP/UDP runtime model and operational invariants.
 - [Performance comparison](docs/PERFORMANCE.md) — the Docker comparison suite and normalized metrics.
 - [Contributing](CONTRIBUTING.md) — the checks every change must pass, and how to add a DNS-01 provider.
-- [Release checklist](docs/RELEASE_CHECKLIST_v0.3.5.md) — historical release evidence.
+- [Release checklist](docs/RELEASE_CHECKLIST_v0.3.6.md) — historical release evidence.
 
 ## Build from source
 

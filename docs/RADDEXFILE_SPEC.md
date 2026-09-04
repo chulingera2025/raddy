@@ -6,12 +6,12 @@
 > **Red line**: any syntax not specified here must be added here before it is
 > implemented — never decide syntax on the fly.
 
-This specification describes the syntax and behavior shipped in `v0.3.5`.
+This specification describes the syntax and behavior shipped in `v0.3.6`.
 New syntax must be documented here before it is implemented. A feature boundary
 or deployment prerequisite belongs in the architecture and operations records,
 not in an untracked implementation plan.
 
-Every directive listed as **Available** below is part of the `v0.3.5`
+Every directive listed as **Available** below is part of the `v0.3.6`
 configuration contract. A release may add syntax only by updating this document
 and its validation coverage together.
 
@@ -647,7 +647,7 @@ api.example.com {
 ## 8. Layer-4 listeners (TCP, SNI passthrough, and UDP)
 
 **Status: Available (TCP/SNI/UDP/TLS termination/transparent TCP) in
-`v0.3.5`.**
+`v0.3.6`.**
 
 A `tcp` block is a **top-level listener**, a peer of an HTTP site block. It
 proxies raw TCP connections (no HTTP parsing) to one or more upstreams. TLS is
@@ -692,19 +692,18 @@ tcp :8443 {
   the connection is closed. Exact names win over wildcards, and `sni` and
   `to` are mutually exclusive. `health_check` does not apply to SNI mode.
 - **L4 TLS termination**: add `tls internal` or
-  `tls <cert-file> <key-file>` inside a `tcp` block. Pingora completes
-  the TLS handshake and the app receives the decrypted byte stream; this mode
-  uses the shared `to` upstream set and cannot be combined with SNI
-  passthrough or `transparent`.
+  `tls <cert-file> <key-file>` inside a `tcp` block. Raddex terminates
+  TLS natively using OpenSSL and passes the decrypted byte stream to the raw
+  relay; this mode uses the shared `to` upstream set and cannot be combined
+  with SNI passthrough or `transparent`.
 - **Transparent TCP mode**: add `transparent` to a `tcp` block together
-  with a `to` fallback. On Linux, raddex binds a socket with
-  `IP_TRANSPARENT`, reads the original destination from the Pingora socket
-  digest, and binds outbound connections to the original client address. It
-  requires `CAP_NET_ADMIN` (or an equivalent service capability),
-  netfilter TPROXY rules, and policy routing. It is custom Linux integration
-  and is not available on Windows. Because the listener is custom-owned, a
-  transparent TCP configuration must use a normal restart rather than
-  `raddex upgrade`.
+  with a `to` fallback. On Linux, Raddex binds a socket with
+  `IP_TRANSPARENT`, reads the original destination via `SO_ORIGINAL_DST`, and
+  binds outbound connections to the original client address. It requires
+  `CAP_NET_ADMIN` (or an equivalent service capability), netfilter TPROXY
+  rules, and policy routing. It is custom Linux integration and is not
+  available on Windows. Because the listener is custom-owned, a transparent TCP
+  configuration must use a normal restart rather than `raddex upgrade`.
 - **`lb_policy`** reuses the HTTP policies: `round_robin` (default), `random`,
   and `ip_hash` (source-IP stickiness — the same client stays on the same
   upstream).
@@ -762,7 +761,7 @@ tcp :8443 {
 ## 9. Compatibility and boundaries
 
 - Any syntax detail not covered here must be documented before implementation.
-- The Cloudflare DNS-01 provider is the provider included in `v0.3.5`; other
+- The Cloudflare DNS-01 provider is the provider included in `v0.3.6`; other
   providers are outside this release's configuration contract.
 - UDP can carry QUIC datagrams as passthrough, but QUIC/HTTP-3 termination,
   HTTP/3 routing, and connection migration require a separate protocol service.

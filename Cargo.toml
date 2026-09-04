@@ -1,6 +1,6 @@
 [package]
 name = "raddex"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 authors = ["chulingera2025"]
 description = "A minimal high-performance reverse proxy gateway built on Cloudflare Pingora"

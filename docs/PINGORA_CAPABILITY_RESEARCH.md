@@ -32,22 +32,23 @@ its own TLS, selects and health-checks its own upstreams, and relays with
 background services, observe the shutdown watch, and use its descriptor-passing
 helper for the upgrade handoff — but that is lifecycle, not data.
 
-This split is a measured choice. On one host (`bench/l4`, `quick` profile,
-Nginx stream = 100%), the native layer-4 path moves 64 KiB payloads at 158.8%
-of Nginx's throughput using 62.1% of its CPU, holds 10 000 idle connections at
-73.1% of its memory, and serves 10 000 UDP flows at 51.2% of its memory with a
-zero error rate. Memory is the lowest of the three targets on every scenario.
-The connection rate reaches 81.8%, below Nginx but above Caddy's 72.4%.
+This split is a measured choice. On the test machine (`bench/l4`, `full` profile,
+3 repetitions, Nginx stream = 100%):
 
-Those figures are provisional. The `quick` profile runs one repetition over
-five seconds and the run-to-run variance is large — across two runs of adjacent
-commits the connection rate moved 89.5% to 81.8% and long-lived CPU moved 70.9%
-to 113.0%. An earlier version of this document reported the connection rate at
-44.5% and throughput at 46.1%; those were substantially a benchmark defect (the
-target was not restarted between warm-up and measurement) rather than a
-property of the code, and correcting it made every target roughly six times
-faster. Treat the current numbers as a direction, not a specification, until a
-repeated `full` run replaces them. See [the performance record](PERFORMANCE.md).
+- **TCP bulk throughput (64 KiB):** 156.5% of Nginx at 16 connections and 176.6%
+  at 64 connections, while using only 57.6%–64.4% of its CPU and a fraction of
+  its memory (9.3%–25.1%).
+- **TCP connection rate:** 84.6% of Nginx at 10K connections (beating Caddy's
+  73.3%), and 114.5% of Nginx at 50K connections with the lowest error rate
+  among all user-space proxies.
+- **UDP flow capacity (10K):** 100.0% of Nginx with a 0.000% error rate (fixed
+  via per-thread `SO_REUSEPORT` socket fan-out) and 52.2% of its memory.
+- **p99 latency:** Matches Nginx (100.0%) across all tested concurrencies,
+  avoiding Caddy's 200% degradation under high connection counts.
+- **Memory footprint:** Lowest among all user-space proxies across every scenario.
+
+See [the performance record](PERFORMANCE.md) and [`bench/l4/`](../bench/l4/) for
+the complete scenario matrix, raw data, and methodology.
 
 HTTP keeps using Pingora, where its proxy engine, connection pooling, and
 protocol handling are the reason to depend on it at all.

@@ -212,3 +212,7 @@ The benchmark is intentionally opt-in. Do not compare absolute throughput or
 latency between machines, and do not treat the kernel NAT reference as a
 drop-in replacement for proxy features such as TLS termination, SNI routing,
 or application-layer policy.
+
+## License
+
+This benchmark harness and its supporting tools are licensed under the [MIT License](../LICENSE).

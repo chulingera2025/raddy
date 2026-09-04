@@ -1,0 +1,1 @@
+{"scenario_id":"tcp_latency_1","title":"TCP p99 latency / 64 B / 1 connection","kind":"p99_latency","target":"raddex-l4","transport":"tcp","connections":1,"payload_bytes":64,"repetition":2,"exit_code":0,"connect_timeout_ms":5000}

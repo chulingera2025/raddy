@@ -9,7 +9,7 @@ runtime actually terminates, forwards, or leaves to another service.
 
 ## Status vocabulary
 
-- **Supported** — implemented and covered by the v0.3.5 verification suite.
+- **Supported** — implemented and covered by the v0.3.6 verification suite.
 - **Linux-only** — supported, but requires Linux kernel behavior, privileges,
   or file-descriptor handoff.
 - **Passthrough** — Raddex forwards bytes or datagrams without terminating the
@@ -78,7 +78,7 @@ for why the two cores are split.
 | Listener topology change | Rejected by reload and by upgrade preflight; use a normal restart where required |
 | Transparent TCP upgrade | Not supported by the standard handoff path; use a normal restart |
 | Rate limiting | In-memory and per process; it is not cluster-wide |
-| DNS-01 providers | Cloudflare is the implemented provider in v0.3.5 |
+| DNS-01 providers | Cloudflare is the implemented provider in v0.3.6 |
 
 ## Choosing the right boundary
 

@@ -1,0 +1,1 @@
+{"scenario_id":"udp_flows_10k","title":"UDP flows / 10K clients","kind":"udp_flows","target":"caddy","transport":"udp","connections":10000,"payload_bytes":64,"repetition":2,"exit_code":0,"connect_timeout_ms":5000}

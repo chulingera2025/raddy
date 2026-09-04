@@ -1,0 +1,1 @@
+{"scenario_id":"tcp_throughput_64k_64","title":"TCP throughput / 64 KiB / 64 connections","kind":"tcp_throughput","target":"raddex-l4","transport":"tcp","connections":64,"payload_bytes":65536,"repetition":2,"exit_code":0,"connect_timeout_ms":5000}

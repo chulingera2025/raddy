@@ -55,7 +55,7 @@ also want to redirect normal HTTP traffic:
 }
 ```
 
-For wildcard certificates, use DNS-01. Raddex's v0.3.5 implementation includes
+For wildcard certificates, use DNS-01. Raddex's v0.3.6 implementation includes
 Cloudflare only; other DNS providers are outside this release.
 
 ## Local or private TLS

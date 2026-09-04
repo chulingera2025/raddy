@@ -1,0 +1,1 @@
+{"scenario_id":"udp_throughput_64","title":"UDP throughput / 64 B datagrams","kind":"udp_throughput","target":"raddex-l4","transport":"udp","connections":1,"payload_bytes":64,"repetition":1,"exit_code":0,"connect_timeout_ms":5000}

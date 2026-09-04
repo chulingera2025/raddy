@@ -96,3 +96,40 @@ description: 用可复现的 Docker 基准测试，说明 Raddex 相对 Nginx �
 [benchmark README](https://github.com/chulingera2025/raddex/tree/main/bench)，
 完整的逐场景表格见
 [docs/PERFORMANCE.zh_CN.md](https://github.com/chulingera2025/raddex/blob/main/docs/PERFORMANCE.zh_CN.md)。
+
+## 原生四层转发基准测试（Layer 4 Forwarding）
+
+四层代理运行在 **Tokio 原生** 数据面上（`Raddex -> L4 Core -> Tokio -> TCP/UDP`），数据包完全不走 Pingora。[`bench/l4/`](https://github.com/chulingera2025/raddex/tree/main/bench/l4) 提供了独立的 Linux 四层基准测试，对比 Nginx stream、Caddy layer4（`mholt/caddy-l4`）、Raddex L4 以及 Linux NAT / nftables。
+
+### 核心指标概览（以 Nginx stream = 100% 为基线）
+
+| 场景 | 评估指标 | Caddy | Raddex | Linux NAT (内核参考) |
+| --- | --- | ---: | ---: | ---: |
+| TCP 吞吐 (64 KiB / 16 并发) | 吞吐量 | 76.6% | **156.5%** | 173.4% |
+| TCP 吞吐 (64 KiB / 16 并发) | CPU / 内存 | 129.8% / 12.6% | **64.4% / 9.3%** | — / — |
+| TCP 吞吐 (64 KiB / 64 并发) | 吞吐量 | 89.2% | **176.6%** | 225.5% |
+| TCP 吞吐 (64 KiB / 64 并发) | CPU / 内存 | 112.4% / 25.4% | **57.6% / 25.1%** | — / — |
+| TCP 连接速率 (10K 并发建连) | 建连速率 | 73.3% | **84.6%** | 117.2% |
+| TCP 连接速率 (50K 并发建连) | 建连速率 | 86.1% | **114.5%** | 456.8% |
+| TCP 连接速率 (50K 并发建连) | CPU / 内存 | 131.8% / 118.1% | **83.2% / 84.0%** | — / — |
+| UDP 流容量 (10K 客户端) | 建立容量 | 98.5% (1.51% 丢包) | **100.0% (0.00% 丢包)** | 100.0% |
+| UDP 流容量 (10K 客户端) | 内存开销 | 183.4% | **52.2%** | — |
+| TCP / UDP p99 延迟 | 延迟 | 100% – 200% | **100.0%** | 40% – 50% |
+
+### 核心结论
+
+- **TCP 大数据量吞吐优势显著：** 剔除 Pingora 缓冲写和逐 chunk `flush().await` 后，原生 Tokio 中继达到 **Nginx 的 1.56 倍 ~ 1.77 倍吞吐**，同时 **CPU 仅消耗 Nginx 的约 60%**，内存开销降至几分之一。
+- **并发连接建立速率：** 基于多套接字 `SO_REUSEPORT` 原生 accept 循环，10K 速率达到 **Nginx 的 84.6%**（显著高于 Caddy 的 73.3%）；在 50K 极高并发建连下达到 **Nginx 的 114.5%**（反超 Nginx 14.5%），且重试错误率在三家代理中最低。
+- **UDP 流容量与丢包彻底根治：** 借助多接收套接字扇出，消除了内核接收队列溢出，10K 场景错误率严格降为 **0.000%**，达到 100% 满容量接入，完全打平 Nginx。
+- **内存占用全场最低：** 各场景中 Raddex 内存通常仅为 Nginx 的 3%~70%，且只有 Caddy 的几分之一到几十分之一。
+
+### 四层转发总览图表
+
+![四层转发基准测试概览](/benchmarks/l4-forwarding.svg)
+
+### 运行四层测试
+
+```bash
+./bench/l4/scripts/run.sh full
+```
+
