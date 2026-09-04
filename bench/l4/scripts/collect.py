@@ -193,8 +193,8 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(f"{scenario_id}.port exceeds the TCP/UDP port range")
         if scenario["payload_bytes"] * scenario["window"] > 8 * 1024 * 1024:
             raise ValueError(f"{scenario_id}.payload_bytes * window exceeds the 8 MiB loadgen limit")
-        if scenario["connections"] > 100_000:
-            raise ValueError(f"{scenario_id}.connections exceeds the 100K benchmark ceiling")
+        if scenario["connections"] > 50_000:
+            raise ValueError(f"{scenario_id}.connections exceeds the 50K benchmark ceiling")
         if scenario["transport"] == "udp" and scenario["payload_bytes"] > 65_507:
             raise ValueError(f"{scenario_id}.payload_bytes exceeds the UDP payload ceiling")
         if scenario["mode"] in CONNECTION_MODES:

@@ -27,7 +27,7 @@ descriptors for the selected scale:
 
 `quick` covers 10K connection and flow scenarios with short measurements. It
 is useful for validating the topology and producing a first comparison.
-`full` adds 50K/100K scenarios, payload-size variants, connection-size sweeps,
+`full` adds 50K scenarios, payload-size variants, connection-size sweeps,
 and three repetitions. It is intentionally not part of the normal Rust CI
 path.
 Each run uses a unique Compose project by default, so interrupted or concurrent
@@ -92,9 +92,17 @@ The matrix is defined in `scenarios/scenarios.json`:
 | UDP throughput | 64 B, 512 B, and 1400 B datagrams at a configured offered PPS |
 | UDP PPS | 64 B datagrams with a configured offered PPS |
 | p99 latency | TCP and UDP 64 B request-response |
-| TCP connection rate | 10K, 50K, and 100K connection establishment |
-| TCP long-lived | 10K, 50K, and 100K established connections held open |
-| UDP flow capacity | 10K, 50K, and 100K client flows held open |
+| TCP connection rate | 10K and 50K connection establishment |
+| TCP long-lived | 10K and 50K established connections held open |
+| UDP flow capacity | 10K and 50K client flows held open |
+
+The scale scenarios stop at 50K. That size already separates the targets on
+everything these scenarios measure — accept-queue drain rate, flow-table cost,
+per-connection memory, and datagram loss under a receive-buffer bound — while
+100K only doubled the wall clock and pushed the load generator, rather than the
+proxy, into the ephemeral-port and descriptor ceiling described below. Raising
+it again means raising the guards in `scripts/collect.py` and
+`scripts/preflight.sh` together.
 
 TCP connection scenarios first read the origin's `READY` handshake. This
 separates downstream accept success from successful upstream establishment.
@@ -117,8 +125,8 @@ the kernel's port scan.
 The same port range also caps what one proxy address can hold open toward one
 origin address: with the default `ip_local_port_range` (32768–60999) that is
 28 232 concurrent proxied connections, before any `TIME-WAIT` residue. The 50K
-and 100K connection scenarios ask for more than that from every target, so
-their results describe where this topology saturates, not a ranking.
+connection scenarios ask for more than that from every target, so their results
+describe where this topology saturates, not a ranking.
 
 UDP throughput is paced instead of flooding the socket indefinitely. The
 report records both offered PPS and received PPS plus packet loss. A result
@@ -166,7 +174,7 @@ not record a host name or merge absolute results from different machines.
 
 ## Scale prerequisites
 
-The 100K scenarios need multiple source ports and high descriptor limits. The
+The 50K scenarios need multiple source ports and high descriptor limits. The
 preflight checks the most important host values, including:
 
 - `ulimit -n`;

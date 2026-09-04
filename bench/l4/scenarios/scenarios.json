@@ -1,5 +1,16 @@
 {
   "schema_version": 1,
+  "notes": [
+    "The scale scenarios stop at 50K. 50K already separates the targets on",
+    "every axis these scenarios exist to measure — accept-queue drain rate,",
+    "flow-table cost, per-connection memory, and datagram loss under a",
+    "receive-buffer bound — so 100K only bought a longer run, not a different",
+    "verdict. It cost roughly half the wall clock of a full profile and put",
+    "the load generator, not the proxy, at the ephemeral-port and descriptor",
+    "ceiling, which measures the harness rather than the target.",
+    "Raise the ceiling in scripts/collect.py and scripts/preflight.sh before",
+    "reintroducing a larger size."
+  ],
   "defaults": {
     "warmup_seconds": 2,
     "duration_seconds": 10,
@@ -166,19 +177,6 @@
       "connect_rate": 5000
     },
     {
-      "id": "tcp_connect_rate_100k",
-      "title": "TCP connection rate / 100K connections",
-      "kind": "tcp_connect_rate",
-      "mode": "tcp-connect-rate",
-      "transport": "tcp",
-      "port": 18000,
-      "connections": 100000,
-      "payload_bytes": 1,
-      "window": 1,
-      "connect_rate": 10000,
-      "duration_seconds": 15
-    },
-    {
       "id": "tcp_connect_rate_50k",
       "title": "TCP connection rate / 50K connections",
       "kind": "tcp_connect_rate",
@@ -205,19 +203,6 @@
       "duration_seconds": 30
     },
     {
-      "id": "tcp_long_lived_100k",
-      "title": "TCP long-lived connections / 100K",
-      "kind": "tcp_long_lived",
-      "mode": "tcp-connections",
-      "transport": "tcp",
-      "port": 18000,
-      "connections": 100000,
-      "payload_bytes": 1,
-      "window": 1,
-      "connect_rate": 10000,
-      "duration_seconds": 30
-    },
-    {
       "id": "tcp_long_lived_50k",
       "title": "TCP long-lived connections / 50K",
       "kind": "tcp_long_lived",
@@ -241,19 +226,6 @@
       "payload_bytes": 64,
       "window": 1,
       "connect_rate": 5000,
-      "duration_seconds": 30
-    },
-    {
-      "id": "udp_flows_100k",
-      "title": "UDP flows / 100K clients",
-      "kind": "udp_flows",
-      "mode": "udp-flows",
-      "transport": "udp",
-      "port": 18001,
-      "connections": 100000,
-      "payload_bytes": 64,
-      "window": 1,
-      "connect_rate": 10000,
       "duration_seconds": 30
     },
     {

@@ -153,13 +153,10 @@ def _short_label(title: str) -> str:
         "UDP p99 latency / 64 B datagrams": "UDP p99\n64 B",
         "TCP connection rate / 10K connections": "TCP connect\n10K",
         "TCP connection rate / 50K connections": "TCP connect\n50K",
-        "TCP connection rate / 100K connections": "TCP connect\n100K",
         "TCP long-lived connections / 10K": "TCP long-lived\n10K",
         "TCP long-lived connections / 50K": "TCP long-lived\n50K",
-        "TCP long-lived connections / 100K": "TCP long-lived\n100K",
         "UDP flows / 10K clients": "UDP flows\n10K",
         "UDP flows / 50K clients": "UDP flows\n50K",
-        "UDP flows / 100K clients": "UDP flows\n100K",
     }
     return replacements.get(title, title.replace(" / ", "\n/ "))
 
